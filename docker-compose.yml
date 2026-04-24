@@ -1,0 +1,83 @@
+services:
+  db:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: drydev_workflow_dev
+    ports:
+      - "33060:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./docker/init-db.sql:/docker-entrypoint-initdb.d/01-init.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "56720:5672"
+      - "15673:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_running"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dev
+    ports:
+      - "4000:4000"
+    environment:
+      DB_HOST: db
+      DB_USER: root
+      DB_PASS: root
+      DB_NAME: drydev_workflow_dev
+      DB_PORT: "3306"
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+      DATABUS_DB_USER: root
+      DATABUS_DB_PASS: root
+      DATABUS_DB_NAME: databus
+      EVICTION_ENABLED: "true"
+      EVICTION_IDLE_MS: "5000"
+      EVICTION_SCAN_MS: "3000"
+      SECRET_KEY_BASE: "dev_secret_key_base_at_least_64_bytes_long_for_phoenix_endpoint_config_placeholder"
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  test:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dev
+    environment:
+      MIX_ENV: test
+      DB_HOST: db
+      DB_USER: root
+      DB_PASS: root
+      DB_NAME: drydev_workflow_test
+      DB_PORT: "3306"
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    command: mix test --include integration
+    profiles:
+      - test
+
+volumes:
+  mysql_data:

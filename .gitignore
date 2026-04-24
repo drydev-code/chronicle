@@ -1,0 +1,15 @@
+_build/
+deps/
+*.ez
+*.beam
+erl_crash.dump
+.elixir_ls/
+.vscode/
+.idea/
+cover/
+doc/
+.fetch
+tmp/
+node_modules/
+.env
+.DS_Store

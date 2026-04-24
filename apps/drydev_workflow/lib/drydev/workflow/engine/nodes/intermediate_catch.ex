@@ -1,0 +1,114 @@
+defmodule DryDev.Workflow.Engine.Nodes.IntermediateCatch do
+  @moduledoc "Intermediate catching events: Timer, Message, Signal."
+
+  defmodule TimerEvent do
+    use DryDev.Workflow.Engine.Nodes.Node
+    defstruct [:id, :key, :timer_config, :inputs, :outputs, :properties]
+
+    @impl true
+    def process(context) do
+      if context.simulation_mode do
+        handle_simulation(context)
+      else
+        timer_id = UUID.uuid4()
+        delay_ms = compute_delay(context.node.timer_config)
+        NodeResult.wait_for_timer(timer_id, delay_ms)
+      end
+    end
+
+    @impl true
+    def continue_after_wait(context) do
+      first_output = List.first(context.node.outputs || [])
+      NodeResult.next(first_output)
+    end
+
+    defp compute_delay(%{duration_ms: ms}), do: ms
+    defp compute_delay(%{period: period}), do: period_to_ms(period)
+    defp compute_delay(_), do: 1000
+
+    defp period_to_ms(%{hours: h, minutes: m, seconds: s}),
+      do: (h || 0) * 3_600_000 + (m || 0) * 60_000 + (s || 0) * 1000
+    defp period_to_ms(_), do: 1000
+
+    defp handle_simulation(context) do
+      {event, _ctx} = ExecutionContext.next_simulation_event(context)
+      case event do
+        %DryDev.Workflow.Engine.PersistentData.TimerElapsed{} ->
+          first_output = List.first(context.node.outputs || [])
+          NodeResult.next(first_output)
+        _ ->
+          NodeResult.simulation_barrier_then_wait(:waiting_for_timer)
+      end
+    end
+  end
+
+  defmodule MessageEvent do
+    use DryDev.Workflow.Engine.Nodes.Node
+    defstruct [:id, :key, :message, :inputs, :outputs, :properties]
+
+    @impl true
+    def process(context) do
+      if context.simulation_mode do
+        handle_simulation(context)
+      else
+        name = resolve_message_name(context.node.message, context.token.parameters)
+        NodeResult.wait_for_message(name)
+      end
+    end
+
+    @impl true
+    def continue_after_wait(context) do
+      first_output = List.first(context.node.outputs || [])
+      NodeResult.next(first_output)
+    end
+
+    defp resolve_message_name(%{static_text: text, variable_content: var}, params) when not is_nil(var) do
+      variable_value = Map.get(params, var, "")
+      "#{text}##{variable_value}"
+    end
+    defp resolve_message_name(%{name: name}, _params), do: name
+    defp resolve_message_name(name, _params) when is_binary(name), do: name
+
+    defp handle_simulation(context) do
+      {event, _ctx} = ExecutionContext.next_simulation_event(context)
+      case event do
+        %DryDev.Workflow.Engine.PersistentData.MessageHandled{} ->
+          first_output = List.first(context.node.outputs || [])
+          NodeResult.next(first_output)
+        _ ->
+          NodeResult.simulation_barrier_then_wait(:waiting_for_message)
+      end
+    end
+  end
+
+  defmodule SignalEvent do
+    use DryDev.Workflow.Engine.Nodes.Node
+    defstruct [:id, :key, :signal, :inputs, :outputs, :properties]
+
+    @impl true
+    def process(context) do
+      if context.simulation_mode do
+        handle_simulation(context)
+      else
+        NodeResult.wait_for_signal(context.node.signal)
+      end
+    end
+
+    @impl true
+    def continue_after_wait(context) do
+      first_output = List.first(context.node.outputs || [])
+      NodeResult.next(first_output)
+    end
+
+    defp handle_simulation(context) do
+      {event, _ctx} = ExecutionContext.next_simulation_event(context)
+      case event do
+        %DryDev.Workflow.Engine.PersistentData.SignalHandled{} ->
+          first_output = List.first(context.node.outputs || [])
+          NodeResult.next(first_output)
+        _ ->
+          NodeResult.simulation_barrier_then_wait(:waiting_for_signal)
+      end
+    end
+  end
+end
