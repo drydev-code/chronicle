@@ -126,8 +126,16 @@ completed P0 pass covered:
 
 ## Suggested Next Batch
 
-Move to P1 scope work: subprocess/event-subprocess semantics, conditional
-start/boundary events, compensation/cancel events, standard loop and
-multi-instance activity characteristics, and collaboration/data-object model
-support. Keep the same rule for every expansion: parseable, executable,
-replayable, and covered by restart/eviction tests before claiming support.
+The next implementation phase is documented in
+[`next-phase-bpmn-roadmap.md`](next-phase-bpmn-roadmap.md). It intentionally
+targets the practical BPJS subset requested next:
+
+1. Lanes as `actorType` metadata.
+2. Conditional start and conditional boundary events.
+3. Standard loop activity characteristics.
+4. Compensation events and compensation handlers.
+
+Use [`next-phase-handoff-prompt.md`](next-phase-handoff-prompt.md) as the
+copy-paste starting prompt for that implementation pass. Keep the same rule for
+every expansion: parseable, executable, replayable, and covered by
+restart/eviction tests before claiming support.
