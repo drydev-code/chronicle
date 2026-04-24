@@ -53,6 +53,22 @@ defmodule Chronicle.Server.Web.Controllers.ManagementController do
     json(conn, %{tasks: tasks})
   end
 
+  def cancel_external_task(conn, %{"task_id" => task_id} = params) do
+    reason = Map.get(params, "reason", "Cancelled via API")
+    continuation_node_id = Map.get(params, "continuationNodeId")
+
+    case Chronicle.Server.Host.ExternalTaskRouter.cancel_task(task_id, reason, continuation_node_id) do
+      :ok ->
+        json(conn, %{status: "cancelled", taskId: task_id})
+
+      {:error, :unknown_task} ->
+        conn |> put_status(404) |> json(%{error: "External task not found"})
+
+      {:error, reason} ->
+        conn |> put_status(409) |> json(%{error: inspect(reason)})
+    end
+  end
+
   def terminate_all(conn, _params) do
     instances = Registry.select(:instances, [{{:_, :_, :"$1"}, [], [:"$1"]}])
     Enum.each(instances, fn pid ->

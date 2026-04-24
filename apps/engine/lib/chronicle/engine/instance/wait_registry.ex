@@ -262,6 +262,69 @@ defmodule Chronicle.Engine.Instance.WaitRegistry do
     %{state | boundary_index: boundary_index}
   end
 
+  @doc """
+  Removes the boundary registration that has just triggered without emitting a
+  cancellation. This is mainly for one-shot non-interrupting timers: the
+  boundary fired, so replay should not restore the same timer again.
+  """
+  def close_triggered_boundary_registration(state, token_id, boundary_node_id) do
+    infos =
+      state.boundary_index
+      |> Map.get(token_id, [])
+      |> Enum.filter(&(&1.boundary_node_id == boundary_node_id))
+
+    state =
+      Enum.reduce(infos, state, fn info, acc ->
+        acc
+        |> remove_boundary_message_registration(token_id, info)
+        |> remove_boundary_signal_registration(token_id, info)
+        |> remove_boundary_timer_registration(info)
+      end)
+
+    remaining =
+      state.boundary_index
+      |> Map.get(token_id, [])
+      |> Enum.reject(&(&1.boundary_node_id == boundary_node_id))
+
+    boundary_index =
+      if remaining == [] do
+        Map.delete(state.boundary_index, token_id)
+      else
+        Map.put(state.boundary_index, token_id, remaining)
+      end
+
+    %{state | boundary_index: boundary_index}
+  end
+
+  @doc """
+  Cancels open non-boundary timers for a token after their `TimerCanceled`
+  events have been persisted. Boundary timers are left for boundary lifecycle
+  cleanup so sibling `BoundaryEventCancelled` semantics stay explicit.
+  """
+  def cancel_activity_timer_registrations(state, token_id) do
+    boundary_refs =
+      state.boundary_index
+      |> Map.get(token_id, [])
+      |> Enum.filter(&(&1.type == :timer))
+      |> Enum.map(&Map.get(&1, :timer_ref))
+      |> Enum.reject(&is_nil/1)
+      |> MapSet.new()
+
+    {refs, keep_refs} =
+      Enum.split_with(state.timer_refs || %{}, fn {ref, owner_token_id} ->
+        owner_token_id == token_id and not MapSet.member?(boundary_refs, ref)
+      end)
+
+    Enum.each(refs, fn {ref, _token_id} -> Process.cancel_timer(ref) end)
+
+    dropped_refs = Enum.map(refs, &elem(&1, 0))
+
+    %{state |
+      timer_refs: Map.new(keep_refs),
+      timer_ref_ids: Map.drop(state.timer_ref_ids || %{}, dropped_refs)
+    }
+  end
+
   # --- Private helpers ---
 
   defp unregister_message_wait(state, message_name, token_id) do

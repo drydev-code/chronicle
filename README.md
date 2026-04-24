@@ -56,9 +56,14 @@ through the instance API when variables change.
 
 Boundary message, signal, and timer waits are supported for the current
 wait-capable activity subset with durable create/cancel/trigger replay.
-Remaining boundary limitations include retry-wait interruption semantics,
-deeper activity interruption edge cases, and unsupported conditional,
-compensation, cancel, multiple, and parallel-multiple boundary events.
+Retry waits remain interruptible by message, signal, and timer boundaries; an
+interrupting boundary durably cancels the retry timer before the boundary path
+continues. Non-interrupting message and signal boundaries remain registered
+while the activity wait stays open. Non-interrupting timer boundaries are
+one-shot: after the timer triggers and creates its boundary token, that timer
+registration is closed and replay does not restore it. Unsupported boundary
+features still include conditional, compensation, cancel, multiple, and
+parallel-multiple boundary events.
 
 Diagram files are shipped inside ZIP deployment packages alongside
 `.dmn` decision tables.

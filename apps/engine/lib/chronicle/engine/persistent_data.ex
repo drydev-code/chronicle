@@ -88,6 +88,10 @@ defmodule Chronicle.Engine.PersistentData do
     defstruct [:token, :family, :current_node, :condition, :matched, :target_node, :evaluated_at]
   end
 
+  defmodule VariablesUpdated do
+    defstruct [:token, :family, :current_node, :variables, :updated_at]
+  end
+
   defmodule LinkTraversed do
     defstruct [:token, :family, :current_node, :link_name, :target_node]
   end

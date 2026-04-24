@@ -94,6 +94,37 @@ defmodule Chronicle.Engine.EvictedWaitRestoreTest do
       assert EvictedWaitRestorer.collect_open_waits(events) == []
     end
 
+    test "does not collect a retry timer that was cancelled by boundary interruption" do
+      events = [
+        start_event(),
+        %PersistentData.TimerCreated{
+          token: 1,
+          family: 0,
+          current_node: "task",
+          timer_id: "retry:1:1",
+          trigger_at: 60_000
+        },
+        %PersistentData.BoundaryEventTriggered{
+          token: 1,
+          family: 0,
+          current_node: "task",
+          boundary_node_id: "cancel",
+          boundary_type: :message,
+          interrupting: true
+        },
+        %PersistentData.TimerCanceled{
+          token: 1,
+          family: 0,
+          current_node: "task",
+          timer_id: "retry:1:1"
+        }
+      ]
+
+      assert [] =
+               EvictedWaitRestorer.collect_open_waits(events)
+               |> Enum.filter(&match?(%WaitingHandle.Timer{}, &1))
+    end
+
     test "collects open timers and drops elapsed/cancelled ones" do
       events = [
         start_event(),
@@ -210,6 +241,26 @@ defmodule Chronicle.Engine.EvictedWaitRestoreTest do
           family: 0,
           current_node: "n1",
           successful: true
+        }
+      ]
+
+      assert EvictedWaitRestorer.collect_open_waits(events) == []
+    end
+
+    test "drops call waits that were cancelled" do
+      events = [
+        start_event(),
+        %PersistentData.CallStarted{
+          token: 1,
+          family: 0,
+          current_node: "n1",
+          started_process: "child-1"
+        },
+        %PersistentData.CallCanceled{
+          token: 1,
+          family: 0,
+          current_node: "n1",
+          next_node: "after-call"
         }
       ]
 

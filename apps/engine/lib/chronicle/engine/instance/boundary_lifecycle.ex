@@ -30,6 +30,32 @@ defmodule Chronicle.Engine.Instance.BoundaryLifecycle do
   end
 
   @doc """
+  Returns `TimerCanceled` events for open non-boundary timers owned by the
+  token. This is used when an interrupting boundary wins while the activity is
+  parked on a retry timer: the retry wait must be durably closed before the
+  boundary continuation mutates in-memory timers.
+  """
+  def activity_timer_cancellation_events(state, token_id) do
+    token = Map.get(state.tokens, token_id)
+    boundary_timer_refs = boundary_timer_refs(state, token_id)
+
+    state.timer_refs
+    |> Enum.reject(fn {ref, owner_token_id} ->
+      owner_token_id != token_id or MapSet.member?(boundary_timer_refs, ref)
+    end)
+    |> Enum.map(fn {ref, _owner_token_id} ->
+      %PersistentData.TimerCanceled{
+        token: token_id,
+        family: token && token.family,
+        current_node: token && token.current_node,
+        retry_counter: token && token.context[:retries],
+        timer_id: Map.get(state.timer_ref_ids || %{}, ref)
+      }
+    end)
+    |> Enum.reject(&is_nil(&1.timer_id))
+  end
+
+  @doc """
   Returns the open boundary metadata for a token/boundary pair.
   """
   def boundary_info(state, token_id, boundary_node_id) do
@@ -63,5 +89,14 @@ defmodule Chronicle.Engine.Instance.BoundaryLifecycle do
       nil -> true
       info -> info.interrupting != false
     end
+  end
+
+  defp boundary_timer_refs(state, token_id) do
+    state.boundary_index
+    |> Map.get(token_id, [])
+    |> Enum.filter(&(&1.type == :timer))
+    |> Enum.map(&Map.get(&1, :timer_ref))
+    |> Enum.reject(&is_nil/1)
+    |> MapSet.new()
   end
 end

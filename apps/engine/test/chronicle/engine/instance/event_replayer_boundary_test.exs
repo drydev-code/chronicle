@@ -280,6 +280,114 @@ defmodule Chronicle.Engine.Instance.EventReplayerBoundaryTest do
     refute MapSet.member?(continued_state.waiting_tokens, 1)
   end
 
+  test "VariablesUpdated replays before persisted conditional evaluation continues token" do
+    definition =
+      %Definition{
+        name: "conditional-variable-restore",
+        version: 1,
+        nodes: %{
+          10 => %Nodes.IntermediateCatch.ConditionalEvent{
+            id: 10,
+            condition: "ready === true",
+            outputs: [11]
+          },
+          11 => %Nodes.EndEvents.BlankEndEvent{id: 11}
+        }
+      }
+
+    :ok = DiagramStore.register(definition.name, definition.version, "tenant-a", definition)
+
+    events = [
+      start_event(definition),
+      %PersistentData.TokenFamilyCreated{token: 1, family: 0, current_node: 10},
+      %PersistentData.ConditionalEventEvaluated{
+        token: 1,
+        family: 0,
+        current_node: 10,
+        condition: "ready === true",
+        matched: false
+      },
+      %PersistentData.ConditionalEventWaitCreated{
+        token: 1,
+        family: 0,
+        current_node: 10,
+        condition: "ready === true"
+      },
+      %PersistentData.VariablesUpdated{
+        token: 1,
+        family: 0,
+        current_node: 10,
+        variables: %{ready: true}
+      },
+      %PersistentData.ConditionalEventEvaluated{
+        token: 1,
+        family: 0,
+        current_node: 10,
+        condition: "ready === true",
+        matched: true,
+        target_node: 11
+      }
+    ]
+
+    assert {:ok, state} = EventReplayer.restore_from_events(events, restore_state("inst-5"))
+
+    assert state.tokens[1].parameters.ready == true
+    assert state.tokens[1].current_node == 11
+    assert MapSet.member?(state.active_tokens, 1)
+  end
+
+  test "ExternalTaskCancellation and CallCanceled close restored waits" do
+    definition =
+      %Definition{
+        name: "cancel-restore",
+        version: 1,
+        nodes: %{
+          10 => %Nodes.ExternalTask{id: 10, kind: :service, outputs: [11]},
+          11 => %Nodes.CallActivity{id: 11, process_name: "child", outputs: [12]},
+          12 => %Nodes.EndEvents.BlankEndEvent{id: 12}
+        }
+      }
+
+    :ok = DiagramStore.register(definition.name, definition.version, "tenant-a", definition)
+
+    events = [
+      start_event(definition),
+      %PersistentData.TokenFamilyCreated{token: 1, family: 0, current_node: 10},
+      %PersistentData.ExternalTaskCreation{
+        token: 1,
+        family: 0,
+        current_node: 10,
+        external_task: "task-1"
+      },
+      %PersistentData.ExternalTaskCancellation{
+        token: 1,
+        family: 0,
+        current_node: 10,
+        external_task: "task-1",
+        continuation_node_id: 11
+      },
+      %PersistentData.CallStarted{
+        token: 1,
+        family: 0,
+        current_node: 11,
+        started_process: "child-1"
+      },
+      %PersistentData.CallCanceled{
+        token: 1,
+        family: 0,
+        current_node: 11,
+        next_node: 12
+      }
+    ]
+
+    assert {:ok, state} = EventReplayer.restore_from_events(events, restore_state("inst-6"))
+
+    assert state.external_tasks == %{}
+    assert state.call_wait_list == %{}
+    assert state.tokens[1].current_node == 12
+    assert MapSet.member?(state.active_tokens, 1)
+  end
+
   defp restore_state(instance_id) do
     Map.merge(TokenState.base_state(), %{
       id: instance_id,

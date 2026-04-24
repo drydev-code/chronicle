@@ -35,6 +35,7 @@ defmodule Chronicle.Server.Web.Router do
 
     # Process Instance (read + non-destructive start)
     post "/process-instance", ProcessInstanceController, :start
+    post "/process-instance/:id/variables", ProcessInstanceController, :update_variables
 
     # Deployment (non-destructive)
     post "/deployment/redeploy", DeploymentController, :redeploy
@@ -44,6 +45,7 @@ defmodule Chronicle.Server.Web.Router do
     get "/management/active-processes-count", ManagementController, :active_processes_count
     get "/management/inspect/:id", ManagementController, :inspect_instance
     get "/management/external-tasks", ManagementController, :list_external_tasks
+    post "/management/external-tasks/:task_id/cancel", ManagementController, :cancel_external_task
     get "/management/timer-start-events", ManagementController, :timer_start_events
     get "/management/test-parse-diagram", ManagementController, :test_parse_diagram
 

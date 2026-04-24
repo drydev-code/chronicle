@@ -50,6 +50,26 @@ defmodule Chronicle.Server.Web.Controllers.ProcessInstanceController do
     end
   end
 
+  def update_variables(conn, %{"id" => id} = params) do
+    tenant_id = conn.assigns[:tenant_id]
+    variables = Map.get(params, "variables") || Map.get(params, "parameters") || %{}
+
+    if is_map(variables) do
+      case Instance.lookup(tenant_id, id) do
+        {:ok, pid} ->
+          case Instance.update_variables_sync(pid, variables) do
+            :ok -> json(conn, %{status: "updated", instanceId: id})
+            {:error, reason} -> conn |> put_status(409) |> json(%{error: inspect(reason)})
+          end
+
+        {:error, :not_found} ->
+          conn |> put_status(404) |> json(%{error: "Instance not found"})
+      end
+    else
+      conn |> put_status(400) |> json(%{error: "variables must be an object"})
+    end
+  end
+
   defp do_migrate(conn, tenant_id, id, target_name, node_mappings) do
     case Instance.lookup(tenant_id, id) do
       {:ok, pid} ->

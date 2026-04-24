@@ -149,6 +149,39 @@ defmodule Chronicle.Engine.TokenProcessorBpmnFeaturesTest do
     assert final_state.tokens[0].next_node == 2
   end
 
+  test "inclusive join proceeds when no other selected token can still reach it" do
+    state = inclusive_join_state(%{0 => Token.new(0, 0, 4)})
+
+    state = TokenProcessor.process_active_tokens(state)
+
+    assert state.tokens[0].next_node == 5
+    assert MapSet.member?(state.active_tokens, 0)
+    refute MapSet.member?(state.waiting_tokens, 0)
+  end
+
+  test "inclusive join waits only for selected sibling paths that can reach it" do
+    state =
+      inclusive_join_state(%{
+        0 => Token.new(0, 0, 4),
+        1 => Token.new(1, 0, 3)
+      })
+
+    first_arrival = TokenProcessor.process_active_tokens(%{state | active_tokens: MapSet.new([0])})
+
+    assert first_arrival.tokens[0].state == :waiting_for_join
+    assert MapSet.member?(first_arrival.waiting_tokens, 0)
+
+    second_arrival =
+      first_arrival
+      |> Map.put(:active_tokens, MapSet.new([1]))
+      |> TokenProcessor.process_active_tokens()
+      |> TokenProcessor.process_active_tokens()
+      |> TokenProcessor.process_active_tokens()
+
+    assert Enum.any?(second_arrival.tokens, fn {_id, token} -> token.next_node == 5 end)
+    assert Enum.any?(second_arrival.tokens, fn {_id, token} -> token.state == :joined end)
+  end
+
   test "token crash appends boundary cancellations before closing registrations" do
     ref = make_ref()
 
@@ -222,6 +255,30 @@ defmodule Chronicle.Engine.TokenProcessorBpmnFeaturesTest do
       tokens: %{0 => token},
       active_tokens: MapSet.new([0]),
       next_token_id: 1
+    })
+  end
+
+  defp inclusive_join_state(tokens) do
+    definition = %Definition{
+      name: "inclusive-join",
+      version: 1,
+      nodes: %{
+        3 => %Nodes.Tasks.ManualTask{id: 3, outputs: [4]},
+        4 => %Nodes.Gateway{id: 4, kind: :inclusive, is_merging: true, outputs: [5]},
+        5 => %Nodes.EndEvents.BlankEndEvent{id: 5}
+      },
+      connections: %{3 => [4], 4 => [5]},
+      reverse_connections: %{4 => [2, 3], 5 => [4]}
+    }
+
+    Map.merge(TokenState.base_state(), %{
+      id: "inst",
+      business_key: "bk",
+      tenant_id: "tenant",
+      definition: definition,
+      tokens: tokens,
+      active_tokens: tokens |> Map.keys() |> MapSet.new(),
+      next_token_id: map_size(tokens)
     })
   end
 end

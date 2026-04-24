@@ -403,17 +403,26 @@ defmodule Chronicle.Engine.TokenProcessor do
     state = %{state | joining_list: joining}
 
     # Check if join can complete
-    _node = Definition.get_node(state.definition, node_id)
-    inputs = Definition.get_inputs(state.definition, node_id)
-    total_inputs = length(inputs)
+    node = Definition.get_node(state.definition, node_id)
+    arrived_token_ids = Map.get(joining, {token.family, node_id}, [])
+    arrived = length(arrived_token_ids)
 
-    # Count recursive connections
-    recursive_count = Enum.count(inputs, fn input_id ->
-      Definition.is_recursive_connection?(state.definition, input_id, node_id)
-    end)
+    required =
+      case node do
+        %Chronicle.Engine.Nodes.Gateway{kind: :inclusive} ->
+          inclusive_join_required(state, token, node_id, arrived_token_ids)
 
-    required = total_inputs - recursive_count
-    arrived = length(Map.get(joining, {token.family, node_id}, []))
+        _ ->
+          inputs = Definition.get_inputs(state.definition, node_id)
+          total_inputs = length(inputs)
+
+          # Count recursive connections
+          recursive_count = Enum.count(inputs, fn input_id ->
+            Definition.is_recursive_connection?(state.definition, input_id, node_id)
+          end)
+
+          total_inputs - recursive_count
+      end
 
     if arrived >= required do
       # Join complete - resume first token, remove others
@@ -717,6 +726,47 @@ defmodule Chronicle.Engine.TokenProcessor do
         acc
       end
     end)
+  end
+
+  defp inclusive_join_required(state, token, join_node_id, arrived_token_ids) do
+    arrived_set = MapSet.new(arrived_token_ids)
+
+    other_reachable =
+      state.tokens
+      |> Enum.reject(fn {tid, _t} -> MapSet.member?(arrived_set, tid) end)
+      |> Enum.count(fn {_tid, other} ->
+        other.family == token.family and
+          not Token.terminal?(other) and
+          can_reach?(state.definition, other.current_node, join_node_id)
+      end)
+
+    length(arrived_token_ids) + other_reachable
+  end
+
+  defp can_reach?(_definition, node_id, node_id), do: true
+
+  defp can_reach?(definition, from_node_id, target_node_id) do
+    do_can_reach?(definition, [from_node_id], target_node_id, MapSet.new())
+  end
+
+  defp do_can_reach?(_definition, [], _target_node_id, _seen), do: false
+
+  defp do_can_reach?(definition, [node_id | rest], target_node_id, seen) do
+    cond do
+      node_id == target_node_id ->
+        true
+
+      MapSet.member?(seen, node_id) ->
+        do_can_reach?(definition, rest, target_node_id, seen)
+
+      true ->
+        next =
+          definition
+          |> Definition.get_outputs(node_id)
+          |> Enum.reject(&Definition.is_recursive_connection?(definition, node_id, &1))
+
+        do_can_reach?(definition, rest ++ next, target_node_id, MapSet.put(seen, node_id))
+    end
   end
 
   defp handle_error_in_activity(state, token, node, exception) do

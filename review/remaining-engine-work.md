@@ -30,53 +30,47 @@ The engine now has parser/runtime/replay support for:
   cancellation of currently wait-capable activity paths, interrupting boundary
   trigger sibling cleanup, script/rules result cleanup, process termination,
   token crash cleanup, external-task error-boundary propagation, replay of
-  `BoundaryEventCancelled`, and evicted collection of boundary timer
-  cancellation.
+  `BoundaryEventCancelled`, retry-wait interruption cleanup, one-shot
+  non-interrupting timer boundary replay, and evicted collection of boundary
+  and retry timer cancellation.
+- Graph-aware inclusive gateway joins that wait for selected same-family
+  sibling tokens that can still reach the join.
+- Durable variable updates through `Instance.update_variables/2` and the server
+  API, followed by conditional re-triggering after the variable-change events
+  persist.
 
 ## P0: Supported-Subset Gaps
 
-1. Finish the remaining boundary lifecycle edge cases. Durable cancellation is
-   now wired through external-task/call completion and cancellation,
-   script/rules result completion, process termination, and interrupting
-   boundary trigger sibling cleanup. Token crash cleanup and external-task
-   error-boundary propagation append durable boundary lifecycle events before
-   registry/timer cleanup. Remaining paths include retry-wait interruption
-   timer cancellation semantics and any deeper activity interruption paths not
-   covered by the current wait-capable subset. Every non-triggered open
-   boundary registration should continue to append `BoundaryEventCancelled`
-   before in-memory registry/timer cleanup.
+No P0 supported-subset gaps are currently open in the BPJS JSON runtime. The
+completed P0 pass covered:
 
-2. Add restart/eviction tests for newly durable transitions. Current focused
-   tests cover parser/runtime behavior, but the following still need replay
-   tests:
-   - Conditional wait created, instance restored, condition re-triggered, token
-     continues only after persisted `ConditionalEventEvaluated`.
-   - Event-based gateway created with timer plus message/signal branch, instance
-     restored, non-timer branch wins, losing timer is persisted as
-     `TimerCanceled` and does not re-fire after another restore.
-   - `ExternalTaskCancellation` and `CallCanceled` close open waits after
-     restore/eviction.
-   - `BoundaryEventCancelled` keeps restored boundary registries/timers closed.
-     Direct instance replay is covered, and evicted wait collection now covers
-     boundary timers; broader load-cell end-to-end coverage is still useful.
+1. Retry-wait interruption by message, signal, and timer boundaries. The engine
+   appends `TimerCanceled` for the retry timer before in-memory timer cleanup
+   and boundary continuation. Replay and evicted wait collection do not restore
+   canceled retry timers.
 
-3. Wire explicit cancellation through service/API layers. Engine APIs exist for
-   `Instance.cancel_external_task/4` and `Instance.cancel_call/3`, but server
-   routes, AMQP acknowledgements, parent/child lifecycle callers, and operational
-   endpoints still need to use them where cancellation is possible.
+2. Boundary lifecycle integration through `Instance` APIs. Normal external-task
+   and call completion/cancellation append `BoundaryEventCancelled` before
+   activity continuation. Interrupting message/signal/timer boundaries append
+   `BoundaryEventTriggered` plus sibling `BoundaryEventCancelled` before the
+   token moves. Non-interrupting message/signal boundaries keep the original
+   activity wait open and stay registered. Non-interrupting timer boundaries
+   are defined as one-shot; each trigger closes that timer registration.
 
-4. Integrate conditional re-triggering with variable-change workflows. The
-   engine has an explicit command, but there is still no public variable-update
-   command/API, scheduler, or registry route that automatically calls it when
-   relevant variables change.
+3. Restart/eviction coverage for `ExternalTaskCancellation`, `CallCanceled`,
+   `BoundaryEventCancelled`, retry timer cancellation, and variable-update /
+   conditional re-trigger replay.
 
-5. Validate retry timer cleanup under interruption. Retry timers are now created
-   durably and external-task retry keeps activity boundary registrations open,
-   but an interrupting boundary that fires while the retry timer is open still
-   needs explicit `TimerCanceled` semantics and tests.
+4. Server/API cancellation wiring for external tasks and durable variable
+   update routing. AMQP task completion/failure/cancellation routes through
+   synchronous engine commands for resident instances so acknowledgement occurs
+   only after durable append succeeds; evicted instances are queued through
+   their load cells for restore.
 
-6. Tighten inclusive gateway join semantics. Inclusive fork exists, but joins
-   are still simplified and can be wrong for complex graph shapes.
+5. Durable variable-change conditional re-trigger via `VariablesUpdated` events
+   and EventReplayer support.
+
+6. Inclusive gateway joins with graph-aware selected-path waiting.
 
 ## P1: BPMN Coverage Still Missing
 
@@ -132,31 +126,8 @@ The engine now has parser/runtime/replay support for:
 
 ## Suggested Next Batch
 
-Start with boundary lifecycle completion and replay tests. The highest-leverage
-files are:
-
-- `apps/engine/lib/chronicle/engine/token_processor.ex`
-- `apps/engine/lib/chronicle/engine/instance.ex`
-- `apps/engine/lib/chronicle/engine/instance/wait_registry.ex`
-- `apps/engine/lib/chronicle/engine/instance/event_replayer.ex`
-- `apps/engine/lib/chronicle/engine/instance/token_state.ex`
-- `apps/engine/test/chronicle/engine/instance_*_test.exs`
-- `apps/engine/test/chronicle/engine/token_processor_bpmn_features_test.exs`
-- `apps/engine/test/chronicle/engine/evicted_wait_restore_test.exs`
-
-Recommended first tests:
-
-- External task with timer/message/signal boundaries completes normally and
-  appends `BoundaryEventCancelled` for every non-triggered boundary before the
-  external task completion event is acted on.
-- Add integration-level coverage for interrupting boundary trigger persistence
-  through `Instance` message/signal/timer commands. Focused registry and replay
-  tests now cover sibling cleanup and closed restoration.
-- Non-interrupting boundary fires and keeps the activity wait open while
-  preserving or rescheduling the expected boundary registrations. Focused
-  registry coverage exists for message boundaries; timer rescheduling still
-  needs explicit semantics.
-- Restore after `BoundaryEventCancelled` does not re-register the canceled
-  timer/message/signal boundary. Direct `EventReplayer` coverage exists.
-- Restore after event-gateway message win does not re-register the canceled
-  timer branch. Direct `EventReplayer` coverage exists.
+Move to P1 scope work: subprocess/event-subprocess semantics, conditional
+start/boundary events, compensation/cancel events, standard loop and
+multi-instance activity characteristics, and collaboration/data-object model
+support. Keep the same rule for every expansion: parseable, executable,
+replayable, and covered by restart/eviction tests before claiming support.

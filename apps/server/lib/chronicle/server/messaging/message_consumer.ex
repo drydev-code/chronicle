@@ -13,6 +13,7 @@ defmodule Chronicle.Server.Messaging.MessageConsumer do
 
   alias Chronicle.Server.Messaging.{WireFormat, AmqpConnection, DeploymentCommandPublisher}
   alias Chronicle.Engine.{Instance, Diagrams.DiagramStore}
+  alias Chronicle.Server.Host.ExternalTaskRouter
   alias Chronicle.Server.Host.Deployment.Manager
   alias Chronicle.Server.Host.LargeVariables
 
@@ -229,21 +230,33 @@ defmodule Chronicle.Server.Messaging.MessageConsumer do
       payload
     end
 
-    Logger.info("MessageConsumer: broadcasting task_completed for task_id=#{inspect(task_id)}")
-    Phoenix.PubSub.broadcast(Chronicle.PubSub, "engine:external_tasks",
-      {:task_completed, task_id, payload, result})
+    Logger.info("MessageConsumer: completing task_id=#{inspect(task_id)}")
+
+    case ExternalTaskRouter.complete_task(task_id, payload, result) do
+      :ok -> :ok
+      {:error, reason} -> raise "external task completion was not persisted: #{inspect(reason)}"
+    end
   end
 
   defp handle_service_task_failed(body) do
     if Map.get(body, "isDeletedTask", false) do
-      :skip
+      task_id = Map.get(body, "externalTaskId")
+      reason = Map.get(body, "reason") || Map.get(body, "message", "Deleted task")
+
+      case ExternalTaskRouter.cancel_task(task_id, reason) do
+        :ok -> :ok
+        {:error, :unknown_task} -> :ok
+        {:error, other} -> raise "external task cancellation was not persisted: #{inspect(other)}"
+      end
     else
       task_id = Map.get(body, "externalTaskId")
       error = Map.get(body, "error") || Map.get(body, "message", "Unknown error")
       retries = Map.get(body, "retries", 0)
 
-      Phoenix.PubSub.broadcast(Chronicle.PubSub, "engine:external_tasks",
-        {:task_failed, task_id, error, retries > 0, 1000})
+      case ExternalTaskRouter.fail_task(task_id, error, retries > 0, 1000) do
+        :ok -> :ok
+        {:error, reason} -> raise "external task failure was not persisted: #{inspect(reason)}"
+      end
     end
   end
 
@@ -259,19 +272,30 @@ defmodule Chronicle.Server.Messaging.MessageConsumer do
 
     merged_payload = Map.put(payload, "__actor", actor)
 
-    Phoenix.PubSub.broadcast(Chronicle.PubSub, "engine:external_tasks",
-      {:task_completed, task_id, merged_payload, nil})
+    case ExternalTaskRouter.complete_task(task_id, merged_payload, nil) do
+      :ok -> :ok
+      {:error, reason} -> raise "user task completion was not persisted: #{inspect(reason)}"
+    end
   end
 
   defp handle_user_task_rejected(body) do
     if Map.get(body, "isDeletedTask", false) do
-      :skip
+      task_id = Map.get(body, "externalTaskId")
+      reason = Map.get(body, "reason", "Deleted task")
+
+      case ExternalTaskRouter.cancel_task(task_id, reason) do
+        :ok -> :ok
+        {:error, :unknown_task} -> :ok
+        {:error, other} -> raise "user task cancellation was not persisted: #{inspect(other)}"
+      end
     else
       task_id = Map.get(body, "externalTaskId")
       error = %{error_message: Map.get(body, "reason", "Rejected"), error_type: "UserTaskRejected"}
 
-      Phoenix.PubSub.broadcast(Chronicle.PubSub, "engine:external_tasks",
-        {:task_failed, task_id, error, false, 0})
+      case ExternalTaskRouter.fail_task(task_id, error, false, 0) do
+        :ok -> :ok
+        {:error, reason} -> raise "user task rejection was not persisted: #{inspect(reason)}"
+      end
     end
   end
 

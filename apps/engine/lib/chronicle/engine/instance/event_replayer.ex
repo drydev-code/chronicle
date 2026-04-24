@@ -394,6 +394,21 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
     track_token_id(acc, event.token)
   end
 
+  defp replay_single_event(%PersistentData.VariablesUpdated{} = event, acc) do
+    state =
+      case Map.get(acc.state.tokens, event.token) do
+        nil ->
+          acc.state
+
+        token ->
+          token = %{token | parameters: Map.merge(token.parameters || %{}, event.variables || %{})}
+          %{acc.state | tokens: Map.put(acc.state.tokens, event.token, token)}
+      end
+
+    %{acc | state: state}
+    |> track_token_id(event.token)
+  end
+
   defp replay_single_event(%PersistentData.BoundaryEventCreated{} = event, acc) do
     boundary_node = Chronicle.Engine.Diagrams.Definition.get_node(acc.state.definition, event.boundary_node_id)
 
@@ -441,16 +456,32 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
     )
 
     acc = %{acc | state: state}
+
     acc =
-      if event.interrupting != false do
-        acc
-        |> delete_boundary_wait(event)
-        |> Map.put(:token_wait_states, Map.delete(acc.token_wait_states, event.token))
-      else
-        acc
+      cond do
+        event.interrupting != false ->
+          acc
+          |> delete_boundary_wait(event)
+          |> Map.put(:token_wait_states, Map.delete(acc.token_wait_states, event.token))
+
+        event.boundary_type == :timer ->
+          # Non-interrupting timer boundaries are one-shot: triggering creates
+          # a sibling boundary token and closes this timer registration while
+          # the original activity wait remains open.
+          delete_boundary_wait(acc, event)
+
+        true ->
+          # Non-interrupting message/signal boundaries remain registered and
+          # can trigger again while the activity is still waiting.
+          acc
       end
 
-    track_token_id(acc, event.token)
+    max_token_id =
+      acc.state.tokens
+      |> Map.keys()
+      |> Enum.reduce(event.token, &max/2)
+
+    %{acc | max_token_id: max(acc.max_token_id, max_token_id)}
   end
 
   defp replay_single_event(%PersistentData.BoundaryEventCancelled{} = event, acc) do

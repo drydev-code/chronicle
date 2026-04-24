@@ -124,6 +124,10 @@ defmodule Chronicle.Engine.InstanceLoadCell do
     handle_wake_event({:external_task_error, task_id, error, retry?, backoff_ms}, state)
   end
 
+  def handle_cast({:wake, :external_task_cancel, task_id, reason, continuation_node_id}, state) do
+    handle_wake_event({:external_task_cancel, task_id, reason, continuation_node_id}, state)
+  end
+
   def handle_cast({:wake, :message, message_name, payload}, state) do
     handle_wake_event({:message, message_name, payload}, state)
   end
@@ -216,6 +220,10 @@ defmodule Chronicle.Engine.InstanceLoadCell do
 
   defp forward_to_instance(pid, {:external_task_error, task_id, error, retry?, backoff_ms}) do
     Instance.error_external_task(pid, task_id, error, retry?, backoff_ms)
+  end
+
+  defp forward_to_instance(pid, {:external_task_cancel, task_id, reason, continuation_node_id}) do
+    Instance.cancel_external_task(pid, task_id, reason, continuation_node_id)
   end
 
   defp forward_to_instance(pid, {:message, name, payload}) do
