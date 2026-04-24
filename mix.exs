@@ -1,4 +1,4 @@
-defmodule DryDev.Workflow.Umbrella.MixProject do
+defmodule Chronicle.Umbrella.MixProject do
   use Mix.Project
 
   def project do
@@ -23,7 +23,7 @@ defmodule DryDev.Workflow.Umbrella.MixProject do
 
   defp releases do
     [
-      drydev_workflow: [
+      chronicle: [
         version: "0.1.0",
         applications: [
           engine: :load,

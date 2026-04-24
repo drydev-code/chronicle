@@ -1,4 +1,4 @@
-# DryDev Workflow
+# Chronicle
 
 Strict BPMN 2.0 workflow engine for Elixir/OTP. Event-sourced, actor-based,
 with DMN decision tables and embedded JavaScript scripting.
@@ -46,8 +46,8 @@ Diagram files are shipped inside ZIP deployment packages alongside
 ## Quick start (docker)
 
 ```bash
-git clone <repo> drydev_workflow
-cd drydev_workflow
+git clone <repo> chronicle
+cd chronicle
 docker compose up --build
 ```
 
@@ -120,7 +120,7 @@ end
 # lib/my_app/application.ex
 def start(_type, _args) do
   children = [
-    {DryDev.Workflow, []},
+    {Chronicle, []},
     # ... your own children
   ]
 
@@ -128,16 +128,16 @@ def start(_type, _args) do
 end
 ```
 
-`{DryDev.Workflow, opts}` accepts:
+`{Chronicle, opts}` accepts:
 
 - `:run_migrations` — run Ecto migrations on startup (default: `true`)
 - `:restore_instances` — replay active instances from the event store (default: `true`)
 
-If you prefer a flat child list, use `DryDev.Workflow.children(opts)` and
+If you prefer a flat child list, use `Chronicle.children(opts)` and
 concat into your own supervisor's children.
 
 The `server` app is the canonical example — see
-[`apps/server/lib/drydev/workflow_server/application.ex`](apps/server/lib/drydev/workflow_server/application.ex).
+[`apps/server/lib/chronicle/server/application.ex`](apps/server/lib/chronicle/server/application.ex).
 
 ## Project status
 
@@ -151,7 +151,7 @@ Known limitations:
 - JavaScript sandbox uses raw `node` subprocesses — adequate for trusted
   scripts, not sufficient for executing untrusted tenant code.
 - No visual BPMN editor bundled. Use any BPMN 2.0 editor capable of exporting
-  the DryDev JSON schema.
+  the Chronicle JSON schema.
 
 ## License
 

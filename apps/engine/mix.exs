@@ -1,4 +1,4 @@
-defmodule DryDev.Workflow.MixProject do
+defmodule Chronicle.MixProject do
   use Mix.Project
 
   def project do
@@ -15,7 +15,7 @@ defmodule DryDev.Workflow.MixProject do
       aliases: aliases(),
       deps: deps(),
       description:
-        "DryDev Workflow — strict BPMN 2.0 engine for Elixir/OTP. Event-sourced, " <>
+        "Chronicle — strict BPMN 2.0 engine for Elixir/OTP. Event-sourced, " <>
           "actor-based, with DMN decision tables and JavaScript scripting.",
       package: package()
     ]
@@ -58,7 +58,7 @@ defmodule DryDev.Workflow.MixProject do
   defp package do
     [
       licenses: ["Apache-2.0"],
-      links: %{"GitHub" => "https://github.com/drydev/workflow"},
+      links: %{"GitHub" => "https://github.com/drydev/chronicle"},
       files: ~w(lib priv/js priv/repo/migrations mix.exs README.md LICENSE)
     ]
   end

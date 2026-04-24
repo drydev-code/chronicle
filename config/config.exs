@@ -1,9 +1,9 @@
 import Config
 
 config :engine,
-  ecto_repos: [DryDev.Workflow.Persistence.Repo.MySQL],
-  active_repo: DryDev.Workflow.Persistence.Repo.MySQL,
-  active_databus_repo: DryDev.Workflow.Persistence.DataBusRepo.MySQL
+  ecto_repos: [Chronicle.Persistence.Repo.MySQL],
+  active_repo: Chronicle.Persistence.Repo.MySQL,
+  active_databus_repo: Chronicle.Persistence.DataBusRepo.MySQL
 
 config :engine, :eviction,
   enabled: false,
@@ -11,11 +11,11 @@ config :engine, :eviction,
   scan_interval_ms: 60_000,
   max_resident: nil
 
-config :server, DryDev.WorkflowServer.Web.Endpoint,
+config :server, Chronicle.Server.Web.Endpoint,
   url: [host: "localhost"],
-  render_errors: [formats: [json: DryDev.WorkflowServer.Web.ErrorJSON], layout: false],
-  pubsub_server: DryDev.Workflow.PubSub,
-  live_view: [signing_salt: "drydev_wf_salt"]
+  render_errors: [formats: [json: Chronicle.Server.Web.ErrorJSON], layout: false],
+  pubsub_server: Chronicle.PubSub,
+  live_view: [signing_salt: "chronicle_salt"]
 
 config :logger, :console,
   format: "$time $metadata[$level] $message\n",

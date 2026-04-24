@@ -1,5 +1,5 @@
 /**
- * Node.js JavaScript evaluator for DryDev.Workflow.
+ * Node.js JavaScript evaluator for Chronicle.
  * Communicates via JSON lines over stdin/stdout.
  * API-compatible with Jint (.NET JS engine).
  */

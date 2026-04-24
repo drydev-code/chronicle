@@ -14,18 +14,18 @@ end
 if config_env() == :prod do
   {active_repo, default_db_port} =
     case System.get_env("DB_ADAPTER", "mysql") do
-      "postgres" -> {DryDev.Workflow.Persistence.Repo.Postgres, "5432"}
-      "mssql" -> {DryDev.Workflow.Persistence.Repo.MsSql, "1433"}
-      _ -> {DryDev.Workflow.Persistence.Repo.MySQL, "3306"}
+      "postgres" -> {Chronicle.Persistence.Repo.Postgres, "5432"}
+      "mssql" -> {Chronicle.Persistence.Repo.MsSql, "1433"}
+      _ -> {Chronicle.Persistence.Repo.MySQL, "3306"}
     end
 
   db_adapter_name = System.get_env("DATABUS_ADAPTER", System.get_env("DB_ADAPTER", "mysql"))
 
   {active_databus_repo, default_databus_port} =
     case db_adapter_name do
-      "postgres" -> {DryDev.Workflow.Persistence.DataBusRepo.Postgres, "5432"}
-      "mssql" -> {DryDev.Workflow.Persistence.DataBusRepo.MsSql, "1433"}
-      _ -> {DryDev.Workflow.Persistence.DataBusRepo.MySQL, "3306"}
+      "postgres" -> {Chronicle.Persistence.DataBusRepo.Postgres, "5432"}
+      "mssql" -> {Chronicle.Persistence.DataBusRepo.MsSql, "1433"}
+      _ -> {Chronicle.Persistence.DataBusRepo.MySQL, "3306"}
     end
 
   config :engine,
@@ -50,7 +50,7 @@ if config_env() == :prod do
 
   secret_key_base = System.fetch_env!("SECRET_KEY_BASE")
 
-  config :server, DryDev.WorkflowServer.Web.Endpoint,
+  config :server, Chronicle.Server.Web.Endpoint,
     http: [
       ip: {0, 0, 0, 0},
       port: String.to_integer(System.get_env("PORT", "4000"))

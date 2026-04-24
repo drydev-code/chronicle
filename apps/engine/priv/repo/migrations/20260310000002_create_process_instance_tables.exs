@@ -1,4 +1,4 @@
-defmodule DryDev.Workflow.Persistence.Repo.Migrations.CreateProcessInstanceTables do
+defmodule Chronicle.Persistence.Repo.Migrations.CreateProcessInstanceTables do
   use Ecto.Migration
 
   def up do

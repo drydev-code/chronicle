@@ -1,4 +1,4 @@
-defmodule DryDev.WorkflowServer.MixProject do
+defmodule Chronicle.Server.MixProject do
   use Mix.Project
 
   def project do
@@ -21,7 +21,7 @@ defmodule DryDev.WorkflowServer.MixProject do
 
   def application do
     [
-      mod: {DryDev.WorkflowServer.Application, []},
+      mod: {Chronicle.Server.Application, []},
       extra_applications: [:logger, :runtime_tools]
     ]
   end
