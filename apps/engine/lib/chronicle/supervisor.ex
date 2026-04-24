@@ -46,6 +46,11 @@ defmodule Chronicle.Supervisor do
       Chronicle.Engine.Dmn.DmnStore,
       Chronicle.Engine.Scripting.ScriptPool,
       {DynamicSupervisor,
+       name: Chronicle.Engine.LoadCellSupervisor,
+       strategy: :one_for_one,
+       max_restarts: 1000,
+       max_seconds: 5},
+      {DynamicSupervisor,
        name: Chronicle.Engine.InstanceSupervisor,
        strategy: :one_for_one,
        max_restarts: 1000,
@@ -53,7 +58,22 @@ defmodule Chronicle.Supervisor do
       Chronicle.Engine.EvictionManager
     ]
 
-    restore_child = if restore?, do: [{Task, fn -> restore_active_instances() end}], else: []
+    restore_child =
+      if restore? do
+        [
+          {Task,
+           fn ->
+             # `restore_active_instances/0` brings active instances back resident
+             # which re-registers their waits via the normal `InstanceLoadCell`
+             # path. `EvictedWaitRestorer.restore_all/0` is intentionally NOT
+             # called here — it would double-register waits and its current
+             # implementation has known correctness issues (see module doc).
+             restore_active_instances()
+           end}
+        ]
+      else
+        []
+      end
 
     Enum.reject(base ++ restore_child, &is_nil/1)
   end

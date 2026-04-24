@@ -60,18 +60,22 @@ defmodule Chronicle.Server.Host.Deployment.Manager do
     case Parser.parse(content) do
       {:ok, definitions} when is_list(definitions) ->
         # Multi-process diagram (e.g., with subprocesses)
-        register_definitions(definitions, tenant_id)
+        register_definitions(definitions, tenant_id, content)
 
       {:ok, definition} ->
-        register_single_definition(definition, tenant_id)
+        register_single_definition(definition, tenant_id, content)
 
       {:error, reason} ->
         {:error, {:parse_failed, reason}}
     end
   end
 
-  defp register_definitions(definitions, tenant_id) do
-    results = Enum.map(definitions, fn def -> register_single_definition(def, tenant_id) end)
+  defp register_definitions(definitions, tenant_id, raw_content) do
+    results =
+      Enum.map(definitions, fn def ->
+        register_single_definition(def, tenant_id, raw_content)
+      end)
+
     errors = Enum.filter(results, &match?({:error, _}, &1))
 
     if length(errors) > 0 do
@@ -82,14 +86,21 @@ defmodule Chronicle.Server.Host.Deployment.Manager do
     end
   end
 
-  defp register_single_definition(definition, tenant_id) do
+  defp register_single_definition(definition, tenant_id, raw_content) do
     findings = Sanitizer.check(definition)
     errors = Enum.filter(findings, &(&1.severity == :error))
 
     if length(errors) > 0 do
       {:error, {:validation_failed, errors}}
     else
-      DiagramStore.register(definition.name, definition.version, tenant_id, definition)
+      DiagramStore.register(
+        definition.name,
+        definition.version,
+        tenant_id,
+        definition,
+        raw_content
+      )
+
       {:ok, definition.name}
     end
   end

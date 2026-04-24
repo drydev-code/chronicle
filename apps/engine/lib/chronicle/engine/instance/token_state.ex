@@ -44,6 +44,7 @@ defmodule Chronicle.Engine.Instance.TokenState do
       next_token_id: 0,
       timer_refs: %{},
       persistent_events: [],
+      last_persisted_index: 0,
       start_parameters: %{},
       start_node_id: nil
     }

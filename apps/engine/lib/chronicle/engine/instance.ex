@@ -38,7 +38,8 @@ defmodule Chronicle.Engine.Instance do
     pin_reason: atom(),
     next_token_id: non_neg_integer(),
     timer_refs: map(),
-    persistent_events: [term()]
+    persistent_events: [term()],
+    last_persisted_index: non_neg_integer()
   }
 
   # --- Public API ---
@@ -148,11 +149,23 @@ defmodule Chronicle.Engine.Instance do
 
     state = append_event(state, start_data)
 
-    # Broadcast start event
-    Phoenix.PubSub.broadcast(Chronicle.PubSub, "engine:events",
-      {:process_instance_started, id, business_key, tenant_id, start_data})
+    # Persist the initial ProcessInstanceStart event synchronously so that
+    # the active row is created before we begin processing. A crash between
+    # here and the first waiting transition must still be recoverable.
+    case Chronicle.Persistence.EventStore.create(id, start_data) do
+      {:ok, _} ->
+        state = %{state | last_persisted_index: length(state.persistent_events)}
 
-    {:ok, state, {:continue, :start_initial_token}}
+        # Broadcast start event
+        Phoenix.PubSub.broadcast(Chronicle.PubSub, "engine:events",
+          {:process_instance_started, id, business_key, tenant_id, start_data})
+
+        {:ok, state, {:continue, :start_initial_token}}
+
+      {:error, reason} ->
+        Logger.error("Instance #{id}: Failed to persist start event: #{inspect(reason)}")
+        {:stop, {:persist_start_failed, reason}}
+    end
   end
 
   def init({:restore, instance_id, tenant_id, events}) do
@@ -160,7 +173,8 @@ defmodule Chronicle.Engine.Instance do
       id: instance_id,
       tenant_id: tenant_id,
       instance_state: :simulating,
-      persistent_events: events
+      persistent_events: events,
+      last_persisted_index: length(events)
     })
 
     {:ok, state, {:continue, {:restore, events}}}
@@ -212,16 +226,34 @@ defmodule Chronicle.Engine.Instance do
   def handle_continue(:process_tokens, state) do
     state = Chronicle.Engine.TokenProcessor.process_active_tokens(state)
 
-    cond do
-      MapSet.size(state.active_tokens) > 0 ->
-        {:noreply, state, {:continue, :process_tokens}}
+    case sync_persist(state) do
+      {:ok, state} ->
+        cond do
+          MapSet.size(state.active_tokens) > 0 ->
+            {:noreply, state, {:continue, :process_tokens}}
 
-      MapSet.size(state.waiting_tokens) == 0 and MapSet.size(state.active_tokens) == 0 ->
-        state = complete_instance(state)
-        {:noreply, state}
+          MapSet.size(state.waiting_tokens) == 0 and MapSet.size(state.active_tokens) == 0 ->
+            case complete_instance(state) do
+              {:ok, state} ->
+                {:noreply, state}
 
-      true ->
-        state = %{state | instance_state: :waiting, pin_state: :not_pinned, pin_reason: :none}
+              {:error, reason, state} ->
+                # Completion persistence failed — stop so the supervisor can
+                # restart and replay from the durable log. Hibernating would
+                # strand the instance with no active/waiting tokens and no
+                # retry path.
+                {:stop, {:persist_failed, reason}, state}
+            end
+
+          true ->
+            state = %{state | instance_state: :waiting, pin_state: :not_pinned, pin_reason: :none}
+            {:noreply, state, :hibernate}
+        end
+
+      {:error, _reason, state} ->
+        # In-cycle persistence failed. Do not continue token processing and
+        # do not publish any downstream event. Hibernate so the next inbound
+        # message (or a supervisor-driven restart) retries.
         {:noreply, state, :hibernate}
     end
   end
@@ -267,10 +299,18 @@ defmodule Chronicle.Engine.Instance do
         }
         state = append_event(state, event)
 
-        Phoenix.PubSub.broadcast(Chronicle.PubSub, "engine:events",
-          {:external_task_completed, state.id, task_id, true})
+        case sync_persist(state) do
+          {:ok, state} ->
+            Phoenix.PubSub.broadcast(Chronicle.PubSub, "engine:events",
+              {:external_task_completed, state.id, task_id, true})
 
-        {:noreply, state, {:continue, :process_tokens}}
+            {:noreply, state, {:continue, :process_tokens}}
+
+          {:error, _reason, state} ->
+            # Do not publish completion or continue token processing. The
+            # next redelivery / external retry will re-invoke this handler.
+            {:noreply, state}
+        end
     end
   end
 
@@ -282,13 +322,23 @@ defmodule Chronicle.Engine.Instance do
   end
 
   def handle_cast({:terminate, reason}, state) do
-    state = TokenState.terminate_all_tokens(state, reason)
-    persist_termination(state, reason)
+    candidate = TokenState.terminate_all_tokens(state, reason)
 
-    Phoenix.PubSub.broadcast(Chronicle.PubSub, "engine:events",
-      {:process_instance_terminated, state.id, state.business_key, state.tenant_id, reason})
+    case persist_termination(candidate, reason) do
+      :ok ->
+        candidate = %{candidate | last_persisted_index: length(candidate.persistent_events)}
 
-    {:noreply, state}
+        Phoenix.PubSub.broadcast(Chronicle.PubSub, "engine:events",
+          {:process_instance_terminated, candidate.id, candidate.business_key, candidate.tenant_id, reason})
+
+        {:noreply, candidate}
+
+      {:error, err} ->
+        Logger.error("Instance #{state.id}: Termination persistence failed: #{inspect(err)}")
+        # Do not publish termination or accept terminated state. Keep the
+        # instance in its prior state so a retry/replay can resolve it.
+        {:noreply, state}
+    end
   end
 
   def handle_cast(:force_pin, state) do
@@ -336,16 +386,57 @@ defmodule Chronicle.Engine.Instance do
   @impl true
   def handle_info({:timer_elapsed, token_id, timer_ref}, state) do
     case WaitRegistry.handle_timer_elapsed(state, token_id, timer_ref) do
-      {:resumed, state} -> {:noreply, state, {:continue, :process_tokens}}
-      {:ignored, state} -> {:noreply, state}
+      {:resumed, state} ->
+        state = append_timer_elapsed_event(state, token_id)
+
+        case sync_persist(state) do
+          {:ok, state} ->
+            {:noreply, state, {:continue, :process_tokens}}
+
+          {:error, _reason, state} ->
+            # Hibernate without publishing; timer will re-fire or instance
+            # will be restored from the event log after a crash.
+            {:noreply, state, :hibernate}
+        end
+
+      {:ignored, state} ->
+        {:noreply, state}
     end
   end
 
   def handle_info({:boundary_timer_elapsed, token_id, boundary_node_id, timer_ref}, state) do
     case WaitRegistry.handle_boundary_timer_elapsed(state, token_id, boundary_node_id, timer_ref) do
-      {:resumed, state} -> {:noreply, state, {:continue, :process_tokens}}
-      {:ignored, state} -> {:noreply, state}
+      {:resumed, state} ->
+        state = append_timer_elapsed_event(state, token_id)
+
+        case sync_persist(state) do
+          {:ok, state} ->
+            {:noreply, state, {:continue, :process_tokens}}
+
+          {:error, _reason, state} ->
+            {:noreply, state, :hibernate}
+        end
+
+      {:ignored, state} ->
+        {:noreply, state}
     end
+  end
+
+  defp append_timer_elapsed_event(state, token_id) do
+    token = Map.get(state.tokens, token_id)
+    timer_id = token && (token.context[:intermediate_timer_id] || token.context[:timer_id])
+
+    event = %PersistentData.TimerElapsed{
+      token: token_id,
+      family: token && token.family,
+      current_node: token && token.current_node,
+      target_node: token && token.current_node,
+      timer_id: timer_id,
+      retry_counter: token && token.context[:retries],
+      triggered_at: System.system_time(:millisecond)
+    }
+
+    append_event(state, event)
   end
 
   @impl true
@@ -376,7 +467,14 @@ defmodule Chronicle.Engine.Instance do
 
   def handle_call({:migrate, new_definition, node_mappings}, _from, state) do
     state = Migration.migrate(state, new_definition, node_mappings)
-    {:reply, :ok, state}
+
+    case sync_persist(state) do
+      {:ok, state} ->
+        {:reply, :ok, state}
+
+      {:error, reason, state} ->
+        {:reply, {:error, {:persist_failed, reason}}, state}
+    end
   end
 
   # --- Internal Helpers ---
@@ -389,49 +487,120 @@ defmodule Chronicle.Engine.Instance do
       |> Enum.map(& &1.context[:completion_data])
       |> Enum.reject(&is_nil/1)
 
-    state = %{state | instance_state: :completed, pin_state: :not_pinned, pin_reason: :none}
+    candidate = %{state | instance_state: :completed, pin_state: :not_pinned, pin_reason: :none}
 
-    persist_completion(state)
+    case persist_completion(candidate) do
+      :ok ->
+        # After a successful complete/3 the active row is deleted and the
+        # completed row carries the full event list; treat as fully persisted.
+        candidate = %{candidate | last_persisted_index: length(candidate.persistent_events)}
 
-    Phoenix.PubSub.broadcast(Chronicle.PubSub, "engine:events",
-      {:process_instance_completed, state.id, state.business_key, state.tenant_id, completion_data})
+        Phoenix.PubSub.broadcast(Chronicle.PubSub, "engine:events",
+          {:process_instance_completed, candidate.id, candidate.business_key, candidate.tenant_id, completion_data})
 
-    if state.parent_id do
-      case lookup(state.tenant_id, state.parent_id) do
-        {:ok, parent_pid} ->
-          GenServer.cast(parent_pid, {:child_completed, state.id, completion_data, true})
-        _ -> :ok
-      end
+        if candidate.parent_id do
+          case lookup(candidate.tenant_id, candidate.parent_id) do
+            {:ok, parent_pid} ->
+              GenServer.cast(parent_pid, {:child_completed, candidate.id, completion_data, true})
+            _ -> :ok
+          end
+        end
+
+        if Chronicle.Engine.LargeVariablesCleaner.enabled?() do
+          cleanup_state = candidate
+          Task.start(fn ->
+            all_params = cleanup_state.tokens |> Map.values() |> Enum.map(& &1.parameters)
+            Enum.each(all_params, &Chronicle.Engine.LargeVariablesCleaner.cleanup(&1, cleanup_state.tenant_id))
+          end)
+        end
+
+        {:ok, candidate}
+
+      {:error, reason} ->
+        Logger.error("Instance #{state.id}: Completion persistence failed, leaving instance active: #{inspect(reason)}")
+        # Do NOT publish the completion event nor notify the parent.
+        # Keep the instance in its pre-completion state so a supervisor
+        # restart (or retry) can replay from the durable log.
+        {:error, reason, state}
     end
-
-    if Chronicle.Engine.LargeVariablesCleaner.enabled?() do
-      cleanup_state = state
-      Task.start(fn ->
-        all_params = cleanup_state.tokens |> Map.values() |> Enum.map(& &1.parameters)
-        Enum.each(all_params, &Chronicle.Engine.LargeVariablesCleaner.cleanup(&1, cleanup_state.tenant_id))
-      end)
-    end
-
-    state
   end
 
   defp append_event(state, event) do
     %{state | persistent_events: state.persistent_events ++ [event]}
   end
 
+  # --- Persistence helpers ---
+
+  @doc false
+  # Synchronously flushes any events appended to `state.persistent_events`
+  # since the last persist. On success returns `{:ok, state}` with
+  # `last_persisted_index` bumped to the current length. On failure returns
+  # `{:error, reason, state}` so callers can abort downstream publishing.
+  #
+  # Callers MUST NOT publish downstream events (PubSub broadcasts, parent
+  # notifications, AMQP acks etc.) when this returns `:error` — the durable
+  # transition has not been written.
+  defp sync_persist(%{instance_state: :simulating} = state), do: {:ok, state}
+  defp sync_persist(state) do
+    total = length(state.persistent_events)
+    delta = total - state.last_persisted_index
+
+    cond do
+      delta <= 0 ->
+        {:ok, state}
+
+      true ->
+        pending = Enum.drop(state.persistent_events, state.last_persisted_index)
+
+        case safe_append_batch(state.id, pending) do
+          :ok ->
+            {:ok, %{state | last_persisted_index: total}}
+
+          {:error, reason} ->
+            Logger.error("Instance #{state.id}: Failed to persist #{delta} events: #{inspect(reason)}")
+            {:error, reason, state}
+        end
+    end
+  end
+
+  defp safe_append_batch(instance_id, events) do
+    try do
+      case Chronicle.Persistence.EventStore.append_batch(instance_id, events) do
+        {:ok, _} -> :ok
+        :ok -> :ok
+        other -> {:error, other}
+      end
+    rescue
+      e -> {:error, e}
+    catch
+      :exit, reason -> {:error, {:exit, reason}}
+    end
+  end
+
+  # Synchronous completion persistence. Called inline — Ecto calls are already
+  # synchronous, and wrapping in Task.async + Task.await only adds linked-task
+  # failure semantics without changing timeout behaviour (Ecto's own pool
+  # timeout raises on DB stalls just the same).
+  # Returns :ok on success, {:error, reason} on failure.
   defp persist_completion(state) do
-    Task.start(fn ->
-      Chronicle.Persistence.EventStore.complete(
-        state.id, state.persistent_events
-      )
-    end)
+    case Chronicle.Persistence.EventStore.complete(state.id, state.persistent_events) do
+      {:ok, _} -> :ok
+      other -> {:error, other}
+    end
+  rescue
+    e -> {:error, e}
+  catch
+    :exit, reason -> {:error, {:exit, reason}}
   end
 
   defp persist_termination(state, reason) do
-    Task.start(fn ->
-      Chronicle.Persistence.EventStore.terminate(
-        state.id, state.persistent_events, reason
-      )
-    end)
+    case Chronicle.Persistence.EventStore.terminate(state.id, state.persistent_events, reason) do
+      {:ok, _} -> :ok
+      other -> {:error, other}
+    end
+  rescue
+    e -> {:error, e}
+  catch
+    :exit, exit_reason -> {:error, {:exit, exit_reason}}
   end
 end

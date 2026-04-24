@@ -162,12 +162,33 @@ defmodule Chronicle.Engine.EvictionManager do
           end
 
         {:error, :not_found} ->
-          # No LoadCell yet — create one and evict
-          {:ok, cell_pid} = InstanceLoadCell.start_link({id, tenant_id, business_key, pid})
-          case InstanceLoadCell.evict(cell_pid) do
-            :ok -> :ok
-            {:error, _} ->
-              GenServer.stop(cell_pid, :normal)
+          # No LoadCell yet — start one under the dedicated supervisor so the
+          # cell survives EvictionManager crashes.
+          case DynamicSupervisor.start_child(
+                 Chronicle.Engine.LoadCellSupervisor,
+                 {InstanceLoadCell, {id, tenant_id, business_key, pid}}
+               ) do
+            {:ok, cell_pid} ->
+              case InstanceLoadCell.evict(cell_pid) do
+                :ok ->
+                  :ok
+
+                {:error, _} ->
+                  DynamicSupervisor.terminate_child(
+                    Chronicle.Engine.LoadCellSupervisor,
+                    cell_pid
+                  )
+
+                  :error
+              end
+
+            {:error, {:already_started, cell_pid}} ->
+              case InstanceLoadCell.evict(cell_pid) do
+                :ok -> :ok
+                {:error, _} -> :error
+              end
+
+            {:error, _reason} ->
               :error
           end
       end

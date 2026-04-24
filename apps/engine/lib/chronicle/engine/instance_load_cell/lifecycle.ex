@@ -31,27 +31,37 @@ defmodule Chronicle.Engine.InstanceLoadCell.Lifecycle do
         # Extract waiting handles from instance state
         handles = extract_waiting_handles(instance_state)
 
-        # Persist current events to DB (ensure nothing is lost)
-        persist_events_sync(instance_state)
+        # Persist current events to DB (ensure nothing is lost). If this
+        # fails we must NOT stop the instance — unflushed events would be
+        # lost and the durable replay would be incomplete.
+        case persist_events_sync(instance_state) do
+          :ok ->
+            # Stop the Instance GenServer
+            GenServer.stop(instance_pid, :normal)
 
-        # Stop the Instance GenServer
-        GenServer.stop(instance_pid, :normal)
+            # Register handles for wake-up routing
+            timer_refs = register_evicted_timers(handles, state.instance_id)
 
-        # Register handles for wake-up routing
-        timer_refs = register_evicted_timers(handles, state.instance_id)
+            # Re-register message/signal handles in :waits registry for this LoadCell
+            register_evicted_waits(handles, self())
 
-        # Re-register message/signal handles in :waits registry for this LoadCell
-        register_evicted_waits(handles, self())
+            new_state = %{state |
+              cell_state: :evicted,
+              instance_pid: nil,
+              waiting_handles: handles,
+              timer_refs: timer_refs
+            }
 
-        new_state = %{state |
-          cell_state: :evicted,
-          instance_pid: nil,
-          waiting_handles: handles,
-          timer_refs: timer_refs
-        }
+            Logger.info("InstanceLoadCell #{state.instance_id}: Evicted with #{length(handles)} waiting handles")
+            {:ok, new_state}
 
-        Logger.info("InstanceLoadCell #{state.instance_id}: Evicted with #{length(handles)} waiting handles")
-        {:ok, new_state}
+          {:error, reason} ->
+            Logger.error(
+              "InstanceLoadCell #{state.instance_id}: Eviction aborted, persist failed: #{inspect(reason)}"
+            )
+
+            {:error, {:persist_failed, reason}}
+        end
       end
     catch
       :exit, _ -> {:error, :instance_not_responding}
@@ -171,12 +181,45 @@ defmodule Chronicle.Engine.InstanceLoadCell.Lifecycle do
     ext_handles ++ msg_handles ++ sig_handles ++ call_handles ++ timer_handles
   end
 
+  # Flushes any unpersisted events to the EventStore.
+  # Returns `:ok` if everything was already persisted or the append succeeded,
+  # `{:error, reason}` otherwise. Callers MUST NOT proceed to stop the
+  # instance when this returns an error — the unflushed events would be lost.
   defp persist_events_sync(instance_state) do
-    try do
-      EventStore.append_batch(instance_state.id, instance_state.persistent_events)
-    rescue
-      _ -> :ok
+    total = length(instance_state.persistent_events)
+    # Prefer the in-memory index the Instance maintains. Fall back to the
+    # EventStore's persisted count in case an older (pre-index) state is
+    # still in flight — this preserves the invariant that we only ever
+    # append the delta and never re-send events already in the store.
+    already_persisted =
+      case Map.get(instance_state, :last_persisted_index) do
+        idx when is_integer(idx) -> idx
+        _ -> EventStore.current_sequence(instance_state.id)
+      end
+
+    pending =
+      if already_persisted < total do
+        Enum.drop(instance_state.persistent_events, already_persisted)
+      else
+        []
+      end
+
+    case pending do
+      [] ->
+        :ok
+
+      events ->
+        case EventStore.append_batch(instance_state.id, events) do
+          {:ok, _} -> :ok
+          :ok -> :ok
+          {:error, reason} -> {:error, reason}
+          other -> {:error, other}
+        end
     end
+  rescue
+    e -> {:error, e}
+  catch
+    :exit, reason -> {:error, {:exit, reason}}
   end
 
   defp register_evicted_timers(handles, _instance_id) do

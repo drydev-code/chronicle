@@ -62,6 +62,7 @@ defmodule Chronicle.Persistence.EventStore do
     end)
   end
 
+  def append_batch(_instance_id, []), do: {:ok, :noop}
   def append_batch(instance_id, events) when is_list(events) do
     case Repo.get(ActiveInstance, instance_id) do
       nil ->
@@ -79,6 +80,21 @@ defmodule Chronicle.Persistence.EventStore do
         active
         |> ActiveInstance.changeset(%{data: Jason.encode!(updated)})
         |> Repo.update()
+    end
+  end
+
+  @doc """
+  Returns the count of events already persisted for an instance.
+  Returns 0 if no active row exists for this instance.
+  """
+  def current_sequence(instance_id) do
+    case Repo.get(ActiveInstance, instance_id) do
+      nil -> 0
+      active ->
+        case Jason.decode(active.data) do
+          {:ok, list} when is_list(list) -> length(list)
+          _ -> 0
+        end
     end
   end
 
