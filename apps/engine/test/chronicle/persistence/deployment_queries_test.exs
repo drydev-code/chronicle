@@ -10,7 +10,17 @@ defmodule Chronicle.Persistence.DeploymentQueriesTest do
 
     if repo do
       :ok = Ecto.Adapters.SQL.Sandbox.checkout(repo)
+      Ecto.Adapters.SQL.Sandbox.mode(repo, {:shared, self()})
       Repo.delete_all(Deployment)
+
+      on_exit(fn ->
+        try do
+          Ecto.Adapters.SQL.Sandbox.mode(repo, :manual)
+        rescue
+          _ -> :ok
+        end
+      end)
+
       {:ok, repo: repo}
     else
       {:ok, repo: nil}
@@ -101,6 +111,33 @@ defmodule Chronicle.Persistence.DeploymentQueriesTest do
       assert_raise FunctionClauseError, fn ->
         Queries.save_deployment("t", "p", 1, "xml", "x")
       end
+    end
+  end
+
+  describe "concurrent saves" do
+    @tag :integration
+    test "two concurrent saves of the same key do not race — exactly one row remains" do
+      # Without `on_conflict`, the previous get_by/insert-or-update sequence
+      # could race so both callers attempted the insert path and one raised
+      # a unique-constraint violation. The upsert path must survive this.
+      tasks =
+        for n <- 1..10 do
+          Task.async(fn ->
+            Queries.save_deployment("race-tenant", "same-proc", 1, "bpmn", "body-#{n}")
+          end)
+        end
+
+      results = Enum.map(tasks, &Task.await(&1, 5_000))
+
+      # Every save should have succeeded (no exceptions, no {:error, ...}).
+      refute Enum.any?(results, &match?({:error, _}, &1)),
+             "expected every concurrent save to succeed, got: #{inspect(results)}"
+
+      all = Queries.load_all_deployments()
+      matching = Enum.filter(all, fn d -> d.name == "same-proc" end)
+
+      assert length(matching) == 1,
+             "expected exactly one row after concurrent upserts, saw #{length(matching)}"
     end
   end
 end
