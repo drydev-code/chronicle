@@ -18,7 +18,8 @@ supervision tree. Run `:server` when you want a batteries-included service.
 ## Features
 
 - **BPJS BPMN subset semantics**: start/end events, intermediate catch/throw,
-  gateways (exclusive, parallel, inclusive), and supported boundary events.
+  gateways (exclusive, parallel, inclusive, event-based), first-class send,
+  receive, and manual tasks, and supported boundary events.
 - **Token-based execution** on a per-instance `GenServer` with event-sourcing
   semantics (append-only log, replay on restart). Commands append durable
   events before publishing effects or mutating query-facing projections.
@@ -43,10 +44,21 @@ BPMN XML in this release:
 
 Supported BPJS node types are declared in
 `Chronicle.Engine.Diagrams.SupportedFeatures`. Unsupported BPMN features such
-as embedded/event/transaction subprocesses, event-based/complex gateways,
-conditional/link/cancel/compensation/multiple events, and standard
+as embedded/event/transaction subprocesses, complex gateways, conditional
+start/boundary events, cancel/compensation/multiple events, and standard
 multi-instance loop characteristics fail during parsing instead of silently
 falling through.
+
+Event-based gateways are limited to supported message, signal, receive-task,
+and timer branches; unsupported outgoing branches are rejected. Intermediate
+conditional catches can park as durable waits and be explicitly re-triggered
+through the instance API when variables change.
+
+Boundary message, signal, and timer waits are supported for the current
+wait-capable activity subset with durable create/cancel/trigger replay.
+Remaining boundary limitations include retry-wait interruption semantics,
+deeper activity interruption edge cases, and unsupported conditional,
+compensation, cancel, multiple, and parallel-multiple boundary events.
 
 Diagram files are shipped inside ZIP deployment packages alongside
 `.dmn` decision tables.

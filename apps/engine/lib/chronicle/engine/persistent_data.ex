@@ -66,6 +66,36 @@ defmodule Chronicle.Engine.PersistentData do
     defstruct [:token, :family, :current_node, :signal_name]
   end
 
+  defmodule EventGatewayActivated do
+    defstruct [
+      :token, :family, :current_node, :message_names, :signal_names,
+      :timer_ids, :trigger_at_by_timer_id
+    ]
+  end
+
+  defmodule EventGatewayResolved do
+    defstruct [
+      :token, :family, :current_node, :trigger_type, :trigger_name,
+      :selected_node, :target_node, :payload, :triggered_at
+    ]
+  end
+
+  defmodule ConditionalEventWaitCreated do
+    defstruct [:token, :family, :current_node, :condition, :condition_key]
+  end
+
+  defmodule ConditionalEventEvaluated do
+    defstruct [:token, :family, :current_node, :condition, :matched, :target_node, :evaluated_at]
+  end
+
+  defmodule LinkTraversed do
+    defstruct [:token, :family, :current_node, :link_name, :target_node]
+  end
+
+  defmodule NoOpTaskCompleted do
+    defstruct [:token, :family, :current_node, :task_type, :target_node]
+  end
+
   defmodule BoundaryEventCreated do
     defstruct [
       :token, :family, :current_node, :boundary_node_id, :boundary_type,

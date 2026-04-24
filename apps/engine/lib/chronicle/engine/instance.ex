@@ -9,7 +9,7 @@ defmodule Chronicle.Engine.Instance do
 
   alias Chronicle.Engine.{Token, PersistentData}
   alias Chronicle.Engine.Diagrams.Definition
-  alias Chronicle.Engine.Instance.{TokenState, EventReplayer, WaitRegistry, Migration}
+  alias Chronicle.Engine.Instance.{TokenState, EventReplayer, WaitRegistry, Migration, BoundaryLifecycle}
 
   @type state :: %{
     id: String.t(),
@@ -73,6 +73,18 @@ defmodule Chronicle.Engine.Instance do
 
   def error_external_task(pid, task_id, error, retry?, backoff_ms) do
     GenServer.cast(pid, {:external_task_error, task_id, error, retry?, backoff_ms})
+  end
+
+  def cancel_external_task(pid, task_id, reason, continuation_node_id \\ nil) do
+    GenServer.cast(pid, {:external_task_cancel, task_id, reason, continuation_node_id})
+  end
+
+  def cancel_call(pid, child_id, next_node \\ nil) do
+    GenServer.cast(pid, {:call_cancel, child_id, next_node})
+  end
+
+  def retrigger_conditionals(pid, variables \\ %{}) do
+    GenServer.cast(pid, {:retrigger_conditionals, variables})
   end
 
   def terminate_instance(pid, reason) do
@@ -321,8 +333,12 @@ defmodule Chronicle.Engine.Instance do
           result: result
         }
 
-        case persist_command_events(state, [event]) do
+        events = BoundaryLifecycle.cancellation_events(state, token_id) ++ [event]
+
+        case persist_command_events(state, events) do
           {:ok, state} ->
+            state = WaitRegistry.cancel_boundary_registrations(state, token_id)
+
             case WaitRegistry.complete_external_task(state, task_id, payload, result) do
               {:ok, state, _token_id} ->
                 Phoenix.PubSub.broadcast(Chronicle.PubSub, "engine:events",
@@ -357,8 +373,18 @@ defmodule Chronicle.Engine.Instance do
           retry_counter: token && token.context[:retries]
         }
 
-        case persist_command_events(state, [event]) do
+        {events, boundary_cleanup?} =
+          external_task_error_events(state, token, retry?, error, event)
+
+        case persist_command_events(state, events) do
           {:ok, state} ->
+            state =
+              if boundary_cleanup? do
+                WaitRegistry.cancel_boundary_registrations(state, token_id)
+              else
+                state
+              end
+
             case WaitRegistry.error_external_task(state, task_id, error, retry?, backoff_ms) do
               {:error, :not_found} -> {:noreply, state}
               {:ok, state} -> {:noreply, state, {:continue, :process_tokens}}
@@ -370,12 +396,53 @@ defmodule Chronicle.Engine.Instance do
     end
   end
 
+  def handle_cast({:external_task_cancel, task_id, reason, continuation_node_id}, state) do
+    case Map.get(state.external_tasks, task_id) do
+      nil ->
+        {:noreply, state}
+
+      token_id ->
+        token = Map.get(state.tokens, token_id)
+        continuation_node_id = continuation_node_id || first_output_for_token(state, token)
+
+        event = %PersistentData.ExternalTaskCancellation{
+          token: token_id,
+          family: token && token.family,
+          current_node: token && token.current_node,
+          external_task: task_id,
+          cancellation_reason: reason,
+          continuation_node_id: continuation_node_id,
+          retry_counter: token && token.context[:retries]
+        }
+
+        events = BoundaryLifecycle.cancellation_events(state, token_id) ++ [event]
+
+        case persist_command_events(state, events) do
+          {:ok, state} ->
+            state =
+              state
+              |> WaitRegistry.cancel_boundary_registrations(token_id)
+              |> WaitRegistry.cancel_external_task(task_id, reason, continuation_node_id)
+
+            {:noreply, state, {:continue, :process_tokens}}
+
+          {:error, _reason, state} ->
+            {:noreply, state}
+        end
+    end
+  end
+
   def handle_cast({:terminate, reason}, state) do
-    candidate = TokenState.terminate_all_tokens(state, reason)
+    boundary_events = all_boundary_cancellation_events(state)
+    candidate =
+      state
+      |> append_events(boundary_events)
+      |> TokenState.terminate_all_tokens(reason)
 
     case persist_termination(candidate, reason) do
       :ok ->
         candidate = %{candidate | last_persisted_index: length(candidate.persistent_events)}
+        candidate = cancel_all_boundary_registrations(candidate)
 
         Phoenix.PubSub.broadcast(Chronicle.PubSub, "engine:events",
           {:process_instance_terminated, candidate.id, candidate.business_key, candidate.tenant_id, reason})
@@ -400,26 +467,17 @@ defmodule Chronicle.Engine.Instance do
 
   # Script result from pool worker
   def handle_cast({:script_result, ref, result}, state) do
-    case WaitRegistry.handle_script_result(state, ref, result) do
-      {:error, :not_found} -> {:noreply, state}
-      {:ok, state} -> {:noreply, state, {:continue, :process_tokens}}
-    end
+    handle_script_like_result(state, ref, result)
   end
 
   # Expression results from pool worker
   def handle_cast({:expressions_result, ref, result}, state) do
-    case WaitRegistry.handle_script_result(state, ref, result) do
-      {:error, :not_found} -> {:noreply, state}
-      {:ok, state} -> {:noreply, state, {:continue, :process_tokens}}
-    end
+    handle_script_like_result(state, ref, result)
   end
 
   # Rules result
   def handle_cast({:rules_result, ref, result}, state) do
-    case WaitRegistry.handle_script_result(state, ref, result) do
-      {:error, :not_found} -> {:noreply, state}
-      {:ok, state} -> {:noreply, state, {:continue, :process_tokens}}
-    end
+    handle_script_like_result(state, ref, result)
   end
 
   # Child process completed (CallActivity)
@@ -439,9 +497,99 @@ defmodule Chronicle.Engine.Instance do
           loop_index: token && token.context[:step]
         }
 
-        case persist_command_events(state, [event]) do
+        events = BoundaryLifecycle.cancellation_events(state, token_id) ++ [event]
+
+        case persist_command_events(state, events) do
           {:ok, state} ->
+            state = WaitRegistry.cancel_boundary_registrations(state, token_id)
+
             case WaitRegistry.handle_child_completed(state, child_id, completion_context, successful) do
+              {:error, :not_found} -> {:noreply, state}
+              {:ok, state} -> {:noreply, state, {:continue, :process_tokens}}
+            end
+
+          {:error, _reason, state} ->
+            {:noreply, state}
+        end
+    end
+  end
+
+  def handle_cast({:call_cancel, child_id, next_node}, state) do
+    case Map.get(state.call_wait_list, child_id) do
+      nil ->
+        {:noreply, state}
+
+      token_id ->
+        token = Map.get(state.tokens, token_id)
+        next_node = next_node || first_output_for_token(state, token)
+
+        event = %PersistentData.CallCanceled{
+          token: token_id,
+          family: token && token.family,
+          current_node: token && token.current_node,
+          next_node: next_node
+        }
+
+        events = BoundaryLifecycle.cancellation_events(state, token_id) ++ [event]
+
+        case persist_command_events(state, events) do
+          {:ok, state} ->
+            state =
+              state
+              |> WaitRegistry.cancel_boundary_registrations(token_id)
+              |> WaitRegistry.cancel_call(child_id, next_node)
+
+            {:noreply, state, {:continue, :process_tokens}}
+
+          {:error, _reason, state} ->
+            {:noreply, state}
+        end
+    end
+  end
+
+  def handle_cast({:retrigger_conditionals, variables}, state) do
+    conditional_tokens =
+      state.waiting_tokens
+      |> Enum.map(&Map.get(state.tokens, &1))
+      |> Enum.reject(&is_nil/1)
+      |> Enum.filter(&(&1.state == :waiting_for_conditional_event))
+
+    state =
+      Enum.reduce(conditional_tokens, state, fn token, acc ->
+        node = Definition.get_node(acc.definition, token.current_node)
+        params = Map.merge(token.parameters || %{}, variables || %{})
+        token = %{token | parameters: params}
+        ref = make_ref()
+
+        Chronicle.Engine.Scripting.ScriptPool.execute_expressions(
+          ref,
+          [{node.id, node.condition}],
+          params,
+          self()
+        )
+
+        %{acc |
+          tokens: Map.put(acc.tokens, token.id, token),
+          script_waits: Map.put(acc.script_waits, ref, token.id)
+        }
+      end)
+
+    {:noreply, state}
+  end
+
+  defp handle_script_like_result(state, ref, result) do
+    case Map.get(state.script_waits, ref) do
+      nil ->
+        {:noreply, state}
+
+      token_id ->
+        events = BoundaryLifecycle.cancellation_events(state, token_id)
+
+        case persist_command_events(state, events) do
+          {:ok, state} ->
+            state = WaitRegistry.cancel_boundary_registrations(state, token_id)
+
+            case WaitRegistry.handle_script_result(state, ref, result) do
               {:error, :not_found} -> {:noreply, state}
               {:ok, state} -> {:noreply, state, {:continue, :process_tokens}}
             end
@@ -455,10 +603,13 @@ defmodule Chronicle.Engine.Instance do
   # --- Timer handling ---
 
   @impl true
-  def handle_info({:timer_elapsed, token_id, timer_ref}, state) do
+  def handle_info({:timer_elapsed, token_id, timer_marker}, state) do
+    {timer_ref, timer_id} = resolve_timer_ref(state, token_id, timer_marker)
+
     case WaitRegistry.handle_timer_elapsed(state, token_id, timer_ref) do
       {:resumed, state} ->
-        state = append_timer_elapsed_event(state, token_id)
+        state = append_timer_elapsed_event(state, token_id, timer_id)
+        state = %{state | timer_ref_ids: Map.delete(state.timer_ref_ids || %{}, timer_ref)}
 
         case sync_persist(state) do
           {:ok, state} ->
@@ -475,17 +626,39 @@ defmodule Chronicle.Engine.Instance do
     end
   end
 
-  def handle_info({:boundary_timer_elapsed, token_id, boundary_node_id, timer_ref}, state) do
+  def handle_info({:boundary_timer_elapsed, token_id, boundary_node_id, timer_marker}, state) do
+    {timer_ref, timer_id} = resolve_timer_ref(state, token_id, timer_marker)
+
+    trigger_event = BoundaryLifecycle.trigger_event(state, token_id, boundary_node_id)
+
+    cancel_events =
+      if BoundaryLifecycle.interrupting?(state, token_id, boundary_node_id) do
+        BoundaryLifecycle.cancellation_events(state, token_id, boundary_node_id)
+      else
+        []
+      end
+
+    timer_event = timer_elapsed_event(state, token_id, timer_id)
+
+    case persist_command_events(state, [timer_event, trigger_event | cancel_events]) do
+      {:ok, state} ->
+        handle_persisted_boundary_timer_elapsed(state, token_id, boundary_node_id, timer_ref)
+
+      {:error, _reason, state} ->
+        {:noreply, state, :hibernate}
+    end
+  end
+
+  defp handle_persisted_boundary_timer_elapsed(state, token_id, boundary_node_id, timer_ref) do
     case WaitRegistry.handle_boundary_timer_elapsed(state, token_id, boundary_node_id, timer_ref) do
       {:resumed, state} ->
-        state = append_timer_elapsed_event(state, token_id)
+        state = %{state | timer_ref_ids: Map.delete(state.timer_ref_ids || %{}, timer_ref)}
 
-        case sync_persist(state) do
-          {:ok, state} ->
-            {:noreply, state, {:continue, :process_tokens}}
-
-          {:error, _reason, state} ->
-            {:noreply, state, :hibernate}
+        if BoundaryLifecycle.interrupting?(state, token_id, boundary_node_id) do
+          state = WaitRegistry.cancel_boundary_registrations(state, token_id)
+          {:noreply, state, {:continue, :process_tokens}}
+        else
+          {:noreply, state, {:continue, :process_tokens}}
         end
 
       {:ignored, state} ->
@@ -493,11 +666,15 @@ defmodule Chronicle.Engine.Instance do
     end
   end
 
-  defp append_timer_elapsed_event(state, token_id) do
-    token = Map.get(state.tokens, token_id)
-    timer_id = token && (token.context[:intermediate_timer_id] || token.context[:timer_id])
+  defp append_timer_elapsed_event(state, token_id, timer_id) do
+    append_event(state, timer_elapsed_event(state, token_id, timer_id))
+  end
 
-    event = %PersistentData.TimerElapsed{
+  defp timer_elapsed_event(state, token_id, timer_id) do
+    token = Map.get(state.tokens, token_id)
+    timer_id = timer_id || (token && (token.context[:intermediate_timer_id] || token.context[:timer_id]))
+
+    %PersistentData.TimerElapsed{
       token: token_id,
       family: token && token.family,
       current_node: token && token.current_node,
@@ -506,8 +683,24 @@ defmodule Chronicle.Engine.Instance do
       retry_counter: token && token.context[:retries],
       triggered_at: System.system_time(:millisecond)
     }
+  end
 
-    append_event(state, event)
+  defp resolve_timer_ref(state, token_id, marker) do
+    cond do
+      Map.has_key?(state.timer_refs || %{}, marker) ->
+        {marker, Map.get(state.timer_ref_ids || %{}, marker)}
+
+      true ->
+        found =
+          Enum.find(state.timer_refs || %{}, fn {ref, owner_token_id} ->
+            owner_token_id == token_id and Map.get(state.timer_ref_ids || %{}, ref) == marker
+          end)
+
+        case found do
+          {ref, _token_id} -> {ref, marker}
+          nil -> {marker, marker}
+        end
+    end
   end
 
   @impl true
@@ -639,7 +832,7 @@ defmodule Chronicle.Engine.Instance do
           []
       end
 
-    boundary_events(state, :message, message_name)
+    boundary_trigger_events(state, :message, message_name)
     |> Kernel.++(wait_events)
   end
 
@@ -657,10 +850,10 @@ defmodule Chronicle.Engine.Instance do
         }
       end)
 
-    boundary_events(state, :signal, signal_name) ++ wait_events
+    boundary_trigger_events(state, :signal, signal_name) ++ wait_events
   end
 
-  defp boundary_events(state, type, name) do
+  defp boundary_trigger_events(state, type, name) do
     {interrupting, non_interrupting} =
       case type do
         :message -> {state.message_boundaries, state.ni_message_boundaries}
@@ -670,20 +863,60 @@ defmodule Chronicle.Engine.Instance do
     Enum.flat_map([{interrupting, true}, {non_interrupting, false}], fn {map, interrupting?} ->
       map
       |> Map.get(name, [])
-      |> Enum.map(fn {token_id, boundary_node} ->
-        token = Map.get(state.tokens, token_id)
-        %PersistentData.BoundaryEventTriggered{
-          token: token_id,
-          family: token && token.family,
-          current_node: token && token.current_node,
-          boundary_node_id: boundary_node.id,
-          boundary_type: type,
-          interrupting: interrupting?,
-          name: name,
-          triggered_at: System.system_time(:millisecond)
-        }
+      |> Enum.flat_map(fn {token_id, boundary_node} ->
+        trigger_event = BoundaryLifecycle.trigger_event(state, token_id, boundary_node.id)
+
+        if interrupting? do
+          [trigger_event | BoundaryLifecycle.cancellation_events(state, token_id, boundary_node.id)]
+        else
+          [trigger_event]
+        end
       end)
     end)
+  end
+
+  defp all_boundary_cancellation_events(state) do
+    state.boundary_index
+    |> Map.keys()
+    |> Enum.flat_map(&BoundaryLifecycle.cancellation_events(state, &1))
+  end
+
+  defp cancel_all_boundary_registrations(state) do
+    state.boundary_index
+    |> Map.keys()
+    |> Enum.reduce(state, &WaitRegistry.cancel_boundary_registrations(&2, &1))
+  end
+
+  defp first_output_for_token(_state, nil), do: nil
+
+  defp first_output_for_token(state, token) do
+    state.definition
+    |> Definition.get_node(token.current_node)
+    |> case do
+      nil -> nil
+      node -> List.first(Map.get(node, :outputs, []) || [])
+    end
+  end
+
+  defp external_task_error_events(_state, nil, _retry?, _error, event), do: {[event], false}
+
+  defp external_task_error_events(_state, _token, true, _error, event) do
+    # A retry keeps the activity alive, so its boundary registrations remain
+    # open and can still interrupt the retry wait.
+    {[event], false}
+  end
+
+  defp external_task_error_events(state, token, false, error, event) do
+    node = Definition.get_node(state.definition, token.current_node)
+    boundary = Chronicle.Engine.Nodes.Activity.get_boundary_event_to_error(node || %{}, error)
+
+    if boundary do
+      trigger = BoundaryLifecycle.trigger_event(state, token.id, boundary.id)
+      cancellations = BoundaryLifecycle.cancellation_events(state, token.id, boundary.id)
+      {[event, trigger | cancellations], true}
+    else
+      {BoundaryLifecycle.cancellation_events(state, token.id) ++ [event], true}
+    end
   end
 
   # --- Persistence helpers ---

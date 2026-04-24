@@ -44,6 +44,7 @@ defmodule Chronicle.Engine.Instance.TokenState do
       pin_reason: :active_token,
       next_token_id: 0,
       timer_refs: %{},
+      timer_ref_ids: %{},
       pending_effects: [],
       persistent_events: [],
       last_persisted_index: 0,

@@ -130,7 +130,9 @@ defmodule Chronicle.Engine.EvictedWaitRestorer do
           instance_id: instance_id,
           tenant_id: tenant_id,
           token_id: info.token_id,
-          trigger_at: info.trigger_at
+          trigger_at: info.trigger_at,
+          boundary_node_id: info[:boundary_node_id],
+          is_boundary: info[:is_boundary] || false
         }
       end)
 
@@ -212,6 +214,26 @@ defmodule Chronicle.Engine.EvictedWaitRestorer do
   end
 
   defp fold(%PersistentData.TimerCanceled{} = e, acc) do
+    update_in(acc.timer, &Map.delete(&1, e.timer_id))
+  end
+
+  defp fold(%PersistentData.BoundaryEventCreated{boundary_type: :timer} = e, acc) do
+    put_in(
+      acc.timer[e.timer_id],
+      %{
+        token_id: e.token,
+        trigger_at: e.trigger_at,
+        boundary_node_id: e.boundary_node_id,
+        is_boundary: true
+      }
+    )
+  end
+
+  defp fold(%PersistentData.BoundaryEventTriggered{boundary_type: :timer} = e, acc) do
+    update_in(acc.timer, &Map.delete(&1, e.timer_id))
+  end
+
+  defp fold(%PersistentData.BoundaryEventCancelled{boundary_type: :timer} = e, acc) do
     update_in(acc.timer, &Map.delete(&1, e.timer_id))
   end
 

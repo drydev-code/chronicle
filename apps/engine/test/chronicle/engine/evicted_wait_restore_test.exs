@@ -140,6 +140,47 @@ defmodule Chronicle.Engine.EvictedWaitRestoreTest do
       assert hd(timer_waits).trigger_at == 1000
     end
 
+    test "collects open boundary timers and drops cancelled boundary timers" do
+      events = [
+        start_event(),
+        %PersistentData.BoundaryEventCreated{
+          token: 1,
+          family: 0,
+          current_node: "activity",
+          boundary_node_id: "b-open",
+          boundary_type: :timer,
+          timer_id: "bt-open",
+          trigger_at: 1000
+        },
+        %PersistentData.BoundaryEventCreated{
+          token: 1,
+          family: 0,
+          current_node: "activity",
+          boundary_node_id: "b-cancelled",
+          boundary_type: :timer,
+          timer_id: "bt-cancelled",
+          trigger_at: 2000
+        },
+        %PersistentData.BoundaryEventCancelled{
+          token: 1,
+          family: 0,
+          current_node: "activity",
+          boundary_node_id: "b-cancelled",
+          boundary_type: :timer,
+          timer_id: "bt-cancelled"
+        }
+      ]
+
+      assert [%WaitingHandle.Timer{} = timer] =
+               EvictedWaitRestorer.collect_open_waits(events)
+               |> Enum.filter(&match?(%WaitingHandle.Timer{}, &1))
+
+      assert timer.token_id == 1
+      assert timer.trigger_at == 1000
+      assert timer.boundary_node_id == "b-open"
+      assert timer.is_boundary == true
+    end
+
     test "collects open call waits" do
       events = [
         start_event(),

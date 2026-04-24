@@ -228,6 +228,7 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
       state: state,
       open_timers: Map.put(acc.open_timers, timer_id, %{
         token_id: token_id,
+        timer_id: timer_id,
         trigger_at: event.trigger_at,
         target_node: event.target_node
       }),
@@ -306,6 +307,93 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
     track_token_id(acc, token_id)
   end
 
+  defp replay_single_event(%PersistentData.EventGatewayActivated{} = event, acc) do
+    state = acc.state
+    token_id = event.token
+
+    state = TokenState.update_token_node(state, token_id, event.current_node)
+    state = TokenState.set_token_wait_state(state, token_id, :waiting_for_event_gateway)
+    state = TokenState.update_token_context(state, token_id, :event_gateway_candidates, event_gateway_candidates_for(state, event.current_node))
+    state = TokenState.update_token_context(state, token_id, :event_gateway_timer_ids, event.timer_ids || [])
+
+    open_message_waits =
+      Enum.reduce(event.message_names || [], acc.open_message_waits, fn name, waits ->
+        Map.update(waits, name, [token_id], &[token_id | &1])
+      end)
+
+    open_signal_waits =
+      Enum.reduce(event.signal_names || [], acc.open_signal_waits, fn name, waits ->
+        Map.update(waits, name, [token_id], &[token_id | &1])
+      end)
+
+    acc = %{acc |
+      state: state,
+      open_message_waits: open_message_waits,
+      open_signal_waits: open_signal_waits,
+      token_wait_states: Map.put(acc.token_wait_states, token_id, :waiting_for_event_gateway)
+    }
+
+    track_token_id(acc, token_id)
+  end
+
+  defp replay_single_event(%PersistentData.EventGatewayResolved{} = event, acc) do
+    state = acc.state
+    token_id = event.token
+
+    state =
+      if event.target_node do
+        TokenState.update_token_node(state, token_id, event.target_node)
+      else
+        state
+      end
+
+    state = TokenState.set_token_active(state, token_id)
+
+    acc = %{acc |
+      state: state,
+      open_message_waits: remove_token_from_all_waits(acc.open_message_waits, token_id),
+      open_signal_waits: remove_token_from_all_waits(acc.open_signal_waits, token_id),
+      token_wait_states: Map.delete(acc.token_wait_states, token_id)
+    }
+
+    track_token_id(acc, token_id)
+  end
+
+  defp replay_single_event(%PersistentData.ConditionalEventWaitCreated{} = event, acc) do
+    state = acc.state
+    token_id = event.token
+
+    state = TokenState.update_token_node(state, token_id, event.current_node)
+    state = TokenState.set_token_wait_state(state, token_id, :waiting_for_conditional_event)
+
+    acc = %{acc |
+      state: state,
+      token_wait_states: Map.put(acc.token_wait_states, token_id, :waiting_for_conditional_event)
+    }
+
+    track_token_id(acc, token_id)
+  end
+
+  defp replay_single_event(%PersistentData.ConditionalEventEvaluated{matched: true} = event, acc) do
+    state = acc.state
+    token_id = event.token
+
+    state =
+      if event.target_node do
+        TokenState.update_token_node(state, token_id, event.target_node)
+      else
+        state
+      end
+
+    state = TokenState.set_token_active(state, token_id)
+    acc = %{acc | state: state, token_wait_states: Map.delete(acc.token_wait_states, token_id)}
+    track_token_id(acc, token_id)
+  end
+
+  defp replay_single_event(%PersistentData.ConditionalEventEvaluated{} = event, acc) do
+    track_token_id(acc, event.token)
+  end
+
   defp replay_single_event(%PersistentData.BoundaryEventCreated{} = event, acc) do
     boundary_node = Chronicle.Engine.Diagrams.Definition.get_node(acc.state.definition, event.boundary_node_id)
 
@@ -327,6 +415,7 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
           %{acc |
             open_timers: Map.put(acc.open_timers, event.timer_id || event.boundary_node_id, %{
               token_id: event.token,
+              timer_id: event.timer_id || event.boundary_node_id,
               trigger_at: event.trigger_at,
               target_node: event.boundary_node_id,
               boundary_node_id: event.boundary_node_id,
@@ -352,8 +441,15 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
     )
 
     acc = %{acc | state: state}
-    acc = delete_boundary_wait(acc, event)
-    acc = %{acc | token_wait_states: Map.delete(acc.token_wait_states, event.token)}
+    acc =
+      if event.interrupting != false do
+        acc
+        |> delete_boundary_wait(event)
+        |> Map.put(:token_wait_states, Map.delete(acc.token_wait_states, event.token))
+      else
+        acc
+      end
+
     track_token_id(acc, event.token)
   end
 
@@ -448,6 +544,26 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
     |> track_token_id(event.token)
   end
 
+  defp replay_single_event(%PersistentData.LinkTraversed{} = event, acc) do
+    state =
+      acc.state
+      |> TokenState.update_token_node(event.token, event.target_node)
+      |> TokenState.set_token_active(event.token)
+
+    %{acc | state: state}
+    |> track_token_id(event.token)
+  end
+
+  defp replay_single_event(%PersistentData.NoOpTaskCompleted{} = event, acc) do
+    state =
+      acc.state
+      |> TokenState.update_token_node(event.token, event.target_node)
+      |> TokenState.set_token_active(event.token)
+
+    %{acc | state: state}
+    |> track_token_id(event.token)
+  end
+
   defp replay_single_event(%PersistentData.ProcessInstanceMigrated{} = _event, acc) do
     acc
   end
@@ -506,6 +622,13 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
     Map.put(acc, wait_key, updated_waits)
   end
 
+  defp remove_token_from_all_waits(waits, token_id) do
+    Enum.reduce(waits || %{}, %{}, fn {name, token_ids}, acc ->
+      remaining = List.delete(token_ids, token_id)
+      if remaining == [], do: acc, else: Map.put(acc, name, remaining)
+    end)
+  end
+
   defp put_boundary(acc, wait_key, name, token_id, boundary_node) do
     waits = Map.get(acc, wait_key, %{})
     waits = Map.update(waits, name, [{token_id, boundary_node}], &[{token_id, boundary_node} | &1])
@@ -522,27 +645,56 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
       trigger_at: event.trigger_at
     }
 
-    state = update_in(acc.state.boundary_index[event.token], &[info | (&1 || [])])
+    boundary_index =
+      Map.update(acc.state.boundary_index || %{}, event.token, [info], &[info | (&1 || [])])
+
+    state = %{acc.state | boundary_index: boundary_index}
     %{acc | state: state}
   end
 
   defp delete_boundary_wait(acc, %{boundary_type: :timer} = event) do
-    %{acc | open_timers: Map.delete(acc.open_timers, event.timer_id || event.boundary_node_id)}
+    acc
+    |> Map.put(:open_timers, Map.delete(acc.open_timers, event.timer_id || event.boundary_node_id))
+    |> delete_boundary_index(event)
   end
 
   defp delete_boundary_wait(acc, %{boundary_type: :message} = event) do
     acc
     |> remove_from_open_boundaries(:open_message_boundaries, event.name, event.token)
     |> remove_from_open_boundaries(:open_ni_message_boundaries, event.name, event.token)
+    |> delete_boundary_index(event)
   end
 
   defp delete_boundary_wait(acc, %{boundary_type: :signal} = event) do
     acc
     |> remove_from_open_boundaries(:open_signal_boundaries, event.name, event.token)
     |> remove_from_open_boundaries(:open_ni_signal_boundaries, event.name, event.token)
+    |> delete_boundary_index(event)
   end
 
-  defp delete_boundary_wait(acc, _event), do: acc
+  defp delete_boundary_wait(acc, event), do: delete_boundary_index(acc, event)
+
+  defp delete_boundary_index(acc, %{token: token_id, boundary_node_id: boundary_node_id}) do
+    boundary_index =
+      acc.state.boundary_index
+      |> Map.update(token_id, [], fn infos ->
+        (infos || [])
+        |> Enum.reject(&(&1.boundary_node_id == boundary_node_id))
+      end)
+
+    boundary_index =
+      if Map.get(boundary_index, token_id) in [nil, []] do
+        Map.delete(boundary_index, token_id)
+      else
+        boundary_index
+      end
+
+    state = %{acc.state | boundary_index: boundary_index}
+
+    %{acc | state: state}
+  end
+
+  defp delete_boundary_index(acc, _event), do: acc
 
   defp remove_from_open_boundaries(acc, wait_key, name, token_id) do
     waits = Map.get(acc, wait_key, %{})
@@ -599,6 +751,37 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
   defp resolve_message_name_for_restore(name, _params) when is_binary(name), do: name
   defp resolve_message_name_for_restore(_, _params), do: "unknown"
 
+  defp event_gateway_candidates_for(state, gateway_node_id) do
+    gateway = Chronicle.Engine.Diagrams.Definition.get_node(state.definition, gateway_node_id)
+    params =
+      state.tokens
+      |> Map.values()
+      |> Enum.find_value(%{}, fn
+        %{current_node: ^gateway_node_id, parameters: parameters} -> parameters
+        _ -> nil
+      end)
+
+    (Map.get(gateway || %{}, :outputs, []) || [])
+    |> Enum.map(&Chronicle.Engine.Diagrams.Definition.get_node(state.definition, &1))
+    |> Enum.map(fn
+      %Chronicle.Engine.Nodes.IntermediateCatch.MessageEvent{} = node ->
+        %{type: :message, name: resolve_message_name_for_restore(node.message, params), node_id: node.id}
+
+      %Chronicle.Engine.Nodes.Tasks.ReceiveTask{} = node ->
+        %{type: :message, name: resolve_message_name_for_restore(node.message, params), node_id: node.id}
+
+      %Chronicle.Engine.Nodes.IntermediateCatch.SignalEvent{} = node ->
+        %{type: :signal, name: node.signal, node_id: node.id}
+
+      %Chronicle.Engine.Nodes.IntermediateCatch.TimerEvent{} = node ->
+        %{type: :timer, node_id: node.id, timer_config: node.timer_config}
+
+      _ ->
+        nil
+    end)
+    |> Enum.reject(&is_nil/1)
+  end
+
   defp reregister_timers(state, open_timers) do
     now_ms = System.system_time(:millisecond)
 
@@ -612,16 +795,18 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
         0
       end
 
-      timer_ref = make_ref()
       msg =
         if timer_info[:boundary_node_id] do
-          {:boundary_timer_elapsed, token_id, timer_info.boundary_node_id, timer_ref}
+          {:boundary_timer_elapsed, token_id, timer_info.boundary_node_id, timer_info[:timer_id]}
         else
-          {:timer_elapsed, token_id, timer_ref}
+          {:timer_elapsed, token_id, timer_info[:timer_id]}
         end
 
       ref = Process.send_after(self(), msg, remaining_ms)
-      %{acc | timer_refs: Map.put(acc.timer_refs, ref, token_id)}
+      %{acc |
+        timer_refs: Map.put(acc.timer_refs, ref, token_id),
+        timer_ref_ids: Map.put(acc.timer_ref_ids || %{}, ref, timer_info[:timer_id])
+      }
     end)
   end
 

@@ -1,5 +1,5 @@
 defmodule Chronicle.Engine.Nodes.IntermediateThrow do
-  @moduledoc "Intermediate throwing events: Message, Signal, Error, Escalation."
+  @moduledoc "Intermediate throwing events: Message, Signal, Error, Escalation, Link."
 
   defmodule MessageEvent do
     use Chronicle.Engine.Nodes.Node
@@ -73,6 +73,31 @@ defmodule Chronicle.Engine.Nodes.IntermediateThrow do
         escalation: node.escalation,
         end_event_key: node.key
       })
+    end
+  end
+
+  defmodule LinkEvent do
+    use Chronicle.Engine.Nodes.Node
+    defstruct [:id, :key, :link_name, :inputs, :outputs, :properties]
+
+    @impl true
+    def process(context) do
+      target =
+        context.definition.nodes
+        |> Map.values()
+        |> Enum.find(fn
+          %Chronicle.Engine.Nodes.IntermediateCatch.LinkEvent{link_name: name} ->
+            name == context.node.link_name
+
+          _ ->
+            false
+        end)
+
+      if target do
+        {:traverse_link, context.node.link_name, target.id}
+      else
+        {:crash, {:link_target_not_found, context.node.link_name}}
+      end
     end
   end
 end

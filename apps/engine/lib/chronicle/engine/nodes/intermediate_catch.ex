@@ -1,5 +1,5 @@
 defmodule Chronicle.Engine.Nodes.IntermediateCatch do
-  @moduledoc "Intermediate catching events: Timer, Message, Signal."
+  @moduledoc "Intermediate catching events: Timer, Message, Signal, Conditional, Link."
 
   defmodule TimerEvent do
     use Chronicle.Engine.Nodes.Node
@@ -109,6 +109,67 @@ defmodule Chronicle.Engine.Nodes.IntermediateCatch do
         _ ->
           NodeResult.simulation_barrier_then_wait(:waiting_for_signal)
       end
+    end
+  end
+
+  defmodule ConditionalEvent do
+    use Chronicle.Engine.Nodes.Node
+    defstruct [:id, :key, :condition, :inputs, :outputs, :properties]
+
+    @impl true
+    def process(context) do
+      condition = context.node.condition
+
+      if condition in [nil, "", true] do
+        first_output = List.first(context.node.outputs || [])
+        {:conditional_event_evaluated, condition, true, first_output}
+      else
+        ref = make_ref()
+
+        Chronicle.Engine.Scripting.ScriptPool.execute_expressions(
+          ref,
+          [{context.node.id, condition}],
+          context.token.parameters,
+          context.instance_pid
+        )
+
+        NodeResult.wait_for_expressions(ref)
+      end
+    end
+
+    @impl true
+    def continue_after_wait(context) do
+      matched? =
+        context.token.context.continuation_context
+        |> normalize_result(context.node.id)
+
+      first_output = List.first(context.node.outputs || [])
+      {:conditional_event_evaluated, context.node.condition, matched?, first_output}
+    end
+
+    defp normalize_result({:ok, results}, node_id), do: normalize_result(results, node_id)
+
+    defp normalize_result(results, node_id) when is_list(results) do
+      Enum.any?(results, fn
+        %{"node_id" => ^node_id, "result" => true} -> true
+        {^node_id, true} -> true
+        true -> true
+        _ -> false
+      end)
+    end
+
+    defp normalize_result(true, _node_id), do: true
+    defp normalize_result(_, _node_id), do: false
+  end
+
+  defmodule LinkEvent do
+    use Chronicle.Engine.Nodes.Node
+    defstruct [:id, :key, :link_name, :inputs, :outputs, :properties]
+
+    @impl true
+    def process(context) do
+      first_output = List.first(context.node.outputs || [])
+      NodeResult.next(first_output)
     end
   end
 end

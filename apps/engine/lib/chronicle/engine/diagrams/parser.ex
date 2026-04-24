@@ -22,6 +22,8 @@ defmodule Chronicle.Engine.Diagrams.Parser do
     catch
       {:duplicate_node_ids, ids} -> {:error, {:duplicate_node_ids, ids}}
       {:unsupported_node_type, type, reason} -> {:error, {:unsupported_node_type, type, reason}}
+      {:invalid_event_based_gateway_branch, gateway_id, branch_id, branch_type} ->
+        {:error, {:invalid_event_based_gateway_branch, gateway_id, branch_id, branch_type}}
     end
   end
 
@@ -50,6 +52,7 @@ defmodule Chronicle.Engine.Diagrams.Parser do
       end)
 
       nodes_with_outputs = attach_boundary_events(nodes_with_outputs)
+      validate_event_based_gateways!(nodes_with_outputs)
 
       %Definition{
         name: Map.get(process, "name", "unknown"),
@@ -155,16 +158,16 @@ defmodule Chronicle.Engine.Diagrams.Parser do
       t when t in ~w(blankEndEvent errorEndEvent messageEndEvent signalEndEvent escalationEndEvent terminationEndEvent) ->
         parse_end_event(t, base, data)
 
-      t when t in ~w(scriptTask externalTask userTask rulesTask) ->
+      t when t in ~w(scriptTask externalTask userTask rulesTask manualTask sendTask receiveTask) ->
         parse_task_node(t, base, data)
 
-      t when t in ~w(parallelGateway exclusiveGateway inclusiveGateway) ->
+      t when t in ~w(parallelGateway exclusiveGateway inclusiveGateway eventBasedGateway) ->
         parse_gateway_node(t, base, data)
 
-      t when t in ~w(intermediateTimerEvent intermediateCatchTimerEvent intermediateCatchMessageEvent intermediateCatchSignalEvent) ->
+      t when t in ~w(intermediateTimerEvent intermediateCatchTimerEvent intermediateCatchMessageEvent intermediateCatchSignalEvent intermediateCatchConditionalEvent intermediateCatchLinkEvent) ->
         parse_intermediate_catch(t, base, data)
 
-      t when t in ~w(intermediateThrowMessageEvent intermediateThrowSignalEvent intermediateThrowErrorEvent intermediateThrowEscalationEvent) ->
+      t when t in ~w(intermediateThrowMessageEvent intermediateThrowSignalEvent intermediateThrowErrorEvent intermediateThrowEscalationEvent intermediateThrowLinkEvent) ->
         parse_intermediate_throw(t, base, data)
 
       t when t in ~w(timerBoundaryEvent messageBoundaryEvent signalBoundaryEvent errorBoundaryEvent escalationBoundaryEvent nonInterruptingTimerBoundaryEvent nonInterruptingMessageBoundaryEvent nonInterruptingSignalBoundaryEvent) ->
@@ -335,6 +338,32 @@ defmodule Chronicle.Engine.Diagrams.Parser do
     }
   end
 
+  defp parse_task_node("manualTask", base, _data) do
+    %Nodes.Tasks.ManualTask{
+      id: base.id, key: base.key,
+      boundary_events: [],
+      properties: base.properties
+    }
+  end
+
+  defp parse_task_node("sendTask", base, data) do
+    %Nodes.Tasks.SendTask{
+      id: base.id, key: base.key,
+      message: parse_message(data),
+      boundary_events: Map.get(data, "boundaryEvents", []),
+      properties: base.properties
+    }
+  end
+
+  defp parse_task_node("receiveTask", base, data) do
+    %Nodes.Tasks.ReceiveTask{
+      id: base.id, key: base.key,
+      message: parse_message(data),
+      boundary_events: Map.get(data, "boundaryEvents", []),
+      properties: base.properties
+    }
+  end
+
   # -- Gateway parsers --
 
   defp parse_gateway_node("parallelGateway", base, data) do
@@ -361,6 +390,14 @@ defmodule Chronicle.Engine.Diagrams.Parser do
       is_merging: Map.get(data, "isMerging", false),
       expressions: parse_expressions(data),
       default_path: Map.get(data, "defaultPath"),
+      properties: base.properties
+    }
+  end
+
+  defp parse_gateway_node("eventBasedGateway", base, _data) do
+    %Nodes.Gateway{
+      id: base.id, key: base.key, kind: :event_based,
+      is_merging: false,
       properties: base.properties
     }
   end
@@ -415,6 +452,22 @@ defmodule Chronicle.Engine.Diagrams.Parser do
     }
   end
 
+  defp parse_intermediate_catch("intermediateCatchConditionalEvent", base, data) do
+    %Nodes.IntermediateCatch.ConditionalEvent{
+      id: base.id, key: base.key,
+      condition: Map.get(data, "condition") || Map.get(base.properties, "condition"),
+      properties: base.properties
+    }
+  end
+
+  defp parse_intermediate_catch("intermediateCatchLinkEvent", base, data) do
+    %Nodes.IntermediateCatch.LinkEvent{
+      id: base.id, key: base.key,
+      link_name: Map.get(data, "linkName") || Map.get(data, "name") || Map.get(base.properties, "linkName"),
+      properties: base.properties
+    }
+  end
+
   # -- Intermediate throw event parsers --
 
   defp parse_intermediate_throw("intermediateThrowMessageEvent", base, data) do
@@ -446,6 +499,14 @@ defmodule Chronicle.Engine.Diagrams.Parser do
     %Nodes.IntermediateThrow.EscalationEvent{
       id: base.id, key: base.key,
       escalation: Map.get(data, "escalation"),
+      properties: base.properties
+    }
+  end
+
+  defp parse_intermediate_throw("intermediateThrowLinkEvent", base, data) do
+    %Nodes.IntermediateThrow.LinkEvent{
+      id: base.id, key: base.key,
+      link_name: Map.get(data, "linkName") || Map.get(data, "name") || Map.get(base.properties, "linkName"),
       properties: base.properties
     }
   end
@@ -588,6 +649,29 @@ defmodule Chronicle.Engine.Diagrams.Parser do
       {id, node}
     end)
   end
+
+  defp validate_event_based_gateways!(nodes) do
+    Enum.each(nodes, fn
+      {gateway_id, %Nodes.Gateway{kind: :event_based, outputs: outputs}} ->
+        Enum.each(outputs || [], fn branch_id ->
+          branch = Map.get(nodes, branch_id)
+
+          unless event_based_gateway_branch?(branch) do
+            type = branch && (branch.__struct__ |> Module.split() |> List.last())
+            throw({:invalid_event_based_gateway_branch, gateway_id, branch_id, type})
+          end
+        end)
+
+      _ ->
+        :ok
+    end)
+  end
+
+  defp event_based_gateway_branch?(%Nodes.IntermediateCatch.MessageEvent{}), do: true
+  defp event_based_gateway_branch?(%Nodes.Tasks.ReceiveTask{}), do: true
+  defp event_based_gateway_branch?(%Nodes.IntermediateCatch.SignalEvent{}), do: true
+  defp event_based_gateway_branch?(%Nodes.IntermediateCatch.TimerEvent{}), do: true
+  defp event_based_gateway_branch?(_), do: false
 
   defp boundary_event?(%Nodes.BoundaryEvents.TimerBoundary{}), do: true
   defp boundary_event?(%Nodes.BoundaryEvents.MessageBoundary{}), do: true

@@ -37,6 +37,8 @@ defmodule Chronicle.Engine.Instance.WaitRegistry do
           end
 
         state = %{state | message_waits: new_waits}
+        state = remove_token_from_all_message_waits(state, token_id)
+        state = remove_token_from_all_signal_waits(state, token_id)
 
         # Remove the per-token entry from the global :waits registry so
         # stale routes do not survive after consumption.
@@ -61,20 +63,23 @@ defmodule Chronicle.Engine.Instance.WaitRegistry do
     unregister_signal_waits(state, signal_name, signal_tokens)
 
     state = Enum.reduce(signal_tokens, state, fn token_id, acc ->
-      TokenState.resume_token(acc, token_id, {:signal, signal_name})
+      acc
+      |> remove_token_from_all_message_waits(token_id)
+      |> remove_token_from_all_signal_waits(token_id)
+      |> TokenState.resume_token(token_id, {:signal, signal_name})
     end)
 
     state =
-      Enum.reduce(boundaries ++ ni_boundaries, state, fn {token_id, boundary_node}, acc ->
-        interrupting? = Enum.member?(boundaries, {token_id, boundary_node})
-        TokenState.trigger_boundary(acc, token_id, boundary_node.id, interrupting?)
+      Enum.reduce(boundaries, state, fn {token_id, boundary_node}, acc ->
+        acc
+        |> TokenState.trigger_boundary(token_id, boundary_node.id, true)
+        |> cancel_boundary_registrations(token_id)
       end)
 
-    %{state |
-      signal_waits: Map.delete(state.signal_waits, signal_name),
-      signal_boundaries: Map.delete(state.signal_boundaries, signal_name),
-      ni_signal_boundaries: Map.delete(state.ni_signal_boundaries || %{}, signal_name)
-    }
+    Enum.reduce(ni_boundaries, state, fn {token_id, boundary_node}, acc ->
+      TokenState.trigger_boundary(acc, token_id, boundary_node.id, false)
+    end)
+    |> Map.put(:signal_waits, Map.delete(state.signal_waits, signal_name))
   end
 
   @doc """
@@ -100,6 +105,21 @@ defmodule Chronicle.Engine.Instance.WaitRegistry do
         state = %{state | external_tasks: Map.delete(state.external_tasks, task_id)}
         state = TokenState.resume_token(state, token_id, {:error, error, retry?, backoff_ms})
         {:ok, state}
+    end
+  end
+
+  @doc """
+  Cancels an open external task and resumes the owning token with a cancellation
+  continuation.
+  """
+  def cancel_external_task(state, task_id, reason, continuation_node_id) do
+    case Map.get(state.external_tasks, task_id) do
+      nil ->
+        state
+
+      token_id ->
+        state = %{state | external_tasks: Map.delete(state.external_tasks, task_id)}
+        TokenState.resume_token(state, token_id, {:cancel, reason, continuation_node_id})
     end
   end
 
@@ -132,6 +152,20 @@ defmodule Chronicle.Engine.Instance.WaitRegistry do
   end
 
   @doc """
+  Cancels an open call wait and resumes the parent token.
+  """
+  def cancel_call(state, child_id, next_node) do
+    case Map.get(state.call_wait_list, child_id) do
+      nil ->
+        state
+
+      token_id ->
+        state = %{state | call_wait_list: Map.delete(state.call_wait_list, child_id)}
+        TokenState.resume_token(state, token_id, {:canceled, next_node})
+    end
+  end
+
+  @doc """
   Handles timer elapsed for a regular intermediate timer.
   Returns {:resumed, state} or {:ignored, state}.
   State always has the timer_ref cleaned up.
@@ -139,7 +173,10 @@ defmodule Chronicle.Engine.Instance.WaitRegistry do
   def handle_timer_elapsed(state, token_id, timer_ref) do
     alias Chronicle.Engine.Token
 
-    state = %{state | timer_refs: Map.delete(state.timer_refs, timer_ref)}
+    state = %{state |
+      timer_refs: Map.delete(state.timer_refs, timer_ref),
+      timer_ref_ids: Map.delete(state.timer_ref_ids || %{}, timer_ref)
+    }
 
     token = Map.get(state.tokens, token_id)
     if token && Token.waiting?(token) do
@@ -158,7 +195,10 @@ defmodule Chronicle.Engine.Instance.WaitRegistry do
   def handle_boundary_timer_elapsed(state, token_id, boundary_node_id, timer_ref) do
     alias Chronicle.Engine.Token
 
-    state = %{state | timer_refs: Map.delete(state.timer_refs, timer_ref)}
+    state = %{state |
+      timer_refs: Map.delete(state.timer_refs, timer_ref),
+      timer_ref_ids: Map.delete(state.timer_ref_ids || %{}, timer_ref)
+    }
 
     token = Map.get(state.tokens, token_id)
     if token && Token.waiting?(token) do
@@ -180,6 +220,48 @@ defmodule Chronicle.Engine.Instance.WaitRegistry do
     :ok
   end
 
+  @doc """
+  Removes all boundary wait registrations attached to a token. The caller is
+  responsible for appending durable BoundaryEventCancelled events before this
+  mutates the in-memory registries.
+  """
+  def cancel_boundary_registrations(state, token_id, except_boundary_node_id \\ nil) do
+    infos =
+      state.boundary_index
+      |> Map.get(token_id, [])
+      |> Enum.reject(&(&1.boundary_node_id == except_boundary_node_id))
+
+    Enum.each(infos, fn
+      %{timer_ref: ref} when not is_nil(ref) ->
+        Process.cancel_timer(ref)
+
+      _ ->
+        :ok
+    end)
+
+    state =
+      Enum.reduce(infos, state, fn info, acc ->
+        acc
+        |> remove_boundary_message_registration(token_id, info)
+        |> remove_boundary_signal_registration(token_id, info)
+        |> remove_boundary_timer_registration(info)
+      end)
+
+    remaining =
+      state.boundary_index
+      |> Map.get(token_id, [])
+      |> Enum.filter(&(&1.boundary_node_id == except_boundary_node_id))
+
+    boundary_index =
+      if remaining == [] do
+        Map.delete(state.boundary_index, token_id)
+      else
+        Map.put(state.boundary_index, token_id, remaining)
+      end
+
+    %{state | boundary_index: boundary_index}
+  end
+
   # --- Private helpers ---
 
   defp unregister_message_wait(state, message_name, token_id) do
@@ -194,18 +276,86 @@ defmodule Chronicle.Engine.Instance.WaitRegistry do
     end)
   end
 
-  defp handle_message_boundary(state, message_name, all_boundaries, interrupting_count) do
+  defp handle_message_boundary(state, _message_name, all_boundaries, interrupting_count) do
+    {interrupting_boundaries, non_interrupting_boundaries} =
+      Enum.split(all_boundaries, interrupting_count)
+
     state =
-      all_boundaries
-      |> Enum.with_index()
-      |> Enum.reduce(state, fn {{token_id, boundary_node}, index}, acc ->
-        TokenState.trigger_boundary(acc, token_id, boundary_node.id, index < interrupting_count)
+      Enum.reduce(interrupting_boundaries, state, fn {token_id, boundary_node}, acc ->
+        acc
+        |> TokenState.trigger_boundary(token_id, boundary_node.id, true)
+        |> cancel_boundary_registrations(token_id)
       end)
 
+    Enum.reduce(non_interrupting_boundaries, state, fn {token_id, boundary_node}, acc ->
+      TokenState.trigger_boundary(acc, token_id, boundary_node.id, false)
+    end)
+  end
+
+  defp remove_token_from_all_message_waits(state, token_id) do
+    waits =
+      state.message_waits
+      |> Enum.reduce(%{}, fn {name, token_ids}, acc ->
+        remaining = List.delete(token_ids, token_id)
+        if remaining == [], do: acc, else: Map.put(acc, name, remaining)
+      end)
+
+    %{state | message_waits: waits}
+  end
+
+  defp remove_token_from_all_signal_waits(state, token_id) do
+    waits =
+      state.signal_waits
+      |> Enum.reduce(%{}, fn {name, token_ids}, acc ->
+        remaining = List.delete(token_ids, token_id)
+        if remaining == [], do: acc, else: Map.put(acc, name, remaining)
+      end)
+
+    %{state | signal_waits: waits}
+  end
+
+  defp remove_boundary_message_registration(state, token_id, %{type: :message, name: name, boundary_node_id: boundary_id}) do
+    Registry.unregister_match(:waits, {state.tenant_id, :message, name, state.business_key}, {:boundary, token_id, boundary_id})
+
     %{state |
-      message_boundaries: Map.delete(state.message_boundaries, message_name),
-      ni_message_boundaries: Map.delete(state.ni_message_boundaries || %{}, message_name)
+      message_boundaries: remove_boundary_from_waits(state.message_boundaries, name, token_id, boundary_id),
+      ni_message_boundaries: remove_boundary_from_waits(state.ni_message_boundaries || %{}, name, token_id, boundary_id)
     }
+  end
+
+  defp remove_boundary_message_registration(state, _token_id, _info), do: state
+
+  defp remove_boundary_signal_registration(state, token_id, %{type: :signal, name: name, boundary_node_id: boundary_id}) do
+    Registry.unregister_match(:waits, {state.tenant_id, :signal, name}, {:boundary, token_id, boundary_id})
+
+    %{state |
+      signal_boundaries: remove_boundary_from_waits(state.signal_boundaries, name, token_id, boundary_id),
+      ni_signal_boundaries: remove_boundary_from_waits(state.ni_signal_boundaries || %{}, name, token_id, boundary_id)
+    }
+  end
+
+  defp remove_boundary_signal_registration(state, _token_id, _info), do: state
+
+  defp remove_boundary_timer_registration(state, %{type: :timer, timer_ref: ref}) when not is_nil(ref) do
+    %{state |
+      timer_refs: Map.delete(state.timer_refs || %{}, ref),
+      timer_ref_ids: Map.delete(state.timer_ref_ids || %{}, ref)
+    }
+  end
+
+  defp remove_boundary_timer_registration(state, _info), do: state
+
+  defp remove_boundary_from_waits(waits, name, token_id, boundary_id) do
+    updated =
+      waits
+      |> Map.get(name, [])
+      |> Enum.reject(fn {tid, boundary} -> tid == token_id and boundary.id == boundary_id end)
+
+    if updated == [] do
+      Map.delete(waits, name)
+    else
+      Map.put(waits, name, updated)
+    end
   end
 
   defp boundary_interrupting?(state, token_id, boundary_node_id) do

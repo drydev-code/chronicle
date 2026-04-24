@@ -10,6 +10,7 @@ defmodule Chronicle.Engine.Token do
     :waiting_for_timer | :waiting_for_message | :waiting_for_signal |
     :waiting_for_script | :waiting_for_call | :waiting_for_external_task |
     :waiting_for_join | :waiting_for_rules | :waiting_for_expressions |
+    :waiting_for_event_gateway | :waiting_for_conditional_event |
     :interrupted | :crashed | :terminated | :joined | :completed |
     :simulation_barrier_then_execute | :simulation_barrier_then_wait
 
@@ -120,7 +121,8 @@ defmodule Chronicle.Engine.Token do
   def waiting?(token), do: token.state in [
     :waiting_for_timer, :waiting_for_message, :waiting_for_signal,
     :waiting_for_script, :waiting_for_call, :waiting_for_external_task,
-    :waiting_for_join, :waiting_for_rules, :waiting_for_expressions
+    :waiting_for_join, :waiting_for_rules, :waiting_for_expressions,
+    :waiting_for_event_gateway, :waiting_for_conditional_event
   ]
 
   def terminal?(token), do: token.state in [:crashed, :terminated, :completed, :joined]

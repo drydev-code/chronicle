@@ -6,6 +6,7 @@ defmodule Chronicle.Engine.TokenProcessor do
 
   alias Chronicle.Engine.{Token, ExecutionContext, PersistentData}
   alias Chronicle.Engine.Diagrams.Definition
+  alias Chronicle.Engine.Instance.{BoundaryLifecycle, WaitRegistry}
   alias Chronicle.Engine.Nodes
 
   require Logger
@@ -75,6 +76,9 @@ defmodule Chronicle.Engine.TokenProcessor do
 
   defp node_module(%Nodes.ScriptTask{}), do: Nodes.ScriptTask
   defp node_module(%Nodes.ExternalTask{}), do: Nodes.ExternalTask
+  defp node_module(%Nodes.Tasks.ManualTask{}), do: Nodes.Tasks.ManualTask
+  defp node_module(%Nodes.Tasks.SendTask{}), do: Nodes.Tasks.SendTask
+  defp node_module(%Nodes.Tasks.ReceiveTask{}), do: Nodes.Tasks.ReceiveTask
   defp node_module(%Nodes.CallActivity{}), do: Nodes.CallActivity
   defp node_module(%Nodes.RulesTask{}), do: Nodes.RulesTask
   defp node_module(%Nodes.Gateway{}), do: Nodes.Gateway
@@ -91,10 +95,13 @@ defmodule Chronicle.Engine.TokenProcessor do
   defp node_module(%Nodes.IntermediateCatch.TimerEvent{}), do: Nodes.IntermediateCatch.TimerEvent
   defp node_module(%Nodes.IntermediateCatch.MessageEvent{}), do: Nodes.IntermediateCatch.MessageEvent
   defp node_module(%Nodes.IntermediateCatch.SignalEvent{}), do: Nodes.IntermediateCatch.SignalEvent
+  defp node_module(%Nodes.IntermediateCatch.ConditionalEvent{}), do: Nodes.IntermediateCatch.ConditionalEvent
+  defp node_module(%Nodes.IntermediateCatch.LinkEvent{}), do: Nodes.IntermediateCatch.LinkEvent
   defp node_module(%Nodes.IntermediateThrow.MessageEvent{}), do: Nodes.IntermediateThrow.MessageEvent
   defp node_module(%Nodes.IntermediateThrow.SignalEvent{}), do: Nodes.IntermediateThrow.SignalEvent
   defp node_module(%Nodes.IntermediateThrow.ErrorEvent{}), do: Nodes.IntermediateThrow.ErrorEvent
   defp node_module(%Nodes.IntermediateThrow.EscalationEvent{}), do: Nodes.IntermediateThrow.EscalationEvent
+  defp node_module(%Nodes.IntermediateThrow.LinkEvent{}), do: Nodes.IntermediateThrow.LinkEvent
   defp node_module(_), do: nil
 
   # --- Handle NodeResult ---
@@ -122,6 +129,9 @@ defmodule Chronicle.Engine.TokenProcessor do
       {:wait_for_signal, name} ->
         handle_wait_for_signal(state, token, name)
 
+      {:wait_for_event_gateway, candidates} ->
+        handle_wait_for_event_gateway(state, token, candidates)
+
       {:wait_for_script, ref} ->
         handle_wait_for_script(state, token, ref)
 
@@ -148,6 +158,18 @@ defmodule Chronicle.Engine.TokenProcessor do
 
       {:throw_signal, name, next_node} ->
         handle_throw_signal(state, token, name, next_node)
+
+      {:traverse_link, link_name, target_node} ->
+        handle_traverse_link(state, token, link_name, target_node)
+
+      {:conditional_event_evaluated, condition, matched?, next_node} ->
+        handle_conditional_event_evaluated(state, token, condition, matched?, next_node)
+
+      {:event_gateway_resolved, trigger, selected_node, target_node} ->
+        handle_event_gateway_resolved(state, token, trigger, selected_node, target_node)
+
+      {:noop_task_completed, task_type, next_node} ->
+        handle_noop_task_completed(state, token, task_type, next_node)
 
       {:call, call_params} ->
         handle_call_activity(state, token, call_params)
@@ -209,9 +231,12 @@ defmodule Chronicle.Engine.TokenProcessor do
       |> Token.set_waiting(:waiting_for_timer)
       |> Token.set_context(:intermediate_timer_id, timer_id)
 
-    ref = Process.send_after(self(), {:timer_elapsed, token.id, make_ref()}, delay_ms)
+    ref = Process.send_after(self(), {:timer_elapsed, token.id, timer_id}, delay_ms)
 
-    state = %{state | timer_refs: Map.put(state.timer_refs, ref, token.id)}
+    state = %{state |
+      timer_refs: Map.put(state.timer_refs, ref, token.id),
+      timer_ref_ids: Map.put(state.timer_ref_ids || %{}, ref, timer_id)
+    }
 
     # Persist timer created
     event = %PersistentData.TimerCreated{
@@ -256,6 +281,68 @@ defmodule Chronicle.Engine.TokenProcessor do
     }
 
     state = state |> append_event(event) |> Map.put(:signal_waits, waits)
+    move_to_waiting(state, token)
+  end
+
+  defp handle_wait_for_event_gateway(state, token, candidates) do
+    token =
+      token
+      |> Token.set_waiting(:waiting_for_event_gateway)
+      |> Token.set_context(:event_gateway_candidates, candidates)
+
+    {state, message_names, signal_names, timer_ids, trigger_at_by_timer_id} =
+      Enum.reduce(candidates, {state, [], [], [], %{}}, fn candidate, {acc, msgs, sigs, timers, triggers} ->
+        case candidate do
+          %{type: :message, name: name} when not is_nil(name) ->
+            waits = Map.update(acc.message_waits, name, [token.id], &[token.id | &1])
+            Registry.register(:waits, {acc.tenant_id, :message, name, acc.business_key}, token.id)
+            {%{acc | message_waits: waits}, [name | msgs], sigs, timers, triggers}
+
+          %{type: :signal, name: name} when not is_nil(name) ->
+            waits = Map.update(acc.signal_waits, name, [token.id], &[token.id | &1])
+            Registry.register(:waits, {acc.tenant_id, :signal, name}, token.id)
+            {%{acc | signal_waits: waits}, msgs, [name | sigs], timers, triggers}
+
+          %{type: :timer, timer_config: timer_config} ->
+            timer_id = UUID.uuid4()
+            delay_ms = compute_timer_delay(timer_config)
+            ref = Process.send_after(self(), {:timer_elapsed, token.id, timer_id}, delay_ms)
+            trigger_at = System.system_time(:millisecond) + delay_ms
+
+            timer_event = %PersistentData.TimerCreated{
+              token: token.id,
+              family: token.family,
+              current_node: token.current_node,
+              timer_id: timer_id,
+              trigger_at: trigger_at,
+              target_node: token.current_node
+            }
+
+            acc =
+              acc
+              |> append_event(timer_event)
+              |> Map.update!(:timer_refs, &Map.put(&1, ref, token.id))
+              |> Map.update(:timer_ref_ids, %{ref => timer_id}, &Map.put(&1, ref, timer_id))
+
+            {acc, msgs, sigs, [timer_id | timers], Map.put(triggers, timer_id, trigger_at)}
+
+          _ ->
+            {acc, msgs, sigs, timers, triggers}
+        end
+      end)
+
+    event = %PersistentData.EventGatewayActivated{
+      token: token.id,
+      family: token.family,
+      current_node: token.current_node,
+      message_names: Enum.reverse(message_names),
+      signal_names: Enum.reverse(signal_names),
+      timer_ids: Enum.reverse(timer_ids),
+      trigger_at_by_timer_id: trigger_at_by_timer_id
+    }
+
+    token = Token.set_context(token, :event_gateway_timer_ids, Enum.reverse(timer_ids))
+    state = append_event(state, event)
     move_to_waiting(state, token)
   end
 
@@ -416,6 +503,117 @@ defmodule Chronicle.Engine.TokenProcessor do
     %{state | tokens: Map.put(state.tokens, token.id, token)}
   end
 
+  defp handle_traverse_link(state, token, link_name, target_node) do
+    event = %PersistentData.LinkTraversed{
+      token: token.id,
+      family: token.family,
+      current_node: token.current_node,
+      link_name: link_name,
+      target_node: target_node
+    }
+
+    state = append_event(state, event)
+    token = Token.move_to(token, target_node)
+    %{state | tokens: Map.put(state.tokens, token.id, token)}
+  end
+
+  defp handle_conditional_event_evaluated(state, token, condition, true, next_node) do
+    event = %PersistentData.ConditionalEventEvaluated{
+      token: token.id,
+      family: token.family,
+      current_node: token.current_node,
+      condition: condition,
+      matched: true,
+      target_node: next_node,
+      evaluated_at: System.system_time(:millisecond)
+    }
+
+    state = append_event(state, event)
+    token = Token.move_to(token, next_node)
+    %{state | tokens: Map.put(state.tokens, token.id, token)}
+  end
+
+  defp handle_conditional_event_evaluated(state, token, condition, false, _next_node) do
+    event = %PersistentData.ConditionalEventEvaluated{
+      token: token.id,
+      family: token.family,
+      current_node: token.current_node,
+      condition: condition,
+      matched: false,
+      evaluated_at: System.system_time(:millisecond)
+    }
+
+    state = append_event(state, event)
+    token = Token.set_waiting(token, :waiting_for_conditional_event)
+
+    wait_event = %PersistentData.ConditionalEventWaitCreated{
+      token: token.id,
+      family: token.family,
+      current_node: token.current_node,
+      condition: condition,
+      condition_key: nil
+    }
+
+    state = append_event(state, wait_event)
+    move_to_waiting(state, token)
+  end
+
+  defp handle_event_gateway_resolved(state, token, trigger, selected_node, target_node) do
+    state = remove_event_gateway_waits(state, token)
+    {state, canceled_timer_ids} = cancel_timer_refs_for_token(state, token.id)
+
+    {trigger_type, trigger_name, payload} =
+      case trigger do
+        {:message, name, payload} -> {:message, name, payload}
+        {:signal, name} -> {:signal, name, nil}
+        :timer_elapsed -> {:timer, nil, nil}
+        _ -> {:unknown, nil, nil}
+      end
+
+    state =
+      canceled_timer_ids
+      |> Enum.reduce(state, fn timer_id, acc ->
+        append_event(acc, %PersistentData.TimerCanceled{
+          token: token.id,
+          family: token.family,
+          current_node: token.current_node,
+          target_node: target_node,
+          retry_counter: token.context[:retries],
+          timer_id: timer_id
+        })
+      end)
+
+    event = %PersistentData.EventGatewayResolved{
+      token: token.id,
+      family: token.family,
+      current_node: token.current_node,
+      trigger_type: trigger_type,
+      trigger_name: trigger_name,
+      selected_node: selected_node,
+      target_node: target_node,
+      payload: payload,
+      triggered_at: System.system_time(:millisecond)
+    }
+
+    state = append_event(state, event)
+    token = Token.move_to(token, target_node)
+    %{state | tokens: Map.put(state.tokens, token.id, token)}
+  end
+
+  defp handle_noop_task_completed(state, token, task_type, next_node) do
+    event = %PersistentData.NoOpTaskCompleted{
+      token: token.id,
+      family: token.family,
+      current_node: token.current_node,
+      task_type: task_type,
+      target_node: next_node
+    }
+
+    state = append_event(state, event)
+    token = Token.move_to(token, next_node)
+    %{state | tokens: Map.put(state.tokens, token.id, token)}
+  end
+
   defp handle_call_activity(state, token, call_params) do
     child_id = UUID.uuid4()
 
@@ -449,8 +647,20 @@ defmodule Chronicle.Engine.TokenProcessor do
     token = Token.increment_retries(token)
     token = Token.set_waiting(token, :waiting_for_timer)
 
-    ref = Process.send_after(self(), {:timer_elapsed, token.id, make_ref()}, backoff_ms)
-    state = %{state | timer_refs: Map.put(state.timer_refs, ref, token.id)}
+    timer_id = "retry:#{token.id}:#{System.unique_integer([:positive])}"
+    ref = Process.send_after(self(), {:timer_elapsed, token.id, timer_id}, backoff_ms)
+    state = %{state |
+      timer_refs: Map.put(state.timer_refs, ref, token.id),
+      timer_ref_ids: Map.put(state.timer_ref_ids || %{}, ref, timer_id)
+    }
+
+    state = append_event(state, %PersistentData.TimerCreated{
+      token: token.id,
+      family: token.family,
+      current_node: token.current_node,
+      timer_id: timer_id,
+      trigger_at: System.system_time(:millisecond) + backoff_ms
+    })
 
     move_to_waiting(state, token)
   end
@@ -474,6 +684,10 @@ defmodule Chronicle.Engine.TokenProcessor do
   end
 
   defp crash_token(state, token) do
+    events = BoundaryLifecycle.cancellation_events(state, token.id)
+    state = Enum.reduce(events, state, &append_event(&2, &1))
+    state = WaitRegistry.cancel_boundary_registrations(state, token.id)
+
     token = Token.crash(token)
     %{state |
       tokens: Map.put(state.tokens, token.id, token),
@@ -482,6 +696,15 @@ defmodule Chronicle.Engine.TokenProcessor do
   end
 
   defp terminate_all(state, _reason) do
+    state =
+      state.boundary_index
+      |> Map.keys()
+      |> Enum.reduce(state, fn token_id, acc ->
+        events = BoundaryLifecycle.cancellation_events(acc, token_id)
+        acc = Enum.reduce(events, acc, &append_event(&2, &1))
+        WaitRegistry.cancel_boundary_registrations(acc, token_id)
+      end)
+
     Enum.reduce(state.tokens, state, fn {tid, t}, acc ->
       if Token.active?(t) or Token.waiting?(t) do
         t = Token.terminate(t)
@@ -512,6 +735,14 @@ defmodule Chronicle.Engine.TokenProcessor do
   defp interrupt_token_to_boundary(state, token, boundary) do
     output_path = Chronicle.Engine.Nodes.BoundaryEvents.output_path(boundary)
     if output_path do
+      trigger = BoundaryLifecycle.trigger_event(state, token.id, boundary.id)
+      cancellations = BoundaryLifecycle.cancellation_events(state, token.id, boundary.id)
+
+      state =
+        [trigger | cancellations]
+        |> Enum.reduce(state, &append_event(&2, &1))
+        |> WaitRegistry.cancel_boundary_registrations(token.id)
+
       token = %{token | state: :execute_current_node, current_node: output_path}
       %{state | tokens: Map.put(state.tokens, token.id, token)}
     else
@@ -554,10 +785,12 @@ defmodule Chronicle.Engine.TokenProcessor do
           delay_ms = Chronicle.Engine.Nodes.BoundaryEvents.compute_timer_delay(boundary, token.parameters)
           timer_id = "boundary:#{token.id}:#{boundary.id}:#{System.unique_integer([:positive])}"
           trigger_at = System.system_time(:millisecond) + delay_ms
-          timer_ref = make_ref()
-          ref = Process.send_after(self(), {:boundary_timer_elapsed, token.id, boundary.id, timer_ref}, delay_ms)
+          ref = Process.send_after(self(), {:boundary_timer_elapsed, token.id, boundary.id, timer_id}, delay_ms)
 
-          state = %{state | timer_refs: Map.put(state.timer_refs, ref, token.id)}
+          state = %{state |
+            timer_refs: Map.put(state.timer_refs, ref, token.id),
+            timer_ref_ids: Map.put(state.timer_ref_ids || %{}, ref, timer_id)
+          }
           {state, %{type: type, boundary_node_id: boundary.id, timer_id: timer_id, timer_ref: ref, name: nil, interrupting: interrupting?, trigger_at: trigger_at}}
 
         :message ->
@@ -614,6 +847,72 @@ defmodule Chronicle.Engine.TokenProcessor do
   defp resolve_message_name(%{name: name}, _params), do: name
   defp resolve_message_name(name, _params) when is_binary(name), do: name
   defp resolve_message_name(_, _params), do: nil
+
+  defp compute_timer_delay(%{duration_ms: ms}) when is_integer(ms), do: ms
+  defp compute_timer_delay(%{period: %{hours: h, minutes: m, seconds: s}}) do
+    (h || 0) * 3_600_000 + (m || 0) * 60_000 + (s || 0) * 1000
+  end
+  defp compute_timer_delay(_), do: 1000
+
+  defp remove_event_gateway_waits(state, token) do
+    candidates = token.context[:event_gateway_candidates] || []
+
+    Enum.reduce(candidates, state, fn
+      %{type: :message, name: name}, acc ->
+        key = {acc.tenant_id, :message, name, acc.business_key}
+        Registry.unregister_match(:waits, key, token.id)
+
+        waits =
+          acc.message_waits
+          |> remove_token_wait(name, token.id)
+
+        %{acc | message_waits: waits}
+
+      %{type: :signal, name: name}, acc ->
+        key = {acc.tenant_id, :signal, name}
+        Registry.unregister_match(:waits, key, token.id)
+
+        waits =
+          acc.signal_waits
+          |> remove_token_wait(name, token.id)
+
+        %{acc | signal_waits: waits}
+
+      _candidate, acc ->
+        acc
+    end)
+  end
+
+  def cancel_timer_refs_for_token(state, token_id) do
+    {refs, keep_refs} =
+      Enum.split_with(state.timer_refs || %{}, fn {_ref, owner_token_id} ->
+        owner_token_id == token_id
+      end)
+
+    Enum.each(refs, fn {ref, _token_id} -> Process.cancel_timer(ref) end)
+
+    canceled_timer_ids =
+      refs
+      |> Enum.map(fn {ref, _token_id} -> Map.get(state.timer_ref_ids || %{}, ref) end)
+      |> Enum.reject(&is_nil/1)
+
+    keep_ref_ids = Map.drop(state.timer_ref_ids || %{}, Enum.map(refs, &elem(&1, 0)))
+
+    {%{state | timer_refs: Map.new(keep_refs), timer_ref_ids: keep_ref_ids}, canceled_timer_ids}
+  end
+
+  defp remove_token_wait(waits, name, token_id) do
+    updated =
+      waits
+      |> Map.get(name, [])
+      |> List.delete(token_id)
+
+    if updated == [] do
+      Map.delete(waits, name)
+    else
+      Map.put(waits, name, updated)
+    end
+  end
 
   defp append_event(state, event) do
     %{state | persistent_events: state.persistent_events ++ [event]}
