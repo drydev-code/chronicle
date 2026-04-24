@@ -647,7 +647,7 @@ defmodule Chronicle.Engine.Diagrams.Parser do
     ext =
       Enum.find(extensions, fn e ->
         name = Map.get(e, "name", "")
-        name == "PSS.RestTask" or name == "PSS.UserTask"
+        name == "RestTask" or name == "UserTask"
       end)
 
     case ext do

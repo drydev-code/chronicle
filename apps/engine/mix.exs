@@ -58,7 +58,7 @@ defmodule Chronicle.MixProject do
   defp package do
     [
       licenses: ["Apache-2.0"],
-      links: %{"GitHub" => "https://github.com/drydev-code/chronicle"},
+      links: %{"GitHub" => "https://github.com/chronicle-workflow/chronicle"},
       files: ~w(lib priv/js priv/repo/migrations mix.exs README.md LICENSE)
     ]
   end
