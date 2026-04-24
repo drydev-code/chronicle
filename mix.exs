@@ -17,7 +17,7 @@ defmodule Chronicle.Umbrella.MixProject do
   defp aliases do
     [
       setup: ["deps.get", "cmd mix ecto.setup"],
-      test: ["cmd --app engine mix test"]
+      test: ["cmd mix test"]
     ]
   end
 

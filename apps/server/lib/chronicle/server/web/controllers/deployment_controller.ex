@@ -26,16 +26,22 @@ defmodule Chronicle.Server.Web.Controllers.DeploymentController do
   end
 
   def deploy_mock(conn, %{"filename" => filename}) do
-    tenant_id = conn.assigns[:tenant_id]
+    if Application.get_env(:server, :enable_mock_deployment, false) do
+      tenant_id = conn.assigns[:tenant_id]
 
-    case File.read(filename) do
-      {:ok, content} ->
-        case Manager.provision(content, filename, tenant_id) do
-          {:ok, results} -> json(conn, %{status: "deployed", results: inspect(results)})
-          {:error, reason} -> conn |> put_status(400) |> json(%{error: inspect(reason)})
-        end
-      {:error, reason} ->
-        conn |> put_status(404) |> json(%{error: "File not found: #{inspect(reason)}"})
+      case File.read(filename) do
+        {:ok, content} ->
+          case Manager.provision(content, filename, tenant_id) do
+            {:ok, results} -> json(conn, %{status: "deployed", results: inspect(results)})
+            {:error, reason} -> conn |> put_status(400) |> json(%{error: inspect(reason)})
+          end
+        {:error, reason} ->
+          conn |> put_status(404) |> json(%{error: "File not found: #{inspect(reason)}"})
+      end
+    else
+      conn
+      |> put_status(:not_found)
+      |> json(%{error: "mock deployment disabled"})
     end
   end
 

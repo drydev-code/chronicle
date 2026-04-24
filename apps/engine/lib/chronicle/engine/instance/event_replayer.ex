@@ -27,9 +27,10 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
       {:error, :no_start_event}
     else
       process_name = start_event.process_name
+      process_version = start_event.process_version
       tenant_id = start_event.tenant || state.tenant_id
 
-      case DiagramStore.get_latest(process_name, tenant_id) do
+      case DiagramStore.get(process_name, process_version, tenant_id) do
         {:ok, definition} ->
           state = %{state |
             business_key: start_event.business_key,
@@ -49,20 +50,30 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
           {:ok, state}
 
         {:error, :not_found} ->
-          Logger.error("Instance #{state.id}: Definition '#{process_name}' not found for tenant #{tenant_id}")
-          {:error, {:definition_not_found, process_name}}
+          Logger.error(
+            "Instance #{state.id}: Definition '#{process_name}' version #{inspect(process_version)} " <>
+              "not found for tenant #{tenant_id}; refusing to fall back to latest to preserve replay fidelity"
+          )
+          {:error, {:definition_version_not_found, process_name, process_version}}
+
+        {:loading, _key} ->
+          Logger.error(
+            "Instance #{state.id}: Definition '#{process_name}' version #{inspect(process_version)} " <>
+              "is registered but not yet loaded"
+          )
+          {:error, {:definition_not_loaded, process_name, process_version}}
 
         _ ->
-          Logger.error("Instance #{state.id}: Failed to load definition '#{process_name}'")
-          {:error, {:definition_load_failed, process_name}}
+          Logger.error(
+            "Instance #{state.id}: Failed to load definition '#{process_name}' version #{inspect(process_version)}"
+          )
+          {:error, {:definition_load_failed, process_name, process_version}}
       end
     end
   end
 
-  @doc """
-  Replays all events against the given state, returning the fully
-  reconstructed state with tokens, waits, and timers restored.
-  """
+  # Replays all events against the given state, returning the fully
+  # reconstructed state with tokens, waits, and timers restored.
   defp replay_events(events, state) do
     acc = %{
       state: state,

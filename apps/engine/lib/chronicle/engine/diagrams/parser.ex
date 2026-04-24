@@ -16,11 +16,22 @@ defmodule Chronicle.Engine.Diagrams.Parser do
   end
 
   def parse_definition(data) when is_map(data) do
+    try do
+      do_parse_definition(data)
+    catch
+      {:duplicate_node_ids, ids} -> {:error, {:duplicate_node_ids, ids}}
+    end
+  end
+
+  defp do_parse_definition(data) do
     data = normalize_keys(data)
     processes = Map.get(data, "processes", [data])
 
     definitions = Enum.map(processes, fn process ->
-      nodes = parse_nodes(Map.get(process, "nodes", []))
+      nodes_data = Map.get(process, "nodes", [])
+      validate_unique_node_ids!(nodes_data)
+
+      nodes = parse_nodes(nodes_data)
       connections = parse_connections(Map.get(process, "connections", []))
       reverse_connections = build_reverse_connections(connections)
       start_events = find_start_events(nodes)
@@ -54,6 +65,30 @@ defmodule Chronicle.Engine.Diagrams.Parser do
       multiple -> {:ok, multiple}
     end
   end
+
+  # Collect raw node IDs before map conversion (which silently drops duplicates)
+  # and throw if any duplicates exist; caller converts throw to {:error, ...}.
+  # Checks both string ("id" / "Id") and atom (:id) key variants because
+  # this runs after normalize_keys has already lowercased top-level keys.
+  defp validate_unique_node_ids!(nodes_data) when is_list(nodes_data) do
+    raw_ids =
+      Enum.map(nodes_data, fn
+        n when is_map(n) ->
+          Map.get(n, "id") || Map.get(n, :id) || Map.get(n, "Id")
+
+        _ ->
+          nil
+      end)
+
+    duplicates = raw_ids -- Enum.uniq(raw_ids)
+
+    case duplicates do
+      [] -> :ok
+      ids -> throw({:duplicate_node_ids, Enum.uniq(ids)})
+    end
+  end
+
+  defp validate_unique_node_ids!(_), do: :ok
 
   # -- Key normalization: PascalCase -> camelCase --
 

@@ -22,7 +22,7 @@ defmodule Chronicle.Server.Host.Deployment.Package do
 
   defp detect_type(name) do
     cond do
-      String.ends_with?(name, ".bpmn") -> :bpmn
+      String.ends_with?(name, ".bpmn") -> :bpmn_xml_unsupported
       String.ends_with?(name, ".bpjs") -> :bpmn
       String.ends_with?(name, ".dmn") -> :dmn
       String.ends_with?(name, ".cmmn") -> :cmmn

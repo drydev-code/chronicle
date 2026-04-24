@@ -404,11 +404,11 @@ defmodule Chronicle.Engine.Instance do
       end
     end
 
-    if Chronicle.Server.Host.LargeVariables.enabled?() do
+    if Chronicle.Engine.LargeVariablesCleaner.enabled?() do
       cleanup_state = state
       Task.start(fn ->
         all_params = cleanup_state.tokens |> Map.values() |> Enum.map(& &1.parameters)
-        Enum.each(all_params, &Chronicle.Server.Host.LargeVariables.cleanup(&1, cleanup_state.tenant_id))
+        Enum.each(all_params, &Chronicle.Engine.LargeVariablesCleaner.cleanup(&1, cleanup_state.tenant_id))
       end)
     end
 

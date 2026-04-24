@@ -23,7 +23,7 @@ defmodule Chronicle.MixProject do
 
   def application do
     [
-      extra_applications: [:logger, :runtime_tools]
+      extra_applications: [:logger, :runtime_tools, :xmerl]
     ]
   end
 
@@ -34,9 +34,9 @@ defmodule Chronicle.MixProject do
     [
       {:phoenix_pubsub, "~> 2.1"},
       {:ecto_sql, "~> 3.11"},
-      {:myxql, "~> 0.7", optional: true},
-      {:postgrex, "~> 0.19", optional: true},
-      {:tds, "~> 2.3", optional: true},
+      {:myxql, "~> 0.7"},
+      {:postgrex, "~> 0.19"},
+      {:tds, "~> 2.3"},
       {:jason, "~> 1.4"},
       {:poolboy, "~> 1.5"},
       {:bbmustache, "~> 1.12"},

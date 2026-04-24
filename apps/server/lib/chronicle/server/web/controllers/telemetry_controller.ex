@@ -4,6 +4,7 @@ defmodule Chronicle.Server.Web.Controllers.TelemetryController do
   alias Chronicle.Server.Host.TelemetryService
   alias Chronicle.Persistence.Repo
   alias Chronicle.Persistence.Schemas.{CompletedInstance, TerminatedInstance}
+  alias Chronicle.Server.Web.Params
   import Ecto.Query
 
   def is_enabled(conn, _params) do
@@ -37,19 +38,33 @@ defmodule Chronicle.Server.Web.Controllers.TelemetryController do
   end
 
   def db_completed_instances(conn, params) do
-    limit = Map.get(params, "limit", "100") |> String.to_integer()
-    instances =
-      from(c in CompletedInstance, select: c.process_instance_id, limit: ^limit)
-      |> Repo.all()
-    json(conn, instances)
+    case Params.positive_int(Map.get(params, "limit", 100)) do
+      {:ok, limit} ->
+        instances =
+          from(c in CompletedInstance, select: c.process_instance_id, limit: ^limit)
+          |> Repo.all()
+        json(conn, instances)
+
+      {:error, reason} ->
+        conn
+        |> put_status(400)
+        |> json(%{error: "invalid parameter", field: "limit", reason: reason})
+    end
   end
 
   def db_terminated_instances(conn, params) do
-    limit = Map.get(params, "limit", "100") |> String.to_integer()
-    instances =
-      from(t in TerminatedInstance, select: t.process_instance_id, limit: ^limit)
-      |> Repo.all()
-    json(conn, instances)
+    case Params.positive_int(Map.get(params, "limit", 100)) do
+      {:ok, limit} ->
+        instances =
+          from(t in TerminatedInstance, select: t.process_instance_id, limit: ^limit)
+          |> Repo.all()
+        json(conn, instances)
+
+      {:error, reason} ->
+        conn
+        |> put_status(400)
+        |> json(%{error: "invalid parameter", field: "limit", reason: reason})
+    end
   end
 
   def db_completed_instance_data(conn, %{"id" => id}) do
@@ -106,37 +121,5 @@ defmodule Chronicle.Server.Web.Controllers.TelemetryController do
       nodes: map_size(definition.nodes || %{}),
       connections: map_size(definition.connections || %{})
     }
-  end
-
-  # Database query endpoints for historical data
-
-  def db_completed_instances(conn, params) do
-    limit = Map.get(params, "limit", "100") |> String.to_integer()
-    instances =
-      from(c in CompletedInstance, select: c.process_instance_id, limit: ^limit)
-      |> Repo.all()
-    json(conn, instances)
-  end
-
-  def db_terminated_instances(conn, params) do
-    limit = Map.get(params, "limit", "100") |> String.to_integer()
-    instances =
-      from(t in TerminatedInstance, select: t.process_instance_id, limit: ^limit)
-      |> Repo.all()
-    json(conn, instances)
-  end
-
-  def db_completed_instance_data(conn, %{"id" => id}) do
-    case Repo.get(CompletedInstance, id) do
-      nil -> conn |> put_status(404) |> json(%{error: "Not found"})
-      instance -> json(conn, instance.data)
-    end
-  end
-
-  def db_terminated_instance_data(conn, %{"id" => id}) do
-    case Repo.get(TerminatedInstance, id) do
-      nil -> conn |> put_status(404) |> json(%{error: "Not found"})
-      instance -> json(conn, instance.data)
-    end
   end
 end

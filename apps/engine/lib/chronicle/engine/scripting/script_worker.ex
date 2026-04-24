@@ -15,20 +15,33 @@ defmodule Chronicle.Engine.Scripting.ScriptWorker do
   def init(_args) do
     js_path = Path.join(:code.priv_dir(:engine), "js/evaluator.js")
 
-    port = Port.open(
-      {:spawn_executable, System.find_executable("node")},
-      [
-        :binary,
-        :exit_status,
-        {:args, [js_path]},
-        {:line, 1_048_576},
-        {:env, [
-          {~c"NODE_OPTIONS", ~c"--max-old-space-size=64"}
-        ]}
-      ]
-    )
+    case System.find_executable("node") do
+      nil ->
+        Logger.error(
+          "ScriptWorker: Node.js binary not on PATH. " <>
+            "Install Node.js 18+ to enable script tasks."
+        )
 
-    {:ok, %{port: port, pending: %{}}}
+        {:stop,
+         {:node_not_found,
+          "Node.js binary not on PATH. Install Node.js 18+ to enable script tasks."}}
+
+      node_path ->
+        port = Port.open(
+          {:spawn_executable, node_path},
+          [
+            :binary,
+            :exit_status,
+            {:args, [js_path]},
+            {:line, 1_048_576},
+            {:env, [
+              {~c"NODE_OPTIONS", ~c"--max-old-space-size=64"}
+            ]}
+          ]
+        )
+
+        {:ok, %{port: port, pending: %{}}}
+    end
   end
 
   @impl true

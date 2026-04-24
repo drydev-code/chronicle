@@ -24,7 +24,19 @@ defmodule Chronicle.Engine.Instance.WaitRegistry do
         end
 
       [token_id | rest] ->
-        state = %{state | message_waits: Map.put(state.message_waits, message_name, rest)}
+        new_waits =
+          if rest == [] do
+            Map.delete(state.message_waits, message_name)
+          else
+            Map.put(state.message_waits, message_name, rest)
+          end
+
+        state = %{state | message_waits: new_waits}
+
+        # Remove the per-token entry from the global :waits registry so
+        # stale routes do not survive after consumption.
+        unregister_message_wait(state, message_name, token_id)
+
         state = TokenState.resume_token(state, token_id, {:message, message_name, payload})
         {:resumed, state}
     end
@@ -36,6 +48,10 @@ defmodule Chronicle.Engine.Instance.WaitRegistry do
   """
   def handle_signal(state, signal_name) do
     signal_tokens = Map.get(state.signal_waits, signal_name, [])
+
+    # Remove all per-token entries from the global :waits registry; the
+    # in-memory signal_waits map is cleared below.
+    unregister_signal_waits(state, signal_name, signal_tokens)
 
     state = Enum.reduce(signal_tokens, state, fn token_id, acc ->
       TokenState.resume_token(acc, token_id, {:signal, signal_name})
@@ -135,7 +151,29 @@ defmodule Chronicle.Engine.Instance.WaitRegistry do
     end
   end
 
+  @doc """
+  Removes all `:waits` Registry entries owned by the current process for
+  the given key whose value equals `token_id`. The `:waits` Registry is
+  `:duplicate`, so multiple entries may share a key; we match by value.
+  """
+  def unregister(registry, key, token_id) do
+    Registry.unregister_match(registry, key, token_id)
+    :ok
+  end
+
   # --- Private helpers ---
+
+  defp unregister_message_wait(state, message_name, token_id) do
+    key = {state.tenant_id, :message, message_name, state.business_key}
+    unregister(:waits, key, token_id)
+  end
+
+  defp unregister_signal_waits(state, signal_name, token_ids) do
+    key = {state.tenant_id, :signal, signal_name}
+    Enum.each(token_ids, fn token_id ->
+      unregister(:waits, key, token_id)
+    end)
+  end
 
   defp handle_interrupting_message_boundary(state, boundaries) do
     Enum.reduce(boundaries, state, fn {token_id, boundary_node}, acc ->

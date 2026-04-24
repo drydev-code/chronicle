@@ -1,6 +1,8 @@
 defmodule Chronicle.Server.Host.LargeVariables do
   @moduledoc "Upload/download >1500 byte values to/from DataBus database."
 
+  @behaviour Chronicle.Engine.LargeVariablesCleaner
+
   alias Chronicle.Server.Host.Deployment.DataBusClient
 
   @threshold 1500

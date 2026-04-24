@@ -120,16 +120,14 @@ defmodule Chronicle.Supervisor do
     repo = Application.get_env(:engine, :active_repo)
     migrations_path = Application.app_dir(:engine, "priv/repo/migrations")
 
-    try do
-      {:ok, _, _} =
-        Ecto.Migrator.with_repo(repo, fn repo ->
-          Ecto.Migrator.run(repo, migrations_path, :up, all: true)
-        end)
+    # Migrations must succeed on startup; re-applying existing migrations is
+    # safe because Ecto tracks schema_migrations. Swallowing errors here can
+    # mask schema drift that corrupts later event replay.
+    {:ok, _, _} =
+      Ecto.Migrator.with_repo(repo, fn repo ->
+        Ecto.Migrator.run(repo, migrations_path, :up, all: true)
+      end)
 
-      Logger.info("Database migrations complete")
-    rescue
-      e ->
-        Logger.warning("Migration failed (may already be applied): #{inspect(e)}")
-    end
+    Logger.info("Database migrations complete")
   end
 end

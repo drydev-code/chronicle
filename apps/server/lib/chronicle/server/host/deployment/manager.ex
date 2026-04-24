@@ -21,7 +21,10 @@ defmodule Chronicle.Server.Host.Deployment.Manager do
       String.ends_with?(filename, ".zip") ->
         Chronicle.Server.Host.Deployment.Package.extract(content)
 
-      String.ends_with?(filename, ".bpmn") or String.ends_with?(filename, ".bpjs") ->
+      String.ends_with?(filename, ".bpmn") ->
+        {:error, {:xml_bpmn_not_supported, filename}}
+
+      String.ends_with?(filename, ".bpjs") ->
         {:ok, [%{name: filename, content: content, type: :bpmn}]}
 
       String.ends_with?(filename, ".dmn") ->
@@ -40,6 +43,7 @@ defmodule Chronicle.Server.Host.Deployment.Manager do
       case file.type do
         :bpmn -> register_bpmn(file, tenant_id, file_map)
         :dmn -> register_dmn(file, tenant_id)
+        :bpmn_xml_unsupported -> {:error, {:xml_bpmn_not_supported, file.name}}
         _ -> {:ok, :skipped}
       end
     end)

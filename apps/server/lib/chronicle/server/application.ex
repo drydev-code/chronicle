@@ -8,6 +8,8 @@ defmodule Chronicle.Server.Application do
 
   @impl true
   def start(_type, _args) do
+    Application.put_env(:engine, :large_variables_cleaner, Chronicle.Server.Host.LargeVariables)
+
     children = [
       {Chronicle, []},
       Chronicle.Server.Host.TelemetryService,

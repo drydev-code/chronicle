@@ -33,4 +33,6 @@ config :server, :rabbitmq,
   password: System.get_env("RABBITMQ_PASS", "guest"),
   virtual_host: System.get_env("RABBITMQ_VHOST", "/")
 
+config :server, enable_mock_deployment: true
+
 config :logger, level: :debug

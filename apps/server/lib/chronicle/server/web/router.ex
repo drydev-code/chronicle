@@ -9,25 +9,41 @@ defmodule Chronicle.Server.Web.Router do
     plug Chronicle.Server.Web.Plugs.Tenant
   end
 
+  pipeline :authenticated do
+    plug Chronicle.Server.Web.Plugs.Auth
+  end
+
+  pipeline :admin do
+    plug Chronicle.Server.Web.Plugs.Auth
+    # future: add role check
+  end
+
+  # Public scope: endpoints safe for unauthenticated callers.
+  # Currently none of the existing routes are safe-by-default; keep this
+  # scope empty until genuinely public endpoints (e.g. health checks) are
+  # added.
   scope "/api", Chronicle.Server.Web.Controllers do
     pipe_through :api
 
-    # Process Instance
+    # (intentionally empty — no public endpoints today)
+  end
+
+  # Authenticated scope: everything that reads state or starts a normal
+  # workflow operation.
+  scope "/api", Chronicle.Server.Web.Controllers do
+    pipe_through [:api, :authenticated]
+
+    # Process Instance (read + non-destructive start)
     post "/process-instance", ProcessInstanceController, :start
-    post "/process-instance/:id/migrate", ProcessInstanceController, :migrate
-    post "/process-instance/stress-test", ProcessInstanceController, :stress_test
 
-    # Deployment
-    post "/deployment", DeploymentController, :upload
+    # Deployment (non-destructive)
     post "/deployment/redeploy", DeploymentController, :redeploy
-    post "/deployment/mock", DeploymentController, :deploy_mock
 
-    # Management
+    # Management (read-only)
     get "/management/active-processes", ManagementController, :active_processes
     get "/management/active-processes-count", ManagementController, :active_processes_count
     get "/management/inspect/:id", ManagementController, :inspect_instance
     get "/management/external-tasks", ManagementController, :list_external_tasks
-    delete "/management/terminate-all", ManagementController, :terminate_all
     get "/management/timer-start-events", ManagementController, :timer_start_events
     get "/management/test-parse-diagram", ManagementController, :test_parse_diagram
 
@@ -50,5 +66,21 @@ defmodule Chronicle.Server.Web.Router do
     get "/telemetry/db-terminated-instances", TelemetryController, :db_terminated_instances
     get "/telemetry/db-completed-instance/:id", TelemetryController, :db_completed_instance_data
     get "/telemetry/db-terminated-instance/:id", TelemetryController, :db_terminated_instance_data
+  end
+
+  # Admin scope: destructive / high-impact operations.
+  scope "/api", Chronicle.Server.Web.Controllers do
+    pipe_through [:api, :admin]
+
+    # Process Instance — migrations + stress test
+    post "/process-instance/:id/migrate", ProcessInstanceController, :migrate
+    post "/process-instance/stress-test", ProcessInstanceController, :stress_test
+
+    # Deployment — uploads + mock
+    post "/deployment", DeploymentController, :upload
+    post "/deployment/mock", DeploymentController, :deploy_mock
+
+    # Management — terminate-all
+    delete "/management/terminate-all", ManagementController, :terminate_all
   end
 end
