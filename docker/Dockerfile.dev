@@ -11,8 +11,8 @@ ENV MIX_ENV=dev
 # Umbrella layout — copy root + app manifests first for dep cache
 COPY mix.exs mix.lock ./
 COPY config config
-COPY apps/drydev_workflow/mix.exs apps/drydev_workflow/
-COPY apps/drydev_workflow_server/mix.exs apps/drydev_workflow_server/
+COPY apps/engine/mix.exs apps/engine/
+COPY apps/server/mix.exs apps/server/
 
 RUN mix deps.get
 RUN mix deps.compile

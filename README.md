@@ -5,16 +5,15 @@ with DMN decision tables and embedded JavaScript scripting.
 
 ## What's in this repo
 
-Umbrella with two apps:
+Umbrella monorepo with two apps:
 
-| App                     | Role                                                                 |
-| ----------------------- | -------------------------------------------------------------------- |
-| `drydev_workflow`       | Engine library — BPMN runtime, DMN evaluator, persistence, scripting |
-| `drydev_workflow_server` | Standalone service — Phoenix REST API, AMQP messaging, external task routing |
+| App      | Kind    | Role                                                              |
+| -------- | ------- | ----------------------------------------------------------------- |
+| `engine` | library | BPMN runtime, DMN evaluator, persistence, scripting. No auto-start. |
+| `server` | service | Standalone Phoenix REST API, AMQP messaging, external task routing. |
 
-Use `:drydev_workflow` directly as a hex dependency to embed the engine.
-Run `:drydev_workflow_server` when you want a batteries-included HTTP + AMQP
-service.
+Depend on `:engine` directly (Hex or path) to embed the engine into your
+supervision tree. Run `:server` when you want a batteries-included service.
 
 ## Features
 
@@ -109,16 +108,36 @@ PORT              HTTP port (default: 4000)
 
 ## Embedding the engine as a library
 
+The `engine` app is a pure library — it ships no `Application` callback and
+does not start a supervision tree on its own. Mount it into your host app:
+
 ```elixir
 # mix.exs
 def deps do
-  [{:drydev_workflow, "~> 0.1"}]
+  [{:engine, "~> 0.1"}]  # or path/in_umbrella during development
+end
+
+# lib/my_app/application.ex
+def start(_type, _args) do
+  children = [
+    {DryDev.Workflow, []},
+    # ... your own children
+  ]
+
+  Supervisor.start_link(children, strategy: :rest_for_one)
 end
 ```
 
-Then wire your own supervision tree; see
-`apps/drydev_workflow/lib/drydev/workflow/application.ex` for the required
-children.
+`{DryDev.Workflow, opts}` accepts:
+
+- `:run_migrations` — run Ecto migrations on startup (default: `true`)
+- `:restore_instances` — replay active instances from the event store (default: `true`)
+
+If you prefer a flat child list, use `DryDev.Workflow.children(opts)` and
+concat into your own supervisor's children.
+
+The `server` app is the canonical example — see
+[`apps/server/lib/drydev/workflow_server/application.ex`](apps/server/lib/drydev/workflow_server/application.ex).
 
 ## Project status
 

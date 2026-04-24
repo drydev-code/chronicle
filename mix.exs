@@ -17,17 +17,17 @@ defmodule DryDev.Workflow.Umbrella.MixProject do
   defp aliases do
     [
       setup: ["deps.get", "cmd mix ecto.setup"],
-      test: ["cmd --app drydev_workflow mix test"]
+      test: ["cmd --app engine mix test"]
     ]
   end
 
   defp releases do
     [
-      drydev_workflow_server: [
+      drydev_workflow: [
         version: "0.1.0",
         applications: [
-          drydev_workflow: :permanent,
-          drydev_workflow_server: :permanent
+          engine: :load,
+          server: :permanent
         ],
         include_executables_for: [:unix, :windows]
       ]

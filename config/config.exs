@@ -1,17 +1,17 @@
 import Config
 
-config :drydev_workflow,
+config :engine,
   ecto_repos: [DryDev.Workflow.Persistence.Repo.MySQL],
   active_repo: DryDev.Workflow.Persistence.Repo.MySQL,
   active_databus_repo: DryDev.Workflow.Persistence.DataBusRepo.MySQL
 
-config :drydev_workflow, :eviction,
+config :engine, :eviction,
   enabled: false,
   idle_threshold_ms: 300_000,
   scan_interval_ms: 60_000,
   max_resident: nil
 
-config :drydev_workflow_server, DryDev.WorkflowServer.Web.Endpoint,
+config :server, DryDev.WorkflowServer.Web.Endpoint,
   url: [host: "localhost"],
   render_errors: [formats: [json: DryDev.WorkflowServer.Web.ErrorJSON], layout: false],
   pubsub_server: DryDev.Workflow.PubSub,

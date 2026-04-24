@@ -3,7 +3,7 @@ services:
     image: mysql:8.0
     environment:
       MYSQL_ROOT_PASSWORD: root
-      MYSQL_DATABASE: drydev_workflow_dev
+      MYSQL_DATABASE: drydev_dev
     ports:
       - "33060:3306"
     volumes:
@@ -36,7 +36,7 @@ services:
       DB_HOST: db
       DB_USER: root
       DB_PASS: root
-      DB_NAME: drydev_workflow_dev
+      DB_NAME: drydev_dev
       DB_PORT: "3306"
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: "5672"
@@ -64,7 +64,7 @@ services:
       DB_HOST: db
       DB_USER: root
       DB_PASS: root
-      DB_NAME: drydev_workflow_test
+      DB_NAME: drydev_test
       DB_PORT: "3306"
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: "5672"
