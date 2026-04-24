@@ -34,4 +34,5 @@ defmodule Chronicle.Persistence.Repo do
 
   # --- Transaction API ---
   def transaction(fun_or_multi, opts \\ []), do: active().transaction(fun_or_multi, opts)
+  def rollback(value), do: active().rollback(value)
 end

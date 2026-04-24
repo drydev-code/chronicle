@@ -26,7 +26,7 @@ defmodule Chronicle.Persistence.Queries do
   enforces idempotent re-deploys for the default tenant. Re-deploying the
   same (tenant, name, version, kind) replaces the stored content.
 
-  Uses a single INSERT ... ON DUPLICATE KEY UPDATE (via Ecto's `on_conflict`)
+  Uses INSERT ... ON DUPLICATE KEY UPDATE on MySQL via Ecto's `on_conflict`
   so two concurrent deploys of the same key cannot race past each other and
   crash with a unique-constraint violation.
   """
@@ -47,8 +47,7 @@ defmodule Chronicle.Persistence.Queries do
     %Deployment{}
     |> Deployment.changeset(attrs)
     |> Repo.insert(
-      on_conflict: {:replace, [:content, :deployed_at]},
-      conflict_target: [:tenant_id, :name, :version, :kind]
+      on_conflict: {:replace, [:content, :deployed_at]}
     )
   end
 

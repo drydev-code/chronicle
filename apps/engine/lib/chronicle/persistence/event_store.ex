@@ -64,23 +64,44 @@ defmodule Chronicle.Persistence.EventStore do
 
   def append_batch(_instance_id, []), do: {:ok, :noop}
   def append_batch(instance_id, events) when is_list(events) do
-    case Repo.get(ActiveInstance, instance_id) do
-      nil ->
-        data = events
-          |> Enum.map(&Chronicle.Engine.PersistentData.encode/1)
-          |> Jason.encode!()
-        %ActiveInstance{}
-        |> ActiveInstance.changeset(%{process_instance_id: instance_id, data: data})
-        |> Repo.insert()
+    # Wrap read-modify-write in a transaction with a row-level lock so
+    # concurrent appends for the same instance cannot trample each other.
+    # Without the lock, two appenders could both read the same `existing`
+    # list, each append their delta, and the later writer would clobber
+    # the earlier one.
+    Repo.transaction(fn ->
+      row =
+        from(a in ActiveInstance,
+          where: a.process_instance_id == ^instance_id,
+          lock: "FOR UPDATE"
+        )
+        |> Repo.one()
 
-      active ->
-        existing = Jason.decode!(active.data)
-        new_encoded = Enum.map(events, &Chronicle.Engine.PersistentData.encode/1)
-        updated = existing ++ new_encoded
-        active
-        |> ActiveInstance.changeset(%{data: Jason.encode!(updated)})
-        |> Repo.update()
-    end
+      new_encoded = Enum.map(events, &Chronicle.Engine.PersistentData.encode/1)
+
+      case row do
+        nil ->
+          data = Jason.encode!(new_encoded)
+
+          case %ActiveInstance{}
+               |> ActiveInstance.changeset(%{process_instance_id: instance_id, data: data})
+               |> Repo.insert() do
+            {:ok, inserted} -> inserted
+            {:error, changeset} -> Repo.rollback(changeset)
+          end
+
+        active ->
+          existing = Jason.decode!(active.data)
+          updated = existing ++ new_encoded
+
+          case active
+               |> ActiveInstance.changeset(%{data: Jason.encode!(updated)})
+               |> Repo.update() do
+            {:ok, updated_row} -> updated_row
+            {:error, changeset} -> Repo.rollback(changeset)
+          end
+      end
+    end)
   end
 
   @doc """

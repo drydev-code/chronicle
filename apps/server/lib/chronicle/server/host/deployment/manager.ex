@@ -93,21 +93,25 @@ defmodule Chronicle.Server.Host.Deployment.Manager do
     if length(errors) > 0 do
       {:error, {:validation_failed, errors}}
     else
-      DiagramStore.register(
-        definition.name,
-        definition.version,
-        tenant_id,
-        definition,
-        raw_content
-      )
-
-      {:ok, definition.name}
+      case DiagramStore.register(
+             definition.name,
+             definition.version,
+             tenant_id,
+             definition,
+             raw_content
+           ) do
+        :ok -> {:ok, definition.name}
+        {:error, reason} -> {:error, {:persist_failed, reason}}
+      end
     end
   end
 
   defp register_dmn(file, tenant_id) do
     dmn_name = Path.rootname(file.name)
-    Chronicle.Engine.Dmn.DmnStore.register(dmn_name, nil, tenant_id, file.content)
-    {:ok, dmn_name}
+
+    case Chronicle.Engine.Dmn.DmnStore.register(dmn_name, nil, tenant_id, file.content) do
+      :ok -> {:ok, dmn_name}
+      {:error, reason} -> {:error, {:persist_failed, reason}}
+    end
   end
 end
