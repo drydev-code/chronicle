@@ -195,6 +195,12 @@ defmodule Chronicle.Engine.Instance do
 
       node ->
         {token, state} = TokenState.create_token(state, 0, node.id, state.start_parameters || %{})
+        state = append_event(state, %PersistentData.TokenFamilyCreated{
+          token: token.id,
+          family: token.family,
+          current_node: token.current_node,
+          start_params: token.parameters
+        })
         state = %{state | active_tokens: MapSet.put(state.active_tokens, token.id)}
         {:noreply, state, {:continue, :process_tokens}}
     end
@@ -228,6 +234,8 @@ defmodule Chronicle.Engine.Instance do
 
     case sync_persist(state) do
       {:ok, state} ->
+        state = publish_pending_effects(state)
+
         cond do
           MapSet.size(state.active_tokens) > 0 ->
             {:noreply, state, {:continue, :process_tokens}}
@@ -262,31 +270,46 @@ defmodule Chronicle.Engine.Instance do
 
   @impl true
   def handle_cast({:message, message_name, payload}, state) do
-    case WaitRegistry.handle_message(state, message_name, payload) do
-      {:ignored, state} -> {:noreply, state}
-      {:boundary, state} -> {:noreply, state, {:continue, :process_tokens}}
-      {:resumed, state} -> {:noreply, state, {:continue, :process_tokens}}
+    events = message_command_events(state, message_name, payload)
+
+    case persist_command_events(state, events) do
+      {:ok, state} ->
+        case WaitRegistry.handle_message(state, message_name, payload) do
+          {:ignored, state} -> {:noreply, state}
+          {:boundary, state} -> {:noreply, state, {:continue, :process_tokens}}
+          {:resumed, state} -> {:noreply, state, {:continue, :process_tokens}}
+        end
+
+      {:error, _reason, state} ->
+        {:noreply, state}
     end
   end
 
   def handle_cast({:signal, signal_name}, state) do
-    state = WaitRegistry.handle_signal(state, signal_name)
+    events = signal_command_events(state, signal_name)
 
-    if MapSet.size(state.active_tokens) > 0 do
-      {:noreply, state, {:continue, :process_tokens}}
-    else
-      {:noreply, state}
+    case persist_command_events(state, events) do
+      {:ok, state} ->
+        state = WaitRegistry.handle_signal(state, signal_name)
+
+        if MapSet.size(state.active_tokens) > 0 do
+          {:noreply, state, {:continue, :process_tokens}}
+        else
+          {:noreply, state}
+        end
+
+      {:error, _reason, state} ->
+        {:noreply, state}
     end
   end
 
   def handle_cast({:external_task_complete, task_id, payload, result}, state) do
-    case WaitRegistry.complete_external_task(state, task_id, payload, result) do
-      {:error, :not_found} ->
+    case Map.get(state.external_tasks, task_id) do
+      nil ->
         Logger.warning("Instance #{state.id}: Unknown external task #{task_id}")
         {:noreply, state}
 
-      {:ok, state, token_id} ->
-        # Persist completion event
+      token_id ->
         token = Map.get(state.tokens, token_id)
         event = %PersistentData.ExternalTaskCompletion{
           token: token_id,
@@ -297,27 +320,53 @@ defmodule Chronicle.Engine.Instance do
           payload: payload,
           result: result
         }
-        state = append_event(state, event)
 
-        case sync_persist(state) do
+        case persist_command_events(state, [event]) do
           {:ok, state} ->
-            Phoenix.PubSub.broadcast(Chronicle.PubSub, "engine:events",
-              {:external_task_completed, state.id, task_id, true})
+            case WaitRegistry.complete_external_task(state, task_id, payload, result) do
+              {:ok, state, _token_id} ->
+                Phoenix.PubSub.broadcast(Chronicle.PubSub, "engine:events",
+                  {:external_task_completed, state.id, task_id, true})
 
-            {:noreply, state, {:continue, :process_tokens}}
+                {:noreply, state, {:continue, :process_tokens}}
+
+              {:error, :not_found} ->
+                {:noreply, state}
+            end
 
           {:error, _reason, state} ->
-            # Do not publish completion or continue token processing. The
-            # next redelivery / external retry will re-invoke this handler.
             {:noreply, state}
         end
     end
   end
 
   def handle_cast({:external_task_error, task_id, error, retry?, backoff_ms}, state) do
-    case WaitRegistry.error_external_task(state, task_id, error, retry?, backoff_ms) do
-      {:error, :not_found} -> {:noreply, state}
-      {:ok, state} -> {:noreply, state, {:continue, :process_tokens}}
+    case Map.get(state.external_tasks, task_id) do
+      nil ->
+        {:noreply, state}
+
+      token_id ->
+        token = Map.get(state.tokens, token_id)
+        event = %PersistentData.ExternalTaskCompletion{
+          token: token_id,
+          family: token && token.family,
+          current_node: token && token.current_node,
+          external_task: task_id,
+          successful: false,
+          error: error,
+          retry_counter: token && token.context[:retries]
+        }
+
+        case persist_command_events(state, [event]) do
+          {:ok, state} ->
+            case WaitRegistry.error_external_task(state, task_id, error, retry?, backoff_ms) do
+              {:error, :not_found} -> {:noreply, state}
+              {:ok, state} -> {:noreply, state, {:continue, :process_tokens}}
+            end
+
+          {:error, _reason, state} ->
+            {:noreply, state}
+        end
     end
   end
 
@@ -375,9 +424,31 @@ defmodule Chronicle.Engine.Instance do
 
   # Child process completed (CallActivity)
   def handle_cast({:child_completed, child_id, completion_context, successful}, state) do
-    case WaitRegistry.handle_child_completed(state, child_id, completion_context, successful) do
-      {:error, :not_found} -> {:noreply, state}
-      {:ok, state} -> {:noreply, state, {:continue, :process_tokens}}
+    case Map.get(state.call_wait_list, child_id) do
+      nil ->
+        {:noreply, state}
+
+      token_id ->
+        token = Map.get(state.tokens, token_id)
+        event = %PersistentData.CallCompleted{
+          token: token_id,
+          family: token && token.family,
+          current_node: token && token.current_node,
+          completion_context: completion_context,
+          successful: successful,
+          loop_index: token && token.context[:step]
+        }
+
+        case persist_command_events(state, [event]) do
+          {:ok, state} ->
+            case WaitRegistry.handle_child_completed(state, child_id, completion_context, successful) do
+              {:error, :not_found} -> {:noreply, state}
+              {:ok, state} -> {:noreply, state, {:continue, :process_tokens}}
+            end
+
+          {:error, _reason, state} ->
+            {:noreply, state}
+        end
     end
   end
 
@@ -527,6 +598,92 @@ defmodule Chronicle.Engine.Instance do
 
   defp append_event(state, event) do
     %{state | persistent_events: state.persistent_events ++ [event]}
+  end
+
+  defp append_events(state, events) do
+    %{state | persistent_events: state.persistent_events ++ events}
+  end
+
+  defp persist_command_events(state, []), do: {:ok, state}
+  defp persist_command_events(state, events) do
+    state
+    |> append_events(events)
+    |> sync_persist()
+  end
+
+  defp publish_pending_effects(state) do
+    Enum.each(state.pending_effects || [], fn
+      {:pubsub, topic, message} ->
+        Phoenix.PubSub.broadcast(Chronicle.PubSub, topic, message)
+    end)
+
+    %{state | pending_effects: []}
+  end
+
+  defp message_command_events(state, message_name, payload) do
+    wait_events =
+      case Map.get(state.message_waits, message_name, []) do
+        [token_id | _] ->
+          token = Map.get(state.tokens, token_id)
+          [%PersistentData.MessageHandled{
+            token: token_id,
+            family: token && token.family,
+            current_node: token && token.current_node,
+            name: message_name,
+            target_node: token && token.current_node,
+            retry_counter: token && token.context[:retries],
+            payload: payload
+          }]
+
+        [] ->
+          []
+      end
+
+    boundary_events(state, :message, message_name)
+    |> Kernel.++(wait_events)
+  end
+
+  defp signal_command_events(state, signal_name) do
+    wait_events =
+      Enum.map(Map.get(state.signal_waits, signal_name, []), fn token_id ->
+        token = Map.get(state.tokens, token_id)
+        %PersistentData.SignalHandled{
+          token: token_id,
+          family: token && token.family,
+          current_node: token && token.current_node,
+          signal_name: signal_name,
+          target_node: token && token.current_node,
+          retry_counter: token && token.context[:retries]
+        }
+      end)
+
+    boundary_events(state, :signal, signal_name) ++ wait_events
+  end
+
+  defp boundary_events(state, type, name) do
+    {interrupting, non_interrupting} =
+      case type do
+        :message -> {state.message_boundaries, state.ni_message_boundaries}
+        :signal -> {state.signal_boundaries, state.ni_signal_boundaries}
+      end
+
+    Enum.flat_map([{interrupting, true}, {non_interrupting, false}], fn {map, interrupting?} ->
+      map
+      |> Map.get(name, [])
+      |> Enum.map(fn {token_id, boundary_node} ->
+        token = Map.get(state.tokens, token_id)
+        %PersistentData.BoundaryEventTriggered{
+          token: token_id,
+          family: token && token.family,
+          current_node: token && token.current_node,
+          boundary_node_id: boundary_node.id,
+          boundary_type: type,
+          interrupting: interrupting?,
+          name: name,
+          triggered_at: System.system_time(:millisecond)
+        }
+      end)
+    end)
   end
 
   # --- Persistence helpers ---

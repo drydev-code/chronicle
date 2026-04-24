@@ -82,6 +82,10 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
       open_timers: %{},
       open_message_waits: %{},
       open_signal_waits: %{},
+      open_message_boundaries: %{},
+      open_signal_boundaries: %{},
+      open_ni_message_boundaries: %{},
+      open_ni_signal_boundaries: %{},
       open_call_waits: %{},
       max_token_id: -1
     }
@@ -94,6 +98,10 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
       external_tasks: acc.open_external_tasks,
       message_waits: acc.open_message_waits,
       signal_waits: acc.open_signal_waits,
+      message_boundaries: acc.open_message_boundaries,
+      signal_boundaries: acc.open_signal_boundaries,
+      ni_message_boundaries: acc.open_ni_message_boundaries,
+      ni_signal_boundaries: acc.open_ni_signal_boundaries,
       call_wait_list: acc.open_call_waits,
       next_token_id: acc.max_token_id + 1
     }
@@ -113,6 +121,7 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
 
     # Re-register message/signal waits in the Registry for cross-instance routing
     reregister_waits_in_registry(state, open_message_waits, open_signal_waits)
+    reregister_boundaries_in_registry(state)
 
     state
   end
@@ -263,6 +272,95 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
     track_token_id(acc, token_id)
   end
 
+  defp replay_single_event(%PersistentData.MessageWaitCreated{} = event, acc) do
+    state = acc.state
+    token_id = event.token
+    name = event.name
+
+    state = TokenState.update_token_node(state, token_id, event.current_node)
+    state = TokenState.set_token_wait_state(state, token_id, :waiting_for_message)
+
+    acc = %{acc |
+      state: state,
+      open_message_waits: Map.update(acc.open_message_waits, name, [token_id], &[token_id | &1]),
+      token_wait_states: Map.put(acc.token_wait_states, token_id, :waiting_for_message)
+    }
+
+    track_token_id(acc, token_id)
+  end
+
+  defp replay_single_event(%PersistentData.SignalWaitCreated{} = event, acc) do
+    state = acc.state
+    token_id = event.token
+    name = event.signal_name
+
+    state = TokenState.update_token_node(state, token_id, event.current_node)
+    state = TokenState.set_token_wait_state(state, token_id, :waiting_for_signal)
+
+    acc = %{acc |
+      state: state,
+      open_signal_waits: Map.update(acc.open_signal_waits, name, [token_id], &[token_id | &1]),
+      token_wait_states: Map.put(acc.token_wait_states, token_id, :waiting_for_signal)
+    }
+
+    track_token_id(acc, token_id)
+  end
+
+  defp replay_single_event(%PersistentData.BoundaryEventCreated{} = event, acc) do
+    boundary_node = Chronicle.Engine.Diagrams.Definition.get_node(acc.state.definition, event.boundary_node_id)
+
+    acc =
+      case {event.boundary_type, event.interrupting, boundary_node} do
+        {:message, true, boundary_node} when not is_nil(boundary_node) ->
+          put_boundary(acc, :open_message_boundaries, event.name, event.token, boundary_node)
+
+        {:message, false, boundary_node} when not is_nil(boundary_node) ->
+          put_boundary(acc, :open_ni_message_boundaries, event.name, event.token, boundary_node)
+
+        {:signal, true, boundary_node} when not is_nil(boundary_node) ->
+          put_boundary(acc, :open_signal_boundaries, event.name, event.token, boundary_node)
+
+        {:signal, false, boundary_node} when not is_nil(boundary_node) ->
+          put_boundary(acc, :open_ni_signal_boundaries, event.name, event.token, boundary_node)
+
+        {:timer, _interrupting, _} ->
+          %{acc |
+            open_timers: Map.put(acc.open_timers, event.timer_id || event.boundary_node_id, %{
+              token_id: event.token,
+              trigger_at: event.trigger_at,
+              target_node: event.boundary_node_id,
+              boundary_node_id: event.boundary_node_id,
+              interrupting: event.interrupting
+            })
+          }
+
+        _ ->
+          acc
+      end
+
+    acc
+    |> put_boundary_index(event)
+    |> track_token_id(event.token)
+  end
+
+  defp replay_single_event(%PersistentData.BoundaryEventTriggered{} = event, acc) do
+    state = TokenState.trigger_boundary(
+      acc.state,
+      event.token,
+      event.boundary_node_id,
+      event.interrupting != false
+    )
+
+    acc = %{acc | state: state}
+    acc = delete_boundary_wait(acc, event)
+    acc = %{acc | token_wait_states: Map.delete(acc.token_wait_states, event.token)}
+    track_token_id(acc, event.token)
+  end
+
+  defp replay_single_event(%PersistentData.BoundaryEventCancelled{} = event, acc) do
+    delete_boundary_wait(acc, event)
+  end
+
   defp replay_single_event(%PersistentData.MessageThrown{} = event, acc) do
     state = acc.state
     state = TokenState.set_token_active(state, event.token)
@@ -408,6 +506,58 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
     Map.put(acc, wait_key, updated_waits)
   end
 
+  defp put_boundary(acc, wait_key, name, token_id, boundary_node) do
+    waits = Map.get(acc, wait_key, %{})
+    waits = Map.update(waits, name, [{token_id, boundary_node}], &[{token_id, boundary_node} | &1])
+    Map.put(acc, wait_key, waits)
+  end
+
+  defp put_boundary_index(acc, event) do
+    info = %{
+      type: event.boundary_type,
+      boundary_node_id: event.boundary_node_id,
+      timer_id: event.timer_id,
+      name: event.name,
+      interrupting: event.interrupting != false,
+      trigger_at: event.trigger_at
+    }
+
+    state = update_in(acc.state.boundary_index[event.token], &[info | (&1 || [])])
+    %{acc | state: state}
+  end
+
+  defp delete_boundary_wait(acc, %{boundary_type: :timer} = event) do
+    %{acc | open_timers: Map.delete(acc.open_timers, event.timer_id || event.boundary_node_id)}
+  end
+
+  defp delete_boundary_wait(acc, %{boundary_type: :message} = event) do
+    acc
+    |> remove_from_open_boundaries(:open_message_boundaries, event.name, event.token)
+    |> remove_from_open_boundaries(:open_ni_message_boundaries, event.name, event.token)
+  end
+
+  defp delete_boundary_wait(acc, %{boundary_type: :signal} = event) do
+    acc
+    |> remove_from_open_boundaries(:open_signal_boundaries, event.name, event.token)
+    |> remove_from_open_boundaries(:open_ni_signal_boundaries, event.name, event.token)
+  end
+
+  defp delete_boundary_wait(acc, _event), do: acc
+
+  defp remove_from_open_boundaries(acc, wait_key, name, token_id) do
+    waits = Map.get(acc, wait_key, %{})
+    boundaries = Map.get(waits, name, [])
+    updated = Enum.reject(boundaries, fn {tid, _boundary} -> tid == token_id end)
+
+    updated_waits = if updated == [] do
+      Map.delete(waits, name)
+    else
+      Map.put(waits, name, updated)
+    end
+
+    Map.put(acc, wait_key, updated_waits)
+  end
+
   defp detect_implicit_waits(state, token_wait_states, open_message_waits, open_signal_waits) do
     alias Chronicle.Engine.Nodes.IntermediateCatch
     alias Chronicle.Engine.Diagrams.Definition
@@ -463,7 +613,14 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
       end
 
       timer_ref = make_ref()
-      ref = Process.send_after(self(), {:timer_elapsed, token_id, timer_ref}, remaining_ms)
+      msg =
+        if timer_info[:boundary_node_id] do
+          {:boundary_timer_elapsed, token_id, timer_info.boundary_node_id, timer_ref}
+        else
+          {:timer_elapsed, token_id, timer_ref}
+        end
+
+      ref = Process.send_after(self(), msg, remaining_ms)
       %{acc | timer_refs: Map.put(acc.timer_refs, ref, token_id)}
     end)
   end
@@ -478,6 +635,24 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
     Enum.each(open_signal_waits, fn {name, token_ids} ->
       Enum.each(token_ids, fn token_id ->
         Registry.register(:waits, {state.tenant_id, :signal, name}, token_id)
+      end)
+    end)
+  end
+
+  defp reregister_boundaries_in_registry(state) do
+    Enum.each([state.message_boundaries, state.ni_message_boundaries], fn waits ->
+      Enum.each(waits || %{}, fn {name, boundaries} ->
+        Enum.each(boundaries, fn {token_id, boundary} ->
+          Registry.register(:waits, {state.tenant_id, :message, name, state.business_key}, {:boundary, token_id, boundary.id})
+        end)
+      end)
+    end)
+
+    Enum.each([state.signal_boundaries, state.ni_signal_boundaries], fn waits ->
+      Enum.each(waits || %{}, fn {name, boundaries} ->
+        Enum.each(boundaries, fn {token_id, boundary} ->
+          Registry.register(:waits, {state.tenant_id, :signal, name}, {:boundary, token_id, boundary.id})
+        end)
       end)
     end)
   end

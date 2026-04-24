@@ -4,6 +4,7 @@ defmodule Chronicle.Engine.Diagrams.Parser do
   Supports both PascalCase (.NET) and camelCase JSON formats.
   """
   alias Chronicle.Engine.Diagrams.Definition
+  alias Chronicle.Engine.Diagrams.SupportedFeatures
   alias Chronicle.Engine.Nodes
 
   def parse(json_string) when is_binary(json_string) do
@@ -20,6 +21,7 @@ defmodule Chronicle.Engine.Diagrams.Parser do
       do_parse_definition(data)
     catch
       {:duplicate_node_ids, ids} -> {:error, {:duplicate_node_ids, ids}}
+      {:unsupported_node_type, type, reason} -> {:error, {:unsupported_node_type, type, reason}}
     end
   end
 
@@ -46,6 +48,8 @@ defmodule Chronicle.Engine.Diagrams.Parser do
           |> Map.put(:inputs, inputs)
         {id, node}
       end)
+
+      nodes_with_outputs = attach_boundary_events(nodes_with_outputs)
 
       %Definition{
         name: Map.get(process, "name", "unknown"),
@@ -135,7 +139,10 @@ defmodule Chronicle.Engine.Diagrams.Parser do
   end
 
   defp parse_node(%{"type" => original_type} = data) do
+    ensure_supported_original_type!(original_type)
     type = normalize_type(original_type)
+    ensure_supported_node_type!(type)
+
     id = Map.get(data, "id")
     key = Map.get(data, "key")
     properties = Map.get(data, "properties") || extract_extension_properties(data)
@@ -167,7 +174,34 @@ defmodule Chronicle.Engine.Diagrams.Parser do
         parse_call_activity(base, data)
 
       _ ->
-        %{id: id, key: key, type: type, properties: properties}
+        throw({:unsupported_node_type, type, "Node type is not in the Chronicle BPJS executable subset."})
+    end
+  end
+
+  defp ensure_supported_original_type!("SubProcess") do
+    throw({:unsupported_node_type, "SubProcess", "Embedded subprocess scopes are not implemented; use callActivity for a separate process."})
+  end
+
+  defp ensure_supported_original_type!(type) do
+    normalized = to_camel_case(type)
+
+    if reason = SupportedFeatures.unsupported_reason(normalized) do
+      throw({:unsupported_node_type, type, reason})
+    else
+      :ok
+    end
+  end
+
+  defp ensure_supported_node_type!(type) do
+    cond do
+      SupportedFeatures.supported?(type) ->
+        :ok
+
+      reason = SupportedFeatures.unsupported_reason(type) ->
+        throw({:unsupported_node_type, type, reason})
+
+      true ->
+        throw({:unsupported_node_type, type, "Node type is not in the Chronicle BPJS executable subset."})
     end
   end
 
@@ -536,6 +570,34 @@ defmodule Chronicle.Engine.Diagrams.Parser do
     end)
     |> Enum.map(fn {id, _} -> id end)
   end
+
+  defp attach_boundary_events(nodes) do
+    boundaries =
+      nodes
+      |> Map.values()
+      |> Enum.filter(&boundary_event?/1)
+      |> Enum.group_by(&Map.get(&1, :attached_to))
+
+    Enum.into(nodes, %{}, fn {id, node} ->
+      node =
+        case Map.get(boundaries, id) do
+          nil -> node
+          attached -> if Map.has_key?(node, :boundary_events), do: %{node | boundary_events: attached}, else: node
+        end
+
+      {id, node}
+    end)
+  end
+
+  defp boundary_event?(%Nodes.BoundaryEvents.TimerBoundary{}), do: true
+  defp boundary_event?(%Nodes.BoundaryEvents.MessageBoundary{}), do: true
+  defp boundary_event?(%Nodes.BoundaryEvents.SignalBoundary{}), do: true
+  defp boundary_event?(%Nodes.BoundaryEvents.ErrorBoundary{}), do: true
+  defp boundary_event?(%Nodes.BoundaryEvents.EscalationBoundary{}), do: true
+  defp boundary_event?(%Nodes.BoundaryEvents.NonInterruptingTimerBoundary{}), do: true
+  defp boundary_event?(%Nodes.BoundaryEvents.NonInterruptingMessageBoundary{}), do: true
+  defp boundary_event?(%Nodes.BoundaryEvents.NonInterruptingSignalBoundary{}), do: true
+  defp boundary_event?(_), do: false
 
   # -- Property parsers --
 

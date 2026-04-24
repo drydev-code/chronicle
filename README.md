@@ -1,7 +1,7 @@
 # Chronicle
 
-Strict BPMN 2.0 workflow engine for Elixir/OTP. Event-sourced, actor-based,
-with DMN decision tables and embedded JavaScript scripting.
+BPJS-backed BPMN subset workflow engine for Elixir/OTP. Event-sourced,
+actor-based, with DMN decision tables and embedded JavaScript scripting.
 
 ## What's in this repo
 
@@ -17,10 +17,11 @@ supervision tree. Run `:server` when you want a batteries-included service.
 
 ## Features
 
-- **Strict BPMN 2.0 semantics** — start/end events, intermediate catch/throw,
-  gateways (exclusive, parallel, inclusive), boundary events, compensation.
-- **Token-based execution** on a per-instance `GenServer` with full event
-  sourcing (append-only log, replay on restart).
+- **BPJS BPMN subset semantics**: start/end events, intermediate catch/throw,
+  gateways (exclusive, parallel, inclusive), and supported boundary events.
+- **Token-based execution** on a per-instance `GenServer` with event-sourcing
+  semantics (append-only log, replay on restart). Commands append durable
+  events before publishing effects or mutating query-facing projections.
 - **Script tasks** — JavaScript via pooled Node.js workers (Jint-compatible
   script API).
 - **Rules tasks** — DMN 1.3 decision tables.
@@ -34,11 +35,18 @@ supervision tree. Run `:server` when you want a batteries-included service.
 
 ## Diagram formats
 
-The engine parses two BPMN representations:
+The engine executes BPJS JSON diagrams and intentionally does not parse native
+BPMN XML in this release:
 
 - `.bpjs` — JSON diagram format (accepts PascalCase and camelCase keys).
-- `.bpmn` — recognised by the deployment packager; XML parser is **not** yet
-  wired in this OSS release. PRs welcome.
+- `.bpmn`: rejected with an unsupported-format error; XML parsing is out of scope for this release.
+
+Supported BPJS node types are declared in
+`Chronicle.Engine.Diagrams.SupportedFeatures`. Unsupported BPMN features such
+as embedded/event/transaction subprocesses, event-based/complex gateways,
+conditional/link/cancel/compensation/multiple events, and standard
+multi-instance loop characteristics fail during parsing instead of silently
+falling through.
 
 Diagram files are shipped inside ZIP deployment packages alongside
 `.dmn` decision tables.
@@ -142,12 +150,14 @@ The `server` app is the canonical example — see
 ## Project status
 
 **Pre-1.0, active development.** Interfaces may change between 0.x releases.
-The core execution semantics are a direct port of a production .NET engine
-that has been running BPMN workloads since 2022.
+Chronicle targets a durable BPJS BPMN subset first, not full BPMN 2.0
+conformance.
 
 Known limitations:
 
-- No XML BPMN parser (JSON bpjs only).
+- No XML BPMN parser (JSON BPJS only).
+- Not a complete BPMN 2.0 engine. Unsupported BPMN features are rejected by
+  the supported-feature manifest.
 - JavaScript sandbox uses raw `node` subprocesses — adequate for trusted
   scripts, not sufficient for executing untrusted tenant code.
 - No visual BPMN editor bundled. Use any BPMN 2.0 editor capable of exporting

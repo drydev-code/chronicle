@@ -10,17 +10,21 @@ defmodule Chronicle.Engine.Nodes.Activity do
 
   def get_boundary_event_to_error(%{boundary_events: events}, error_data) do
     Enum.find(events, fn be ->
-      be.type == :error_boundary &&
-      match_error_boundary?(be, error_data)
+      match?(%Chronicle.Engine.Nodes.BoundaryEvents.ErrorBoundary{}, be) &&
+        match_error_boundary?(be, error_data)
     end)
   end
 
+  def get_boundary_event_to_error(_, _), do: nil
+
   def get_boundary_event_to_exception(%{boundary_events: events}, exception) do
     Enum.find(events, fn be ->
-      be.type == :error_boundary &&
-      (be.exception_type == nil || be.exception_type == exception.__struct__)
+      match?(%Chronicle.Engine.Nodes.BoundaryEvents.ErrorBoundary{}, be) &&
+        (be.exception_type == nil || be.exception_type == exception.__struct__)
     end)
   end
+
+  def get_boundary_event_to_exception(_, _), do: nil
 
   defp match_error_boundary?(boundary_event, error_data) do
     cond do

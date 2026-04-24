@@ -16,10 +16,15 @@ defmodule Chronicle.Engine.Instance.WaitRegistry do
   def handle_message(state, message_name, payload) do
     case Map.get(state.message_waits, message_name, []) do
       [] ->
-        case Map.get(state.message_boundaries, message_name, []) do
-          [] -> {:ignored, state}
-          boundaries ->
-            state = handle_interrupting_message_boundary(state, boundaries)
+        boundaries = Map.get(state.message_boundaries, message_name, [])
+        ni_boundaries = Map.get(state.ni_message_boundaries || %{}, message_name, [])
+
+        case boundaries ++ ni_boundaries do
+          [] ->
+            {:ignored, state}
+
+          all_boundaries ->
+            state = handle_message_boundary(state, message_name, all_boundaries, length(boundaries))
             {:boundary, state}
         end
 
@@ -48,6 +53,8 @@ defmodule Chronicle.Engine.Instance.WaitRegistry do
   """
   def handle_signal(state, signal_name) do
     signal_tokens = Map.get(state.signal_waits, signal_name, [])
+    boundaries = Map.get(state.signal_boundaries, signal_name, [])
+    ni_boundaries = Map.get(state.ni_signal_boundaries || %{}, signal_name, [])
 
     # Remove all per-token entries from the global :waits registry; the
     # in-memory signal_waits map is cleared below.
@@ -57,7 +64,17 @@ defmodule Chronicle.Engine.Instance.WaitRegistry do
       TokenState.resume_token(acc, token_id, {:signal, signal_name})
     end)
 
-    %{state | signal_waits: Map.delete(state.signal_waits, signal_name)}
+    state =
+      Enum.reduce(boundaries ++ ni_boundaries, state, fn {token_id, boundary_node}, acc ->
+        interrupting? = Enum.member?(boundaries, {token_id, boundary_node})
+        TokenState.trigger_boundary(acc, token_id, boundary_node.id, interrupting?)
+      end)
+
+    %{state |
+      signal_waits: Map.delete(state.signal_waits, signal_name),
+      signal_boundaries: Map.delete(state.signal_boundaries, signal_name),
+      ni_signal_boundaries: Map.delete(state.ni_signal_boundaries || %{}, signal_name)
+    }
   end
 
   @doc """
@@ -80,6 +97,7 @@ defmodule Chronicle.Engine.Instance.WaitRegistry do
     case Map.get(state.external_tasks, task_id) do
       nil -> {:error, :not_found}
       token_id ->
+        state = %{state | external_tasks: Map.delete(state.external_tasks, task_id)}
         state = TokenState.resume_token(state, token_id, {:error, error, retry?, backoff_ms})
         {:ok, state}
     end
@@ -144,7 +162,8 @@ defmodule Chronicle.Engine.Instance.WaitRegistry do
 
     token = Map.get(state.tokens, token_id)
     if token && Token.waiting?(token) do
-      state = TokenState.interrupt_token(state, token_id, boundary_node_id)
+      interrupting? = boundary_interrupting?(state, token_id, boundary_node_id)
+      state = TokenState.trigger_boundary(state, token_id, boundary_node_id, interrupting?)
       {:resumed, state}
     else
       {:ignored, state}
@@ -175,9 +194,26 @@ defmodule Chronicle.Engine.Instance.WaitRegistry do
     end)
   end
 
-  defp handle_interrupting_message_boundary(state, boundaries) do
-    Enum.reduce(boundaries, state, fn {token_id, boundary_node}, acc ->
-      TokenState.interrupt_token(acc, token_id, boundary_node.id)
-    end)
+  defp handle_message_boundary(state, message_name, all_boundaries, interrupting_count) do
+    state =
+      all_boundaries
+      |> Enum.with_index()
+      |> Enum.reduce(state, fn {{token_id, boundary_node}, index}, acc ->
+        TokenState.trigger_boundary(acc, token_id, boundary_node.id, index < interrupting_count)
+      end)
+
+    %{state |
+      message_boundaries: Map.delete(state.message_boundaries, message_name),
+      ni_message_boundaries: Map.delete(state.ni_message_boundaries || %{}, message_name)
+    }
+  end
+
+  defp boundary_interrupting?(state, token_id, boundary_node_id) do
+    infos = get_in(state.boundary_index || %{}, [token_id]) || []
+
+    case Enum.find(infos, &(&1.boundary_node_id == boundary_node_id)) do
+      nil -> true
+      info -> Map.get(info, :interrupting, true)
+    end
   end
 end

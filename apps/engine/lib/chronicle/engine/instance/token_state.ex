@@ -32,6 +32,7 @@ defmodule Chronicle.Engine.Instance.TokenState do
       signal_boundaries: %{},
       ni_message_boundaries: %{},
       ni_signal_boundaries: %{},
+      boundary_index: %{},
       call_wait_list: %{},
       external_tasks: %{},
       script_waits: %{},
@@ -43,6 +44,7 @@ defmodule Chronicle.Engine.Instance.TokenState do
       pin_reason: :active_token,
       next_token_id: 0,
       timer_refs: %{},
+      pending_effects: [],
       persistent_events: [],
       last_persisted_index: 0,
       start_parameters: %{},
@@ -156,10 +158,39 @@ defmodule Chronicle.Engine.Instance.TokenState do
   end
 
   @doc """
+  Triggers a boundary event.
+
+  Interrupting boundaries redirect the waiting token to the boundary node.
+  Non-interrupting boundaries leave the original token untouched and create a
+  sibling token that starts at the boundary node.
+  """
+  def trigger_boundary(state, token_id, boundary_node_id, interrupting?) do
+    case {Map.get(state.tokens, token_id), interrupting?} do
+      {nil, _} ->
+        state
+
+      {_token, true} ->
+        interrupt_token(state, token_id, boundary_node_id)
+
+      {token, false} ->
+        new_token_id = state.next_token_id
+        new_token = Token.new(new_token_id, token.family, boundary_node_id, token.parameters)
+
+        %{state |
+          tokens: Map.put(state.tokens, new_token_id, new_token),
+          active_tokens: MapSet.put(state.active_tokens, new_token_id),
+          next_token_id: new_token_id + 1,
+          pin_state: :pinned,
+          pin_reason: :active_token
+        }
+    end
+  end
+
+  @doc """
   Terminates all active and waiting tokens, cancels timers, and marks
   the instance as terminated.
   """
-  def terminate_all_tokens(state, reason) do
+  def terminate_all_tokens(state, _reason) do
     state = Enum.reduce(state.tokens, state, fn {token_id, token}, acc ->
       if Token.active?(token) or Token.waiting?(token) do
         token = Token.terminate(token)

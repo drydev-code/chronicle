@@ -58,6 +58,35 @@ defmodule Chronicle.Engine.PersistentData do
     defstruct [:token, :family, :current_node, :target_node, :retry_counter, :timer_id]
   end
 
+  defmodule MessageWaitCreated do
+    defstruct [:token, :family, :current_node, :name, :business_key]
+  end
+
+  defmodule SignalWaitCreated do
+    defstruct [:token, :family, :current_node, :signal_name]
+  end
+
+  defmodule BoundaryEventCreated do
+    defstruct [
+      :token, :family, :current_node, :boundary_node_id, :boundary_type,
+      :interrupting, :name, :timer_id, :trigger_at
+    ]
+  end
+
+  defmodule BoundaryEventTriggered do
+    defstruct [
+      :token, :family, :current_node, :boundary_node_id, :boundary_type,
+      :interrupting, :name, :timer_id, :triggered_at
+    ]
+  end
+
+  defmodule BoundaryEventCancelled do
+    defstruct [
+      :token, :family, :current_node, :boundary_node_id, :boundary_type,
+      :name, :timer_id
+    ]
+  end
+
   defmodule MessageThrown do
     defstruct [:token, :family, :current_node, :name]
   end

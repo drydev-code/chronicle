@@ -2,23 +2,20 @@ defmodule Chronicle.Persistence.Repo.Migrations.CreateProcessInstanceTables do
   use Ecto.Migration
 
   def up do
-    # Drop existing .NET tables that have incompatible column names (PascalCase)
-    execute "DROP TABLE IF EXISTS `ActiveProcessInstances`"
-    execute "DROP TABLE IF EXISTS `CompletedProcessInstances`"
-    execute "DROP TABLE IF EXISTS `TerminatedProcessInstances`"
-
-    # Recreate with Ecto-compatible snake_case columns
-    create table(:ActiveProcessInstances, primary_key: false) do
+    # Additive/idempotent creation only. Event logs are the source of truth for
+    # active and historical process instances, so migrations must never drop
+    # these tables implicitly.
+    create_if_not_exists table(:ActiveProcessInstances, primary_key: false) do
       add :process_instance_id, :binary_id, primary_key: true
       add :data, :text, null: false
     end
 
-    create table(:CompletedProcessInstances, primary_key: false) do
+    create_if_not_exists table(:CompletedProcessInstances, primary_key: false) do
       add :process_instance_id, :binary_id, primary_key: true
       add :data, :text, null: false
     end
 
-    create table(:TerminatedProcessInstances, primary_key: false) do
+    create_if_not_exists table(:TerminatedProcessInstances, primary_key: false) do
       add :process_instance_id, :binary_id, primary_key: true
       add :data, :text, null: false
     end

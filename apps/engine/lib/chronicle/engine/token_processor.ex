@@ -180,6 +180,12 @@ defmodule Chronicle.Engine.TokenProcessor do
   defp handle_fork(state, token, paths) do
     # Mark original token as joined
     token = Token.join(token)
+    state = append_event(state, %PersistentData.TokenFamilyRemoved{
+      token: token.id,
+      family: token.family,
+      current_node: token.current_node
+    })
+
     state = %{state |
       tokens: Map.put(state.tokens, token.id, token),
       active_tokens: MapSet.delete(state.active_tokens, token.id)
@@ -188,6 +194,12 @@ defmodule Chronicle.Engine.TokenProcessor do
     # Create new tokens for each path
     Enum.reduce(paths, state, fn path_node_id, acc ->
       {new_token, acc} = create_token(acc, token.family, path_node_id, token.parameters)
+      acc = append_event(acc, %PersistentData.TokenFamilyCreated{
+        token: new_token.id,
+        family: new_token.family,
+        current_node: new_token.current_node,
+        start_params: new_token.parameters
+      })
       %{acc | active_tokens: MapSet.put(acc.active_tokens, new_token.id)}
     end)
   end
@@ -218,7 +230,15 @@ defmodule Chronicle.Engine.TokenProcessor do
     # Register in Registry for cross-instance routing
     Registry.register(:waits, {state.tenant_id, :message, name, state.business_key}, token.id)
 
-    state = %{state | message_waits: waits}
+    event = %PersistentData.MessageWaitCreated{
+      token: token.id,
+      family: token.family,
+      current_node: token.current_node,
+      name: name,
+      business_key: state.business_key
+    }
+
+    state = state |> append_event(event) |> Map.put(:message_waits, waits)
     move_to_waiting(state, token)
   end
 
@@ -228,7 +248,14 @@ defmodule Chronicle.Engine.TokenProcessor do
 
     Registry.register(:waits, {state.tenant_id, :signal, name}, token.id)
 
-    state = %{state | signal_waits: waits}
+    event = %PersistentData.SignalWaitCreated{
+      token: token.id,
+      family: token.family,
+      current_node: token.current_node,
+      signal_name: name
+    }
+
+    state = state |> append_event(event) |> Map.put(:signal_waits, waits)
     move_to_waiting(state, token)
   end
 
@@ -256,12 +283,11 @@ defmodule Chronicle.Engine.TokenProcessor do
     }
     state = append_event(state, event)
 
-    # Broadcast external task event for host handler
     node = Definition.get_node(state.definition, token.current_node)
     node_properties = if node, do: Map.get(node, :properties, %{}), else: %{}
-    Phoenix.PubSub.broadcast(Chronicle.PubSub, "engine:events",
+    state = enqueue_effect(state, {:pubsub, "engine:events",
       {:external_task_created, state.id, state.business_key, state.tenant_id,
-       task_id, kind, token.parameters, node && Map.get(node, :key), node_properties})
+       task_id, kind, token.parameters, node && Map.get(node, :key), node_properties}})
 
     move_to_waiting(state, token)
   end
@@ -370,9 +396,8 @@ defmodule Chronicle.Engine.TokenProcessor do
     }
     state = append_event(state, event)
 
-    # Broadcast message to other instances
-    Phoenix.PubSub.broadcast(Chronicle.PubSub, "engine:messages",
-      {:message, state.tenant_id, name, state.business_key, payload})
+    state = enqueue_effect(state, {:pubsub, "engine:messages",
+      {:message, state.tenant_id, name, state.business_key, payload}})
 
     # Advance token
     token = Token.move_to(token, next_node)
@@ -385,8 +410,7 @@ defmodule Chronicle.Engine.TokenProcessor do
     }
     state = append_event(state, event)
 
-    Phoenix.PubSub.broadcast(Chronicle.PubSub, "engine:signals",
-      {:signal, state.tenant_id, name})
+    state = enqueue_effect(state, {:pubsub, "engine:signals", {:signal, state.tenant_id, name}})
 
     token = Token.move_to(token, next_node)
     %{state | tokens: Map.put(state.tokens, token.id, token)}
@@ -440,6 +464,8 @@ defmodule Chronicle.Engine.TokenProcessor do
   # --- Helpers ---
 
   defp move_to_waiting(state, token) do
+    state = register_boundary_events(state, token)
+
     %{state |
       tokens: Map.put(state.tokens, token.id, token),
       active_tokens: MapSet.delete(state.active_tokens, token.id),
@@ -504,8 +530,97 @@ defmodule Chronicle.Engine.TokenProcessor do
     {token, state}
   end
 
+  defp register_boundary_events(state, token) do
+    if Map.has_key?(state.boundary_index || %{}, token.id) do
+      state
+    else
+      node = Definition.get_node(state.definition, token.current_node)
+      boundaries = Map.get(node || %{}, :boundary_events, []) || []
+
+      Enum.reduce(boundaries, %{state | boundary_index: Map.put(state.boundary_index || %{}, token.id, [])}, fn boundary, acc ->
+        {acc, info} = register_boundary_event(acc, token, boundary)
+        update_in(acc.boundary_index[token.id], &[info | (&1 || [])])
+      end)
+    end
+  end
+
+  defp register_boundary_event(state, token, boundary) do
+    interrupting? = Chronicle.Engine.Nodes.BoundaryEvents.interrupting?(boundary)
+    type = boundary_type(boundary)
+
+    {state, info} =
+      case type do
+        :timer ->
+          delay_ms = Chronicle.Engine.Nodes.BoundaryEvents.compute_timer_delay(boundary, token.parameters)
+          timer_id = "boundary:#{token.id}:#{boundary.id}:#{System.unique_integer([:positive])}"
+          trigger_at = System.system_time(:millisecond) + delay_ms
+          timer_ref = make_ref()
+          ref = Process.send_after(self(), {:boundary_timer_elapsed, token.id, boundary.id, timer_ref}, delay_ms)
+
+          state = %{state | timer_refs: Map.put(state.timer_refs, ref, token.id)}
+          {state, %{type: type, boundary_node_id: boundary.id, timer_id: timer_id, timer_ref: ref, name: nil, interrupting: interrupting?, trigger_at: trigger_at}}
+
+        :message ->
+          name = resolve_message_name(Map.get(boundary, :message), token.parameters)
+          Registry.register(:waits, {state.tenant_id, :message, name, state.business_key}, {:boundary, token.id, boundary.id})
+          target = if interrupting?, do: :message_boundaries, else: :ni_message_boundaries
+          state = Map.update!(state, target, fn waits ->
+            Map.update(waits, name, [{token.id, boundary}], &[{token.id, boundary} | &1])
+          end)
+          {state, %{type: type, boundary_node_id: boundary.id, timer_id: nil, timer_ref: nil, name: name, interrupting: interrupting?, trigger_at: nil}}
+
+        :signal ->
+          name = Map.get(boundary, :signal)
+          Registry.register(:waits, {state.tenant_id, :signal, name}, {:boundary, token.id, boundary.id})
+          target = if interrupting?, do: :signal_boundaries, else: :ni_signal_boundaries
+          state = Map.update!(state, target, fn waits ->
+            Map.update(waits, name, [{token.id, boundary}], &[{token.id, boundary} | &1])
+          end)
+          {state, %{type: type, boundary_node_id: boundary.id, timer_id: nil, timer_ref: nil, name: name, interrupting: interrupting?, trigger_at: nil}}
+
+        _ ->
+          {state, %{type: type, boundary_node_id: boundary.id, timer_id: nil, timer_ref: nil, name: nil, interrupting: interrupting?, trigger_at: nil}}
+      end
+
+    event = %PersistentData.BoundaryEventCreated{
+      token: token.id,
+      family: token.family,
+      current_node: token.current_node,
+      boundary_node_id: boundary.id,
+      boundary_type: type,
+      interrupting: interrupting?,
+      name: info.name,
+      timer_id: info.timer_id,
+      trigger_at: info.trigger_at
+    }
+
+    {append_event(state, event), info}
+  end
+
+  defp boundary_type(%Chronicle.Engine.Nodes.BoundaryEvents.TimerBoundary{}), do: :timer
+  defp boundary_type(%Chronicle.Engine.Nodes.BoundaryEvents.NonInterruptingTimerBoundary{}), do: :timer
+  defp boundary_type(%Chronicle.Engine.Nodes.BoundaryEvents.MessageBoundary{}), do: :message
+  defp boundary_type(%Chronicle.Engine.Nodes.BoundaryEvents.NonInterruptingMessageBoundary{}), do: :message
+  defp boundary_type(%Chronicle.Engine.Nodes.BoundaryEvents.SignalBoundary{}), do: :signal
+  defp boundary_type(%Chronicle.Engine.Nodes.BoundaryEvents.NonInterruptingSignalBoundary{}), do: :signal
+  defp boundary_type(%Chronicle.Engine.Nodes.BoundaryEvents.ErrorBoundary{}), do: :error
+  defp boundary_type(%Chronicle.Engine.Nodes.BoundaryEvents.EscalationBoundary{}), do: :escalation
+  defp boundary_type(_), do: :unknown
+
+  defp resolve_message_name(%{static_text: text, variable_content: var}, params) when not is_nil(var) do
+    variable_value = Map.get(params, var, "")
+    "#{text}##{variable_value}"
+  end
+  defp resolve_message_name(%{name: name}, _params), do: name
+  defp resolve_message_name(name, _params) when is_binary(name), do: name
+  defp resolve_message_name(_, _params), do: nil
+
   defp append_event(state, event) do
     %{state | persistent_events: state.persistent_events ++ [event]}
+  end
+
+  defp enqueue_effect(state, effect) do
+    %{state | pending_effects: (state.pending_effects || []) ++ [effect]}
   end
 
   defp start_child_instance(state, _token, call_params, child_id) do
