@@ -86,12 +86,14 @@ defmodule Chronicle.Engine.TokenProcessor do
   defp node_module(%Nodes.StartEvents.MessageStartEvent{}), do: Nodes.StartEvents.MessageStartEvent
   defp node_module(%Nodes.StartEvents.SignalStartEvent{}), do: Nodes.StartEvents.SignalStartEvent
   defp node_module(%Nodes.StartEvents.TimerStartEvent{}), do: Nodes.StartEvents.TimerStartEvent
+  defp node_module(%Nodes.StartEvents.ConditionalStartEvent{}), do: Nodes.StartEvents.ConditionalStartEvent
   defp node_module(%Nodes.EndEvents.BlankEndEvent{}), do: Nodes.EndEvents.BlankEndEvent
   defp node_module(%Nodes.EndEvents.ErrorEndEvent{}), do: Nodes.EndEvents.ErrorEndEvent
   defp node_module(%Nodes.EndEvents.MessageEndEvent{}), do: Nodes.EndEvents.MessageEndEvent
   defp node_module(%Nodes.EndEvents.SignalEndEvent{}), do: Nodes.EndEvents.SignalEndEvent
   defp node_module(%Nodes.EndEvents.EscalationEndEvent{}), do: Nodes.EndEvents.EscalationEndEvent
   defp node_module(%Nodes.EndEvents.TerminationEndEvent{}), do: Nodes.EndEvents.TerminationEndEvent
+  defp node_module(%Nodes.EndEvents.CompensationEndEvent{}), do: Nodes.EndEvents.CompensationEndEvent
   defp node_module(%Nodes.IntermediateCatch.TimerEvent{}), do: Nodes.IntermediateCatch.TimerEvent
   defp node_module(%Nodes.IntermediateCatch.MessageEvent{}), do: Nodes.IntermediateCatch.MessageEvent
   defp node_module(%Nodes.IntermediateCatch.SignalEvent{}), do: Nodes.IntermediateCatch.SignalEvent
@@ -102,6 +104,7 @@ defmodule Chronicle.Engine.TokenProcessor do
   defp node_module(%Nodes.IntermediateThrow.ErrorEvent{}), do: Nodes.IntermediateThrow.ErrorEvent
   defp node_module(%Nodes.IntermediateThrow.EscalationEvent{}), do: Nodes.IntermediateThrow.EscalationEvent
   defp node_module(%Nodes.IntermediateThrow.LinkEvent{}), do: Nodes.IntermediateThrow.LinkEvent
+  defp node_module(%Nodes.IntermediateThrow.CompensationEvent{}), do: Nodes.IntermediateThrow.CompensationEvent
   defp node_module(_), do: nil
 
   # --- Handle NodeResult ---
@@ -109,13 +112,11 @@ defmodule Chronicle.Engine.TokenProcessor do
   defp handle_node_result(state, token, result) do
     case result do
       {:next, next_node_id} ->
-        token = Token.move_to(token, next_node_id)
-        %{state | tokens: Map.put(state.tokens, token.id, token)}
+        apply_loop_or_move(state, token, token.parameters, next_node_id)
 
       {:next_with_params, next_node_id, new_params} ->
         token = %{token | parameters: new_params}
-        token = Token.move_to(token, next_node_id)
-        %{state | tokens: Map.put(state.tokens, token.id, token)}
+        apply_loop_or_move(state, token, new_params, next_node_id)
 
       {:fork, paths, _params} ->
         handle_fork(state, token, paths)
@@ -158,6 +159,9 @@ defmodule Chronicle.Engine.TokenProcessor do
 
       {:throw_signal, name, next_node} ->
         handle_throw_signal(state, token, name, next_node)
+
+      {:throw_compensation, next_node, complete?} ->
+        handle_throw_compensation(state, token, next_node, complete?)
 
       {:traverse_link, link_name, target_node} ->
         handle_traverse_link(state, token, link_name, target_node)
@@ -224,6 +228,190 @@ defmodule Chronicle.Engine.TokenProcessor do
       })
       %{acc | active_tokens: MapSet.put(acc.active_tokens, new_token.id)}
     end)
+  end
+
+  defp apply_loop_or_move(state, token, params, next_node_id) do
+    node = Definition.get_node(state.definition, token.current_node)
+    state = record_compensatable_completion(state, token, node)
+
+    case loop_characteristics(node) do
+      nil ->
+        token = Token.move_to(token, next_node_id)
+        %{state | tokens: Map.put(state.tokens, token.id, token)}
+
+      loop ->
+        iteration = loop_iteration(token, node.id) + 1
+        continue? = loop_continue?(loop, params, iteration, node.id)
+        target_node = if continue?, do: node.id, else: next_node_id
+
+        event = %PersistentData.LoopConditionEvaluated{
+          token: token.id,
+          family: token.family,
+          current_node: token.current_node,
+          condition: Map.get(loop, "condition"),
+          iteration: iteration,
+          continue: continue?,
+          max_iterations: Map.get(loop, "maxIterations"),
+          target_node: target_node,
+          evaluated_at: System.system_time(:millisecond)
+        }
+
+        token =
+          token
+          |> put_loop_iteration(node.id, iteration)
+          |> Token.move_to(target_node)
+
+        state
+        |> append_event(event)
+        |> Map.update!(:tokens, &Map.put(&1, token.id, token))
+    end
+  end
+
+  defp loop_characteristics(%{properties: %{"loopCharacteristics" => loop}}) when is_map(loop) do
+    if activity_node_with_loop?(loop), do: loop
+  end
+
+  defp loop_characteristics(_), do: nil
+
+  defp activity_node_with_loop?(%{"testBefore" => true}), do: false
+  defp activity_node_with_loop?(_), do: true
+
+  defp loop_iteration(token, node_id) do
+    token.context
+    |> Map.get(:loop_iterations, %{})
+    |> Map.get(node_id, 0)
+  end
+
+  defp put_loop_iteration(token, node_id, iteration) do
+    iterations = Map.put(Map.get(token.context, :loop_iterations, %{}), node_id, iteration)
+    Token.set_context(token, :loop_iterations, iterations)
+  end
+
+  defp loop_continue?(loop, params, iteration, node_id) do
+    max_iterations = Map.get(loop, "maxIterations")
+
+    cond do
+      is_integer(max_iterations) and iteration >= max_iterations ->
+        false
+
+      condition = Map.get(loop, "condition") ->
+        params =
+          params
+          |> Map.put("loopIteration", iteration)
+          |> Map.put(:loop_iteration, iteration)
+
+        case Chronicle.Engine.Scripting.ScriptPool.evaluate_expressions([{node_id, condition}], params) do
+          {:ok, results} -> expression_true?(results, node_id)
+          _ -> false
+        end
+
+      true ->
+        false
+    end
+  end
+
+  defp expression_true?(results, node_id) when is_list(results) do
+    Enum.any?(results, fn
+      %{"node_id" => ^node_id, "result" => true} -> true
+      %{node_id: ^node_id, result: true} -> true
+      {^node_id, true} -> true
+      true -> true
+      _ -> false
+    end)
+  end
+
+  defp expression_true?(true, _node_id), do: true
+  defp expression_true?(_, _node_id), do: false
+
+  defp record_compensatable_completion(state, token, node) do
+    compensation_boundaries =
+      (Map.get(node || %{}, :boundary_events) || [])
+      |> Enum.filter(&match?(%Chronicle.Engine.Nodes.BoundaryEvents.CompensationBoundary{}, &1))
+
+    Enum.reduce(compensation_boundaries, state, fn boundary, acc ->
+      handler_node_id = Chronicle.Engine.Nodes.BoundaryEvents.output_path(boundary)
+      activity_key = "#{token.id}:#{node.id}:#{loop_iteration(token, node.id)}"
+
+      events = [
+        %PersistentData.CompensationHandlerRegistered{
+          token: token.id,
+          family: token.family,
+          current_node: token.current_node,
+          boundary_node_id: boundary.id,
+          handler_node_id: handler_node_id
+        },
+        %PersistentData.CompensatableActivityCompleted{
+          token: token.id,
+          family: token.family,
+          current_node: token.current_node,
+          activity_node_id: node.id,
+          handler_node_id: handler_node_id,
+          activity_instance_key: activity_key
+        }
+      ]
+
+      activity = %{
+        token: token.id,
+        family: token.family,
+        activity_node_id: node.id,
+        handler_node_id: handler_node_id,
+        activity_instance_key: activity_key
+      }
+
+      acc
+      |> append_events(events)
+      |> Map.update!(:compensatable_activities, &Map.put(&1, activity_key, activity))
+    end)
+  end
+
+  defp handle_throw_compensation(state, token, next_node, complete?) do
+    eligible =
+      state.compensatable_activities
+      |> Map.values()
+      |> Enum.reject(&MapSet.member?(state.compensation_started || MapSet.new(), &1.activity_instance_key))
+      |> Enum.sort_by(& &1.activity_instance_key)
+
+    request_event = %PersistentData.CompensationRequested{
+      token: token.id,
+      family: token.family,
+      current_node: token.current_node,
+      eligible_activity_keys: Enum.map(eligible, & &1.activity_instance_key),
+      requested_at: System.system_time(:millisecond)
+    }
+
+    {state, _started} =
+      Enum.reduce(eligible, {append_event(state, request_event), MapSet.new()}, fn activity, {acc, started} ->
+        {handler_token, acc} = create_token(acc, token.family, activity.handler_node_id, token.parameters)
+        handler_token =
+          handler_token
+          |> Token.set_context(:compensation_activity_key, activity.activity_instance_key)
+          |> Token.set_context(:compensation_handler_node_id, activity.handler_node_id)
+
+        acc = %{acc | tokens: Map.put(acc.tokens, handler_token.id, handler_token)}
+
+        event = %PersistentData.CompensationHandlerStarted{
+          token: token.id,
+          family: token.family,
+          current_node: token.current_node,
+          activity_instance_key: activity.activity_instance_key,
+          handler_node_id: activity.handler_node_id,
+          handler_token: handler_token.id
+        }
+
+        acc =
+          acc
+          |> append_event(event)
+          |> Map.update!(:active_tokens, &MapSet.put(&1, handler_token.id))
+          |> Map.update!(:compensation_started, &MapSet.put(&1, activity.activity_instance_key))
+
+        {acc, MapSet.put(started, activity.activity_instance_key)}
+      end)
+
+    if complete? do
+      handle_complete(state, token, %Chronicle.Engine.CompletionData.Blank{})
+    else
+      apply_loop_or_move(state, token, token.parameters, next_node)
+    end
   end
 
   defp handle_wait_for_timer(state, token, timer_id, delay_ms) do
@@ -363,15 +551,18 @@ defmodule Chronicle.Engine.TokenProcessor do
 
     state = %{state | external_tasks: Map.put(state.external_tasks, task_id, token.id)}
 
+    node = Definition.get_node(state.definition, token.current_node)
+    node_properties = if node, do: Map.get(node, :properties, %{}), else: %{}
+    actor_type = Map.get(node_properties, "actorType") || Map.get(node_properties, :actorType)
+
     # Persist external task creation
     event = %PersistentData.ExternalTaskCreation{
       token: token.id, family: token.family, current_node: token.current_node,
-      external_task: task_id, retry_counter: token.context.retries
+      external_task: task_id, retry_counter: token.context.retries,
+      actor_type: actor_type
     }
     state = append_event(state, event)
 
-    node = Definition.get_node(state.definition, token.current_node)
-    node_properties = if node, do: Map.get(node, :properties, %{}), else: %{}
     state = enqueue_effect(state, {:pubsub, "engine:events",
       {:external_task_created, state.id, state.business_key, state.tenant_id,
        task_id, kind, token.parameters, node && Map.get(node, :key), node_properties}})
@@ -464,6 +655,21 @@ defmodule Chronicle.Engine.TokenProcessor do
   end
 
   defp handle_complete(state, token, completion_data) do
+    state =
+      case token.context[:compensation_activity_key] do
+        nil ->
+          state
+
+        activity_key ->
+          append_event(state, %PersistentData.CompensationHandlerCompleted{
+            token: token.id,
+            family: token.family,
+            current_node: token.current_node,
+            activity_instance_key: activity_key,
+            handler_node_id: token.context[:compensation_handler_node_id]
+          })
+      end
+
     token = token
       |> Token.complete()
       |> Token.set_context(:completion_data, completion_data)
@@ -495,9 +701,7 @@ defmodule Chronicle.Engine.TokenProcessor do
     state = enqueue_effect(state, {:pubsub, "engine:messages",
       {:message, state.tenant_id, name, state.business_key, payload}})
 
-    # Advance token
-    token = Token.move_to(token, next_node)
-    %{state | tokens: Map.put(state.tokens, token.id, token)}
+    apply_loop_or_move(state, token, token.parameters, next_node)
   end
 
   defp handle_throw_signal(state, token, name, next_node) do
@@ -508,8 +712,7 @@ defmodule Chronicle.Engine.TokenProcessor do
 
     state = enqueue_effect(state, {:pubsub, "engine:signals", {:signal, state.tenant_id, name}})
 
-    token = Token.move_to(token, next_node)
-    %{state | tokens: Map.put(state.tokens, token.id, token)}
+    apply_loop_or_move(state, token, token.parameters, next_node)
   end
 
   defp handle_traverse_link(state, token, link_name, target_node) do
@@ -538,8 +741,7 @@ defmodule Chronicle.Engine.TokenProcessor do
     }
 
     state = append_event(state, event)
-    token = Token.move_to(token, next_node)
-    %{state | tokens: Map.put(state.tokens, token.id, token)}
+    apply_loop_or_move(state, token, token.parameters, next_node)
   end
 
   defp handle_conditional_event_evaluated(state, token, condition, false, _next_node) do
@@ -619,8 +821,7 @@ defmodule Chronicle.Engine.TokenProcessor do
     }
 
     state = append_event(state, event)
-    token = Token.move_to(token, next_node)
-    %{state | tokens: Map.put(state.tokens, token.id, token)}
+    apply_loop_or_move(state, token, token.parameters, next_node)
   end
 
   defp handle_call_activity(state, token, call_params) do
@@ -816,7 +1017,9 @@ defmodule Chronicle.Engine.TokenProcessor do
       state
     else
       node = Definition.get_node(state.definition, token.current_node)
-      boundaries = Map.get(node || %{}, :boundary_events, []) || []
+      boundaries =
+        (Map.get(node || %{}, :boundary_events, []) || [])
+        |> Enum.reject(&match?(%Chronicle.Engine.Nodes.BoundaryEvents.CompensationBoundary{}, &1))
 
       Enum.reduce(boundaries, %{state | boundary_index: Map.put(state.boundary_index || %{}, token.id, [])}, fn boundary, acc ->
         {acc, info} = register_boundary_event(acc, token, boundary)
@@ -861,6 +1064,10 @@ defmodule Chronicle.Engine.TokenProcessor do
           end)
           {state, %{type: type, boundary_node_id: boundary.id, timer_id: nil, timer_ref: nil, name: name, interrupting: interrupting?, trigger_at: nil}}
 
+        :conditional ->
+          condition = Map.get(boundary, :condition)
+          {state, %{type: type, boundary_node_id: boundary.id, timer_id: nil, timer_ref: nil, name: nil, condition: condition, interrupting: interrupting?, trigger_at: nil}}
+
         _ ->
           {state, %{type: type, boundary_node_id: boundary.id, timer_id: nil, timer_ref: nil, name: nil, interrupting: interrupting?, trigger_at: nil}}
       end
@@ -873,6 +1080,7 @@ defmodule Chronicle.Engine.TokenProcessor do
       boundary_type: type,
       interrupting: interrupting?,
       name: info.name,
+      condition: Map.get(info, :condition),
       timer_id: info.timer_id,
       trigger_at: info.trigger_at
     }
@@ -886,6 +1094,9 @@ defmodule Chronicle.Engine.TokenProcessor do
   defp boundary_type(%Chronicle.Engine.Nodes.BoundaryEvents.NonInterruptingMessageBoundary{}), do: :message
   defp boundary_type(%Chronicle.Engine.Nodes.BoundaryEvents.SignalBoundary{}), do: :signal
   defp boundary_type(%Chronicle.Engine.Nodes.BoundaryEvents.NonInterruptingSignalBoundary{}), do: :signal
+  defp boundary_type(%Chronicle.Engine.Nodes.BoundaryEvents.ConditionalBoundary{}), do: :conditional
+  defp boundary_type(%Chronicle.Engine.Nodes.BoundaryEvents.NonInterruptingConditionalBoundary{}), do: :conditional
+  defp boundary_type(%Chronicle.Engine.Nodes.BoundaryEvents.CompensationBoundary{}), do: :compensation
   defp boundary_type(%Chronicle.Engine.Nodes.BoundaryEvents.ErrorBoundary{}), do: :error
   defp boundary_type(%Chronicle.Engine.Nodes.BoundaryEvents.EscalationBoundary{}), do: :escalation
   defp boundary_type(_), do: :unknown
@@ -966,6 +1177,10 @@ defmodule Chronicle.Engine.TokenProcessor do
 
   defp append_event(state, event) do
     %{state | persistent_events: state.persistent_events ++ [event]}
+  end
+
+  defp append_events(state, events) do
+    %{state | persistent_events: state.persistent_events ++ events}
   end
 
   defp enqueue_effect(state, effect) do

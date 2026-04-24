@@ -125,4 +125,19 @@ defmodule Chronicle.Engine.Nodes.EndEvents do
       })
     end
   end
+
+  defmodule CompensationEndEvent do
+    use Chronicle.Engine.Nodes.Node
+    defstruct [:id, :key, :inputs, :outputs, :properties]
+
+    @impl true
+    def max_outputs(), do: 0
+    @impl true
+    def min_outputs(), do: 0
+
+    @impl true
+    def process(_context) do
+      NodeResult.throw_compensation(nil, true)
+    end
+  end
 end

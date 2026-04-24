@@ -29,13 +29,16 @@ defmodule Chronicle.Engine.Diagrams.Parser do
 
   defp do_parse_definition(data) do
     data = normalize_keys(data)
+    reject_collaboration_shapes!(data)
     processes = Map.get(data, "processes", [data])
 
     definitions = Enum.map(processes, fn process ->
+      reject_collaboration_shapes!(process)
       nodes_data = Map.get(process, "nodes", [])
       validate_unique_node_ids!(nodes_data)
 
-      nodes = parse_nodes(nodes_data)
+      {lanes, node_lanes} = parse_lanes(Map.get(process, "lanes", []))
+      nodes = parse_nodes(nodes_data, lanes, node_lanes)
       connections = parse_connections(Map.get(process, "connections", []))
       reverse_connections = build_reverse_connections(connections)
       start_events = find_start_events(nodes)
@@ -61,6 +64,8 @@ defmodule Chronicle.Engine.Diagrams.Parser do
         nodes: nodes_with_outputs,
         connections: connections,
         reverse_connections: reverse_connections,
+        lanes: lanes,
+        node_lanes: node_lanes,
         start_events: start_events,
         merging_gateways: merging,
         recursive_connections: parse_recursive_connections(Map.get(process, "recursiveConnections", []))
@@ -133,13 +138,67 @@ defmodule Chronicle.Engine.Diagrams.Parser do
 
   # -- Node parsing --
 
-  defp parse_nodes(nodes_data) do
+  defp parse_nodes(nodes_data, lanes, node_lanes) do
     Enum.into(nodes_data, %{}, fn node_data ->
       id = Map.get(node_data, "id")
       node = parse_node(node_data)
+      node = apply_lane_actor_type(node, Map.get(lanes, Map.get(node_lanes, id)))
       {id, node}
     end)
   end
+
+  defp parse_lanes(lanes) when is_list(lanes) do
+    Enum.reduce(lanes, {%{}, %{}}, fn lane_data, {lanes_acc, node_lanes_acc} ->
+      lane_id = Map.get(lane_data, "id") || Map.get(lane_data, "key") || Map.get(lane_data, "name")
+      properties = Map.get(lane_data, "properties") || extract_extension_properties(lane_data)
+      actor_type = Map.get(lane_data, "actorType") || Map.get(properties || %{}, "actorType")
+
+      lane = %{
+        id: lane_id,
+        key: Map.get(lane_data, "key"),
+        name: Map.get(lane_data, "name"),
+        actor_type: actor_type,
+        properties: properties || %{}
+      }
+
+      node_ids =
+        ["nodes", "nodeIds", "flowNodeRefs", "flowNodes"]
+        |> Enum.flat_map(fn key -> List.wrap(Map.get(lane_data, key, [])) end)
+        |> Enum.map(&normalize_lane_node_ref/1)
+        |> Enum.reject(&is_nil/1)
+
+      lanes_acc = if lane_id, do: Map.put(lanes_acc, lane_id, lane), else: lanes_acc
+
+      node_lanes_acc =
+        Enum.reduce(node_ids, node_lanes_acc, fn node_id, acc ->
+          if lane_id, do: Map.put(acc, node_id, lane_id), else: acc
+        end)
+
+      {lanes_acc, node_lanes_acc}
+    end)
+  end
+
+  defp parse_lanes(_), do: {%{}, %{}}
+
+  defp normalize_lane_node_ref(%{"id" => id}), do: id
+  defp normalize_lane_node_ref(%{"nodeId" => id}), do: id
+  defp normalize_lane_node_ref(%{"flowNodeRef" => id}), do: id
+  defp normalize_lane_node_ref(id) when is_integer(id) or is_binary(id), do: id
+  defp normalize_lane_node_ref(_), do: nil
+
+  defp apply_lane_actor_type(node, %{actor_type: actor_type} = lane)
+       when actor_type not in [nil, ""] and is_map_key(node, :properties) do
+    properties = Map.get(node, :properties) || %{}
+
+    properties =
+      properties
+      |> Map.put_new("actorType", actor_type)
+      |> Map.put("lane", Map.take(lane, [:id, :key, :name, :actor_type]))
+
+    %{node | properties: properties}
+  end
+
+  defp apply_lane_actor_type(node, _lane), do: node
 
   defp parse_node(%{"type" => original_type} = data) do
     ensure_supported_original_type!(original_type)
@@ -149,13 +208,14 @@ defmodule Chronicle.Engine.Diagrams.Parser do
     id = Map.get(data, "id")
     key = Map.get(data, "key")
     properties = Map.get(data, "properties") || extract_extension_properties(data)
+    properties = maybe_put_loop_characteristics(properties, data)
     base = %{id: id, key: key, properties: properties}
 
     case type do
-      t when t in ~w(blankStartEvent messageStartEvent signalStartEvent timerStartEvent) ->
+      t when t in ~w(blankStartEvent messageStartEvent signalStartEvent timerStartEvent conditionalStartEvent) ->
         parse_start_event(t, base, data, original_type)
 
-      t when t in ~w(blankEndEvent errorEndEvent messageEndEvent signalEndEvent escalationEndEvent terminationEndEvent) ->
+      t when t in ~w(blankEndEvent errorEndEvent messageEndEvent signalEndEvent escalationEndEvent terminationEndEvent compensationEndEvent) ->
         parse_end_event(t, base, data)
 
       t when t in ~w(scriptTask externalTask userTask rulesTask manualTask sendTask receiveTask) ->
@@ -167,10 +227,10 @@ defmodule Chronicle.Engine.Diagrams.Parser do
       t when t in ~w(intermediateTimerEvent intermediateCatchTimerEvent intermediateCatchMessageEvent intermediateCatchSignalEvent intermediateCatchConditionalEvent intermediateCatchLinkEvent) ->
         parse_intermediate_catch(t, base, data)
 
-      t when t in ~w(intermediateThrowMessageEvent intermediateThrowSignalEvent intermediateThrowErrorEvent intermediateThrowEscalationEvent intermediateThrowLinkEvent) ->
+      t when t in ~w(intermediateThrowMessageEvent intermediateThrowSignalEvent intermediateThrowErrorEvent intermediateThrowEscalationEvent intermediateThrowLinkEvent intermediateThrowCompensationEvent) ->
         parse_intermediate_throw(t, base, data)
 
-      t when t in ~w(timerBoundaryEvent messageBoundaryEvent signalBoundaryEvent errorBoundaryEvent escalationBoundaryEvent nonInterruptingTimerBoundaryEvent nonInterruptingMessageBoundaryEvent nonInterruptingSignalBoundaryEvent) ->
+      t when t in ~w(timerBoundaryEvent messageBoundaryEvent signalBoundaryEvent conditionalBoundaryEvent compensationBoundaryEvent errorBoundaryEvent escalationBoundaryEvent nonInterruptingTimerBoundaryEvent nonInterruptingMessageBoundaryEvent nonInterruptingSignalBoundaryEvent nonInterruptingConditionalBoundaryEvent) ->
         parse_boundary_event(t, base, data)
 
       "callActivity" ->
@@ -208,6 +268,24 @@ defmodule Chronicle.Engine.Diagrams.Parser do
     end
   end
 
+  defp reject_collaboration_shapes!(data) do
+    unsupported =
+      [
+        {"collaborations", "BPMN collaborations are not implemented."},
+        {"participants", "BPMN participants/pools are not implemented."},
+        {"pools", "BPMN pools are not implemented."},
+        {"messageFlows", "BPMN message flows are not implemented."}
+      ]
+
+    Enum.each(unsupported, fn {key, reason} ->
+      case Map.get(data, key) do
+        nil -> :ok
+        [] -> :ok
+        _ -> throw({:unsupported_node_type, key, reason})
+      end
+    end)
+  end
+
   # -- Start event parsers --
 
   defp parse_start_event("blankStartEvent", base, data, original_type) do
@@ -238,6 +316,20 @@ defmodule Chronicle.Engine.Diagrams.Parser do
     %Nodes.StartEvents.TimerStartEvent{
       id: base.id, key: base.key,
       timer: parse_timer(data),
+      properties: base.properties
+    }
+  end
+
+  defp parse_start_event("conditionalStartEvent", base, data, _original_type) do
+    condition = Map.get(data, "condition") || Map.get(base.properties, "condition")
+
+    if condition in [nil, ""] do
+      throw({:unsupported_node_type, "conditionalStartEvent", "Conditional start events require a condition expression."})
+    end
+
+    %Nodes.StartEvents.ConditionalStartEvent{
+      id: base.id, key: base.key,
+      condition: condition,
       properties: base.properties
     }
   end
@@ -287,6 +379,13 @@ defmodule Chronicle.Engine.Diagrams.Parser do
     %Nodes.EndEvents.TerminationEndEvent{
       id: base.id, key: base.key,
       reason: Map.get(data, "reason"),
+      properties: base.properties
+    }
+  end
+
+  defp parse_end_event("compensationEndEvent", base, _data) do
+    %Nodes.EndEvents.CompensationEndEvent{
+      id: base.id, key: base.key,
       properties: base.properties
     }
   end
@@ -511,6 +610,13 @@ defmodule Chronicle.Engine.Diagrams.Parser do
     }
   end
 
+  defp parse_intermediate_throw("intermediateThrowCompensationEvent", base, _data) do
+    %Nodes.IntermediateThrow.CompensationEvent{
+      id: base.id, key: base.key,
+      properties: base.properties
+    }
+  end
+
   # -- Boundary event parsers --
 
   defp parse_boundary_event("timerBoundaryEvent", base, data) do
@@ -557,6 +663,29 @@ defmodule Chronicle.Engine.Diagrams.Parser do
     }
   end
 
+  defp parse_boundary_event("conditionalBoundaryEvent", base, data) do
+    condition = Map.get(data, "condition") || Map.get(base.properties, "condition")
+
+    if condition in [nil, ""] do
+      throw({:unsupported_node_type, "conditionalBoundaryEvent", "Conditional boundary events require a condition expression."})
+    end
+
+    %Nodes.BoundaryEvents.ConditionalBoundary{
+      id: base.id, key: base.key,
+      condition: condition,
+      attached_to: Map.get(data, "activity"),
+      properties: base.properties
+    }
+  end
+
+  defp parse_boundary_event("compensationBoundaryEvent", base, data) do
+    %Nodes.BoundaryEvents.CompensationBoundary{
+      id: base.id, key: base.key,
+      attached_to: Map.get(data, "activity"),
+      properties: base.properties
+    }
+  end
+
   defp parse_boundary_event("nonInterruptingTimerBoundaryEvent", base, data) do
     %Nodes.BoundaryEvents.NonInterruptingTimerBoundary{
       id: base.id, key: base.key,
@@ -579,6 +708,21 @@ defmodule Chronicle.Engine.Diagrams.Parser do
     %Nodes.BoundaryEvents.NonInterruptingSignalBoundary{
       id: base.id, key: base.key,
       signal: Map.get(data, "signal"),
+      attached_to: Map.get(data, "activity"),
+      properties: base.properties
+    }
+  end
+
+  defp parse_boundary_event("nonInterruptingConditionalBoundaryEvent", base, data) do
+    condition = Map.get(data, "condition") || Map.get(base.properties, "condition")
+
+    if condition in [nil, ""] do
+      throw({:unsupported_node_type, "nonInterruptingConditionalBoundaryEvent", "Non-interrupting conditional boundary events require a condition expression."})
+    end
+
+    %Nodes.BoundaryEvents.NonInterruptingConditionalBoundary{
+      id: base.id, key: base.key,
+      condition: condition,
       attached_to: Map.get(data, "activity"),
       properties: base.properties
     }
@@ -619,7 +763,8 @@ defmodule Chronicle.Engine.Diagrams.Parser do
       match?(%Nodes.StartEvents.BlankStartEvent{}, node) ||
       match?(%Nodes.StartEvents.MessageStartEvent{}, node) ||
       match?(%Nodes.StartEvents.SignalStartEvent{}, node) ||
-      match?(%Nodes.StartEvents.TimerStartEvent{}, node)
+      match?(%Nodes.StartEvents.TimerStartEvent{}, node) ||
+      match?(%Nodes.StartEvents.ConditionalStartEvent{}, node)
     end)
     |> Enum.map(fn {id, _} -> id end)
   end
@@ -678,9 +823,12 @@ defmodule Chronicle.Engine.Diagrams.Parser do
   defp boundary_event?(%Nodes.BoundaryEvents.SignalBoundary{}), do: true
   defp boundary_event?(%Nodes.BoundaryEvents.ErrorBoundary{}), do: true
   defp boundary_event?(%Nodes.BoundaryEvents.EscalationBoundary{}), do: true
+  defp boundary_event?(%Nodes.BoundaryEvents.ConditionalBoundary{}), do: true
+  defp boundary_event?(%Nodes.BoundaryEvents.CompensationBoundary{}), do: true
   defp boundary_event?(%Nodes.BoundaryEvents.NonInterruptingTimerBoundary{}), do: true
   defp boundary_event?(%Nodes.BoundaryEvents.NonInterruptingMessageBoundary{}), do: true
   defp boundary_event?(%Nodes.BoundaryEvents.NonInterruptingSignalBoundary{}), do: true
+  defp boundary_event?(%Nodes.BoundaryEvents.NonInterruptingConditionalBoundary{}), do: true
   defp boundary_event?(_), do: false
 
   # -- Property parsers --
@@ -784,6 +932,61 @@ defmodule Chronicle.Engine.Diagrams.Parser do
       _ -> :fail
     end
   end
+
+  defp maybe_put_loop_characteristics(properties, data) do
+    loop =
+      Map.get(data, "standardLoop") ||
+        Map.get(data, "loopCharacteristics") ||
+        Map.get(data, "loop")
+
+    parsed = parse_loop_characteristics(loop || Map.get(properties || %{}, "loopCharacteristics"))
+
+    if parsed do
+      Map.put(properties || %{}, "loopCharacteristics", parsed)
+    else
+      properties || %{}
+    end
+  end
+
+  defp parse_loop_characteristics(loop) when is_map(loop) do
+    condition =
+      Map.get(loop, "condition") ||
+        Map.get(loop, "loopCondition") ||
+        Map.get(loop, "expression")
+
+    max_iterations =
+      Map.get(loop, "maxIterations") ||
+        Map.get(loop, "maximum") ||
+        Map.get(loop, "max")
+
+    cond do
+      Map.get(loop, "isSequential") == true or Map.get(loop, "multiInstance") == true ->
+        throw({:unsupported_node_type, "loopCharacteristics", "Multi-instance activity characteristics are not implemented."})
+
+      condition in [nil, ""] and max_iterations in [nil, ""] ->
+        nil
+
+      true ->
+        %{
+          "condition" => condition,
+          "maxIterations" => parse_optional_int(max_iterations),
+          "testBefore" => Map.get(loop, "testBefore", false)
+        }
+    end
+  end
+
+  defp parse_loop_characteristics(_), do: nil
+
+  defp parse_optional_int(nil), do: nil
+  defp parse_optional_int(""), do: nil
+  defp parse_optional_int(value) when is_integer(value), do: value
+  defp parse_optional_int(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {int, _} -> int
+      :error -> nil
+    end
+  end
+  defp parse_optional_int(_), do: nil
 
   # -- Extension extraction --
 

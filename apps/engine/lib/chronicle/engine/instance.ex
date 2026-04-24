@@ -920,14 +920,91 @@ defmodule Chronicle.Engine.Instance do
             token = %{token | parameters: Map.merge(token.parameters || %{}, variables)}
             %{acc | tokens: Map.put(acc.tokens, token.id, token)}
           end)
-          |> retrigger_conditional_tokens(%{})
 
-        {:ok, state, false}
+        state = retrigger_conditional_tokens(state, %{})
+
+        case trigger_matching_conditional_boundaries(state) do
+          {:ok, state, continue?} -> {:ok, state, continue?}
+          {:error, reason, state} -> {:error, reason, state}
+        end
 
       {:error, reason, state} ->
         {:error, reason, state}
     end
   end
+
+  defp trigger_matching_conditional_boundaries(state) do
+    matches =
+      state.boundary_index
+      |> Enum.flat_map(fn {token_id, infos} ->
+        token = Map.get(state.tokens, token_id)
+
+        infos
+        |> Enum.filter(&(&1.type == :conditional))
+        |> Enum.filter(fn info ->
+          token && conditional_boundary_matches?(info, token.parameters || %{})
+        end)
+        |> Enum.map(&{token_id, &1})
+      end)
+
+    events =
+      Enum.flat_map(matches, fn {token_id, info} ->
+        trigger_event = BoundaryLifecycle.trigger_event(state, token_id, info.boundary_node_id)
+
+        if info.interrupting != false do
+          [trigger_event] ++
+            BoundaryLifecycle.activity_timer_cancellation_events(state, token_id) ++
+            BoundaryLifecycle.cancellation_events(state, token_id, info.boundary_node_id)
+        else
+          [trigger_event]
+        end
+      end)
+
+    case persist_command_events(state, events) do
+      {:ok, state} ->
+        state =
+          Enum.reduce(matches, state, fn {token_id, info}, acc ->
+            if info.interrupting != false do
+              acc
+              |> TokenState.trigger_boundary(token_id, info.boundary_node_id, true)
+              |> WaitRegistry.cancel_activity_timer_registrations(token_id)
+              |> WaitRegistry.cancel_boundary_registrations(token_id)
+            else
+              acc
+              |> TokenState.trigger_boundary(token_id, info.boundary_node_id, false)
+              |> WaitRegistry.close_triggered_boundary_registration(token_id, info.boundary_node_id)
+            end
+          end)
+
+        {:ok, state, matches != []}
+
+      {:error, reason, state} ->
+        {:error, reason, state}
+    end
+  end
+
+  defp conditional_boundary_matches?(%{condition: condition, boundary_node_id: node_id}, params)
+       when condition not in [nil, ""] do
+    case Chronicle.Engine.Scripting.ScriptPool.evaluate_expressions([{node_id, condition}], params) do
+      {:ok, results} -> conditional_expression_result?(results, node_id)
+      _ -> false
+    end
+  end
+
+  defp conditional_boundary_matches?(_, _), do: false
+
+  defp conditional_expression_result?(results, node_id) when is_list(results) do
+    Enum.any?(results, fn
+      %{"node_id" => ^node_id, "result" => true} -> true
+      %{node_id: ^node_id, result: true} -> true
+      {^node_id, true} -> true
+      true -> true
+      _ -> false
+    end)
+  end
+
+  defp conditional_expression_result?(true, _node_id), do: true
+  defp conditional_expression_result?(_, _node_id), do: false
 
   defp retrigger_conditional_tokens(state, variables) do
     conditional_tokens =

@@ -33,6 +33,8 @@ defmodule Chronicle.Engine.Instance.TokenState do
       ni_message_boundaries: %{},
       ni_signal_boundaries: %{},
       boundary_index: %{},
+      compensatable_activities: %{},
+      compensation_started: MapSet.new(),
       call_wait_list: %{},
       external_tasks: %{},
       script_waits: %{},

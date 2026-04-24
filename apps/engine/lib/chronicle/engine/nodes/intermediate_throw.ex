@@ -1,5 +1,5 @@
 defmodule Chronicle.Engine.Nodes.IntermediateThrow do
-  @moduledoc "Intermediate throwing events: Message, Signal, Error, Escalation, Link."
+  @moduledoc "Intermediate throwing events: Message, Signal, Error, Escalation, Link, Compensation."
 
   defmodule MessageEvent do
     use Chronicle.Engine.Nodes.Node
@@ -98,6 +98,17 @@ defmodule Chronicle.Engine.Nodes.IntermediateThrow do
       else
         {:crash, {:link_target_not_found, context.node.link_name}}
       end
+    end
+  end
+
+  defmodule CompensationEvent do
+    use Chronicle.Engine.Nodes.Node
+    defstruct [:id, :key, :inputs, :outputs, :properties]
+
+    @impl true
+    def process(context) do
+      first_output = List.first(context.node.outputs || [])
+      NodeResult.throw_compensation(first_output, false)
     end
   end
 end

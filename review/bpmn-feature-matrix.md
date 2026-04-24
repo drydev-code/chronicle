@@ -15,7 +15,7 @@ Status values:
 | --- | --- | --- |
 | Executable process | Partial | BPJS process definitions are executable. Native BPMN XML is not. |
 | BPMN XML import | Unsupported | `.bpmn` is rejected as XML unsupported. |
-| Collaboration / pools / lanes | Missing | No model/runtime for participants, lanes, or message flows. |
+| Collaboration / pools / lanes | Partial | Lanes are supported as `actorType` routing metadata only. Collaborations, pools, participants, and message flows remain unsupported. |
 | Sequence flow | Implemented | Connections drive token movement. |
 | Data objects / data associations | Missing | Variables are engine maps, not BPMN data objects/associations. |
 | Process versioning | Implemented | Restore uses recorded process version. |
@@ -38,8 +38,8 @@ Status values:
 | Event subprocess | Missing | No scoped event subprocess support. |
 | Transaction subprocess | Missing | No transaction/cancel semantics. |
 | Ad-hoc subprocess | Missing | No ad-hoc semantics. |
-| Loop activity | Missing | No standard activity loop characteristics. |
-| Multi-instance activity | Partial | Only call-activity-specific sequential collection looping exists; standard BPMN loop and multi-instance characteristics are missing. |
+| Loop activity | Implemented | Standard activity loops use post-test condition evaluation with a max-iteration guard and durable `LoopConditionEvaluated` replay. |
+| Multi-instance activity | Partial | Only call-activity-specific sequential collection looping exists; standard BPMN multi-instance characteristics are missing. |
 
 ## Gateways
 
@@ -61,9 +61,9 @@ Status values:
 | Signal | Implemented | Implemented | Implemented | Implemented | Partial |
 | Error | Partial | N/A | Partial | Partial | Partial |
 | Escalation | Partial | N/A | Partial | Partial | Partial |
-| Conditional | Missing | Partial | N/A | N/A | Missing |
+| Conditional | Implemented | Partial | N/A | N/A | Implemented |
 | Link | N/A | Implemented | Implemented | N/A | N/A |
-| Compensation | N/A | Missing | Missing | Missing | Missing |
+| Compensation | N/A | Missing | Implemented | Implemented | Implemented |
 | Cancel | N/A | Missing | Missing | Missing | Missing |
 | Terminate | N/A | N/A | N/A | Implemented | N/A |
 | Multiple | Missing | Missing | Missing | Missing | Missing |
@@ -75,10 +75,13 @@ Notes:
   parser, so they are not true BPMN error/escalation start semantics.
 - Throwing error/escalation completes with `CompletionData`, rather than
   propagating through BPMN scopes.
-- Conditional intermediate events are expression-gated and persist evaluation.
-  False evaluations create durable waits that can be re-triggered explicitly,
-  or via the durable variable-update API, when variables change. Conditional
-  start and boundary events remain unsupported.
+- Conditional start events are evaluated from variable payloads and persist
+  the selected start node on `ProcessInstanceStart`. Conditional intermediate
+  events are expression-gated and persist evaluation. False evaluations create
+  durable waits that can be re-triggered explicitly, or via the durable
+  variable-update API, when variables change. Conditional boundaries are
+  evaluated only after durable `VariablesUpdated` events persist;
+  non-interrupting conditional boundaries are one-shot.
 - Boundary events can be created/registered for waiting activity tokens.
   Cancellation/removal is wired for external-task and call-activity completion/
   cancellation, script/rules result completion, process termination,
@@ -87,6 +90,12 @@ Notes:
   message/signal boundaries keep the activity wait open and remain registered.
   Non-interrupting timer boundaries are one-shot and close their timer
   registration after the trigger is persisted.
+- Lane metadata is parsed from BPJS JSON and resolved into node `actorType`
+  metadata for service/user task publication. Explicit node `actorType`
+  overrides lane metadata; collaboration semantics remain unsupported.
+- Compensation is scoped to completed compensatable activities with durable
+  handler registration, compensation requests, handler starts, and handler
+  completions. Transaction subprocess and cancel semantics remain unsupported.
 
 ## Persistence And Recovery
 
@@ -103,6 +112,9 @@ Notes:
 | Fork/token-family persistence | Implemented | Initial and fork-created tokens append `TokenFamilyCreated`; original fork token appends `TokenFamilyRemoved`. |
 | Event-gateway timer cleanup | Implemented | Losing timer branches are canceled and recorded with `TimerCanceled` before `EventGatewayResolved` continues the token; replay coverage verifies canceled timer branches stay closed after restore. |
 | Conditional wait re-trigger | Implemented | `Instance.retrigger_conditionals/2` re-evaluates pending conditional catches; `Instance.update_variables/2` and the HTTP variable update route append durable `VariablesUpdated` events before mutating token variables and re-triggering conditionals. |
+| Conditional boundary trigger | Implemented | `Instance.update_variables/2` persists `VariablesUpdated` before evaluating open conditional boundaries, then persists boundary trigger/cancel events before registry cleanup and continuation. |
+| Loop activity persistence | Implemented | Standard loop decisions append `LoopConditionEvaluated` with iteration, condition result, max guard, and target node. |
+| Compensation persistence | Implemented | Compensation handler registration/completion, compensation requests, handler starts, and handler completions are represented as persistent events and replayed. |
 | Boundary cancellation persistence | Implemented | `BoundaryEventCancelled` is appended before registry/timer mutation for external-task and call-activity completion/cancellation cleanup, script/rules result completion, process termination, interrupting boundary trigger sibling cleanup, retry timer interruption, and token crash cleanup. Replay removes canceled boundary indexes so restored registries/timers stay closed, and evicted collection handles boundary and retry timer cancellation. |
 | Exact-version restore | Implemented | Replayer uses `DiagramStore.get(name, version, tenant)`. |
 | Eviction duplicate prevention | Implemented | Lifecycle appends only event deltas. |

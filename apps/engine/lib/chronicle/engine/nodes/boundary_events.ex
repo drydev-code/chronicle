@@ -29,6 +29,16 @@ defmodule Chronicle.Engine.Nodes.BoundaryEvents do
     defstruct [:id, :key, :escalation, :attached_to, :outputs, :properties]
   end
 
+  defmodule ConditionalBoundary do
+    @moduledoc "Interrupting conditional boundary event."
+    defstruct [:id, :key, :condition, :attached_to, :outputs, :properties]
+  end
+
+  defmodule CompensationBoundary do
+    @moduledoc "Compensation boundary event registering a compensation handler."
+    defstruct [:id, :key, :attached_to, :outputs, :properties]
+  end
+
   defmodule NonInterruptingTimerBoundary do
     @moduledoc "Non-interrupting timer boundary event (recurring)."
     defstruct [:id, :key, :timer_config, :variable_name, :repetition_count, :attached_to, :outputs, :properties]
@@ -44,6 +54,11 @@ defmodule Chronicle.Engine.Nodes.BoundaryEvents do
     defstruct [:id, :key, :signal, :attached_to, :outputs, :properties]
   end
 
+  defmodule NonInterruptingConditionalBoundary do
+    @moduledoc "Non-interrupting one-shot conditional boundary event."
+    defstruct [:id, :key, :condition, :attached_to, :outputs, :properties]
+  end
+
   @doc "Get the output path from a boundary event."
   def output_path(boundary_event) do
     List.first(boundary_event.outputs || [])
@@ -55,6 +70,8 @@ defmodule Chronicle.Engine.Nodes.BoundaryEvents do
   def interrupting?(%SignalBoundary{}), do: true
   def interrupting?(%ErrorBoundary{}), do: true
   def interrupting?(%EscalationBoundary{}), do: true
+  def interrupting?(%ConditionalBoundary{}), do: true
+  def interrupting?(%CompensationBoundary{}), do: false
   def interrupting?(_), do: false
 
   @doc "Compute timer delay from boundary event config."

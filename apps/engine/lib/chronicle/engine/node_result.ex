@@ -20,6 +20,7 @@ defmodule Chronicle.Engine.NodeResult do
     {:complete, term()} |
     {:throw_message, String.t(), map(), non_neg_integer()} |
     {:throw_signal, String.t(), non_neg_integer()} |
+    {:throw_compensation, non_neg_integer() | nil, boolean()} |
     {:call, map()} |
     {:retry, non_neg_integer()} |
     {:step} |
@@ -41,6 +42,7 @@ defmodule Chronicle.Engine.NodeResult do
   def complete(data), do: {:complete, data}
   def throw_message(name, payload, next_node), do: {:throw_message, name, payload, next_node}
   def throw_signal(name, next_node), do: {:throw_signal, name, next_node}
+  def throw_compensation(next_node, complete? \\ false), do: {:throw_compensation, next_node, complete?}
   def call(params), do: {:call, params}
   def retry(backoff_ms), do: {:retry, backoff_ms}
   def step(), do: {:step}

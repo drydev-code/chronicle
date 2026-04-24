@@ -13,12 +13,22 @@ The engine now has parser/runtime/replay support for:
 - BPJS JSON diagrams only. Native BPMN XML remains out of scope.
 - Start/end events, script tasks, rules tasks, external/user tasks, call
   activities, send tasks, receive tasks, and manual tasks.
+- BPJS lanes as routing metadata for resolving external/user task `actorType`.
+  Explicit node metadata wins over lane metadata; collaboration semantics are
+  still unsupported.
 - Exclusive, parallel, inclusive, and event-based gateways.
 - Event-based gateway branches limited to message, receive-task, signal, and
   timer branches. Unsupported outgoing branches fail during parsing and at
   runtime validation.
 - Intermediate message, signal, timer, conditional, and link catches.
-- Intermediate message, signal, error, escalation, and link throws.
+- Conditional starts evaluated from variable payloads with selected
+  `start_node_id` persisted on `ProcessInstanceStart`.
+- Intermediate message, signal, error, escalation, compensation, and link
+  throws.
+- Standard activity loops with post-test condition evaluation, max-iteration
+  guard, durable loop decisions, and replay.
+- Compensation boundary handlers for completed compensatable activities, plus
+  durable compensation request/start/completion replay.
 - Durable wait-created events for message/signal waits.
 - Durable external-task success/failure/cancellation events.
 - Durable call completion/cancellation events.
@@ -37,6 +47,7 @@ The engine now has parser/runtime/replay support for:
   sibling tokens that can still reach the join.
 - Durable variable updates through `Instance.update_variables/2` and the server
   API, followed by conditional re-triggering after the variable-change events
+  persist and conditional boundary evaluation after variable-change events
   persist.
 
 ## P0: Supported-Subset Gaps
@@ -76,17 +87,15 @@ completed P0 pass covered:
 
 1. Embedded subprocesses with scoped variables and boundary events.
 2. Event subprocesses, including interrupting and non-interrupting starts.
-3. Conditional start events and conditional boundary events.
-4. Compensation events and compensation handlers.
-5. Cancel events and transaction subprocesses.
-6. Multiple and parallel-multiple events.
-7. Standard loop activity characteristics.
-8. Sequential and parallel multi-instance activity characteristics with
+3. Event subprocess conditional starts and event-subprocess boundary semantics.
+4. Cancel events and transaction subprocesses.
+5. Multiple and parallel-multiple events.
+6. Sequential and parallel multi-instance activity characteristics with
    completion conditions. Current sequential collection loop is call-activity
    specific, not general BPMN multi-instance support.
-9. Collaboration, pools, lanes, message flows, BPMN data objects, and data
-   associations.
-10. Broader event-based gateway branch support beyond message/receive/signal/
+7. Collaboration, pools, participants, message flows, BPMN data objects, and
+   data associations. Lanes are supported only as `actorType` metadata.
+8. Broader event-based gateway branch support beyond message/receive/signal/
     timer only if BPJS models require it.
 
 ## P1: Claims And Packaging
@@ -101,8 +110,8 @@ completed P0 pass covered:
 3. Add parser, runtime, replay, and restart/eviction tests before marking any
    SupportedFeatures entry as supported.
 
-4. Keep compensation explicitly unsupported until both compensation events and
-   compensation handlers are implemented and replayable.
+4. Keep transaction/cancel semantics explicitly unsupported until they are
+   implemented separately from compensation.
 
 ## P2: Production Safety
 
@@ -126,16 +135,14 @@ completed P0 pass covered:
 
 ## Suggested Next Batch
 
-The next implementation phase is documented in
-[`next-phase-bpmn-roadmap.md`](next-phase-bpmn-roadmap.md). It intentionally
-targets the practical BPJS subset requested next:
+The next implementation phase should focus on scoped subprocess behavior and
+the remaining unsupported BPMN event families:
 
-1. Lanes as `actorType` metadata.
-2. Conditional start and conditional boundary events.
-3. Standard loop activity characteristics.
-4. Compensation events and compensation handlers.
+1. Embedded subprocesses with scoped variables and scoped boundary events.
+2. Event subprocesses, including interrupting/non-interrupting starts.
+3. Transaction subprocesses with cancel semantics.
+4. Multiple and parallel-multiple events.
+5. Standard sequential/parallel multi-instance activity characteristics.
 
-Use [`next-phase-handoff-prompt.md`](next-phase-handoff-prompt.md) as the
-copy-paste starting prompt for that implementation pass. Keep the same rule for
-every expansion: parseable, executable, replayable, and covered by
-restart/eviction tests before claiming support.
+Keep the same rule for every expansion: parseable, executable, replayable, and
+covered by restart/eviction tests before claiming support.

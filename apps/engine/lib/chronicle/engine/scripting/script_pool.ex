@@ -53,4 +53,15 @@ defmodule Chronicle.Engine.Scripting.ScriptPool do
       end
     end)
   end
+
+  @doc "Execute boolean expressions synchronously."
+  def evaluate_expressions(expressions, inputs, timeout \\ 10_000) do
+    worker = :poolboy.checkout(@pool_name)
+
+    try do
+      GenServer.call(worker, {:execute_expressions, expressions, inputs}, timeout)
+    after
+      :poolboy.checkin(@pool_name, worker)
+    end
+  end
 end

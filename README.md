@@ -19,7 +19,8 @@ supervision tree. Run `:server` when you want a batteries-included service.
 
 - **BPJS BPMN subset semantics**: start/end events, intermediate catch/throw,
   gateways (exclusive, parallel, inclusive, event-based), first-class send,
-  receive, and manual tasks, and supported boundary events.
+  receive, and manual tasks, lane-based actor routing metadata, and supported
+  boundary, loop, and compensation events.
 - **Token-based execution** on a per-instance `GenServer` with event-sourcing
   semantics (append-only log, replay on restart). Commands append durable
   events before publishing effects or mutating query-facing projections.
@@ -43,16 +44,19 @@ BPMN XML in this release:
 - `.bpmn`: rejected with an unsupported-format error; XML parsing is out of scope for this release.
 
 Supported BPJS node types are declared in
-`Chronicle.Engine.Diagrams.SupportedFeatures`. Unsupported BPMN features such
-as embedded/event/transaction subprocesses, complex gateways, conditional
-start/boundary events, cancel/compensation/multiple events, and standard
-multi-instance loop characteristics fail during parsing instead of silently
-falling through.
+`Chronicle.Engine.Diagrams.SupportedFeatures`. Lane metadata is supported only
+for resolving `actorType` on service/user task publications. Unsupported BPMN
+features such as collaborations, pools, participants, message flows,
+embedded/event/transaction subprocesses, complex gateways, cancel/multiple
+events, and standard multi-instance loop characteristics fail during parsing
+instead of silently falling through.
 
 Event-based gateways are limited to supported message, signal, receive-task,
 and timer branches; unsupported outgoing branches are rejected. Intermediate
 conditional catches can park as durable waits and be explicitly re-triggered
-through the instance API when variables change.
+through the instance API when variables change. Conditional start events are
+evaluated from a variable payload and persist the selected `start_node_id` on
+the resulting `ProcessInstanceStart`.
 
 Boundary message, signal, and timer waits are supported for the current
 wait-capable activity subset with durable create/cancel/trigger replay.
@@ -61,9 +65,17 @@ interrupting boundary durably cancels the retry timer before the boundary path
 continues. Non-interrupting message and signal boundaries remain registered
 while the activity wait stays open. Non-interrupting timer boundaries are
 one-shot: after the timer triggers and creates its boundary token, that timer
-registration is closed and replay does not restore it. Unsupported boundary
-features still include conditional, compensation, cancel, multiple, and
-parallel-multiple boundary events.
+registration is closed and replay does not restore it. Conditional boundaries
+are evaluated only after durable variable updates persist; non-interrupting
+conditional boundaries are one-shot. Compensation boundaries register handlers
+for completed compensatable activities; compensation throw/end events request
+and start eligible handlers durably. Unsupported boundary features still
+include cancel, multiple, and parallel-multiple boundary events.
+
+Standard activity loops use post-test semantics by default: the activity runs
+once, then Chronicle evaluates the loop condition with a max-iteration guard
+and records the decision as durable loop data. Sequential and parallel
+multi-instance characteristics remain out of scope.
 
 Diagram files are shipped inside ZIP deployment packages alongside
 `.dmn` decision tables.

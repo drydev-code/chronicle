@@ -1,21 +1,25 @@
 defmodule Chronicle.Engine.Diagrams.SupportedFeatures do
   @moduledoc """
-  Manifest for the executable BPJS BPMN subset supported by Chronicle.
+  Manifest for the executable BPJS BPMN node subset supported by Chronicle.
 
   Native BPMN XML and full BPMN 2.0 conformance are intentionally out of
   scope for this release. Unsupported node types must fail during parsing so
   deployments cannot silently execute with degraded semantics.
+
+  Non-node BPJS lane metadata is supported separately by the parser for
+  `actorType` resolution only; collaborations, pools, participants, and
+  message flows remain unsupported.
   """
 
   @supported_node_types MapSet.new(~w(
-    blankStartEvent messageStartEvent signalStartEvent timerStartEvent
-    blankEndEvent errorEndEvent messageEndEvent signalEndEvent escalationEndEvent terminationEndEvent
+    blankStartEvent messageStartEvent signalStartEvent timerStartEvent conditionalStartEvent
+    blankEndEvent errorEndEvent messageEndEvent signalEndEvent escalationEndEvent terminationEndEvent compensationEndEvent
     scriptTask externalTask userTask rulesTask callActivity manualTask sendTask receiveTask
     parallelGateway exclusiveGateway inclusiveGateway eventBasedGateway
     intermediateTimerEvent intermediateCatchTimerEvent intermediateCatchMessageEvent intermediateCatchSignalEvent intermediateCatchConditionalEvent intermediateCatchLinkEvent
-    intermediateThrowMessageEvent intermediateThrowSignalEvent intermediateThrowErrorEvent intermediateThrowEscalationEvent intermediateThrowLinkEvent
-    timerBoundaryEvent messageBoundaryEvent signalBoundaryEvent errorBoundaryEvent escalationBoundaryEvent
-    nonInterruptingTimerBoundaryEvent nonInterruptingMessageBoundaryEvent nonInterruptingSignalBoundaryEvent
+    intermediateThrowMessageEvent intermediateThrowSignalEvent intermediateThrowErrorEvent intermediateThrowEscalationEvent intermediateThrowLinkEvent intermediateThrowCompensationEvent
+    timerBoundaryEvent messageBoundaryEvent signalBoundaryEvent conditionalBoundaryEvent compensationBoundaryEvent errorBoundaryEvent escalationBoundaryEvent
+    nonInterruptingTimerBoundaryEvent nonInterruptingMessageBoundaryEvent nonInterruptingSignalBoundaryEvent nonInterruptingConditionalBoundaryEvent
   ))
 
   @unsupported_reasons %{
@@ -24,11 +28,6 @@ defmodule Chronicle.Engine.Diagrams.SupportedFeatures do
     "transaction" => "Transaction subprocess and cancel semantics are not implemented.",
     "adHocSubProcess" => "Ad-hoc subprocesses are not implemented.",
     "complexGateway" => "Complex gateways are not implemented.",
-    "conditionalStartEvent" => "Conditional start events are not implemented.",
-    "conditionalBoundaryEvent" => "Conditional boundary events are not implemented.",
-    "compensationEndEvent" => "Compensation is not implemented.",
-    "intermediateThrowCompensationEvent" => "Compensation is not implemented.",
-    "compensationBoundaryEvent" => "Compensation is not implemented.",
     "cancelEndEvent" => "Cancel events are not implemented.",
     "cancelBoundaryEvent" => "Cancel events are not implemented.",
     "multipleStartEvent" => "Multiple events are not implemented.",

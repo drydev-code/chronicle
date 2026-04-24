@@ -70,6 +70,28 @@ defmodule Chronicle.Server.Web.Controllers.ProcessInstanceController do
     end
   end
 
+  def evaluate_conditional_starts(conn, params) do
+    tenant_id = conn.assigns[:tenant_id]
+    variables = Map.get(params, "variables") || Map.get(params, "parameters") || %{}
+
+    if is_map(variables) do
+      opts =
+        []
+        |> maybe_put(:business_key, Map.get(params, "businessKey"))
+        |> maybe_put(:process_name, Map.get(params, "name") || Map.get(params, "processName"))
+
+      results = Chronicle.Engine.ConditionalStarts.evaluate(tenant_id, variables, opts)
+
+      json(conn, %{
+        status: "evaluated",
+        started: Enum.count(results, &match?({:ok, _}, &1)),
+        results: Enum.map(results, &format_conditional_start_result/1)
+      })
+    else
+      conn |> put_status(400) |> json(%{error: "variables must be an object"})
+    end
+  end
+
   defp do_migrate(conn, tenant_id, id, target_name, node_mappings) do
     case Instance.lookup(tenant_id, id) do
       {:ok, pid} ->
@@ -107,6 +129,28 @@ defmodule Chronicle.Server.Web.Controllers.ProcessInstanceController do
   end
 
   defp parse_node_mappings(_), do: {:error, {"nodeMappings", :invalid}}
+
+  defp maybe_put(opts, _key, nil), do: opts
+  defp maybe_put(opts, _key, ""), do: opts
+  defp maybe_put(opts, key, value), do: Keyword.put(opts, key, value)
+
+  defp format_conditional_start_result({:ok, result}) do
+    %{
+      status: "started",
+      processInstanceId: result.process_instance_id,
+      processName: result.process_name,
+      startNodeId: result.start_node_id
+    }
+  end
+
+  defp format_conditional_start_result({:error, result}) do
+    %{
+      status: "error",
+      processName: result.process_name,
+      startNodeId: result.start_node_id,
+      reason: inspect(result.reason)
+    }
+  end
 
   def stress_test(conn, %{"count" => count_raw}) do
     case Params.positive_int(count_raw, max: 1_000) do

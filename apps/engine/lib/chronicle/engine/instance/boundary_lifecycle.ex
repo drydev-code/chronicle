@@ -24,6 +24,7 @@ defmodule Chronicle.Engine.Instance.BoundaryLifecycle do
         boundary_node_id: info.boundary_node_id,
         boundary_type: info.type,
         name: Map.get(info, :name),
+        condition: Map.get(info, :condition),
         timer_id: Map.get(info, :timer_id)
       }
     end)
@@ -79,6 +80,7 @@ defmodule Chronicle.Engine.Instance.BoundaryLifecycle do
       boundary_type: info && info.type,
       interrupting: info && info.interrupting != false,
       name: info && Map.get(info, :name),
+      condition: info && Map.get(info, :condition),
       timer_id: info && Map.get(info, :timer_id),
       triggered_at: System.system_time(:millisecond)
     }

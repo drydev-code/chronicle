@@ -35,6 +35,7 @@ defmodule Chronicle.Server.Web.Router do
 
     # Process Instance (read + non-destructive start)
     post "/process-instance", ProcessInstanceController, :start
+    post "/process-instance/conditional-starts", ProcessInstanceController, :evaluate_conditional_starts
     post "/process-instance/:id/variables", ProcessInstanceController, :update_variables
 
     # Deployment (non-destructive)

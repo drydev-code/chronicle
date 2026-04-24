@@ -7,7 +7,12 @@ defmodule Chronicle.Engine.InstanceBoundaryLifecycleTest do
 
   setup do
     case Chronicle.Engine.Diagrams.DiagramStore.start_link([]) do
-      {:ok, _pid} -> :ok
+      {:ok, pid} -> Process.unlink(pid)
+      {:error, {:already_started, _pid}} -> :ok
+    end
+
+    case Chronicle.Engine.Scripting.ScriptPool.start_link([]) do
+      {:ok, pid} -> Process.unlink(pid)
       {:error, {:already_started, _pid}} -> :ok
     end
 
@@ -148,6 +153,52 @@ defmodule Chronicle.Engine.InstanceBoundaryLifecycleTest do
       assert {:ok, replayed} = restored_state
       assert replayed.timer_refs == %{}
       assert replayed.boundary_index == %{}
+    end
+  end
+
+  describe "conditional boundary semantics" do
+    test "interrupting conditional boundary triggers after durable variable update and cancels siblings" do
+      {:ok, pid, _instance_id} = start_retry_boundary_instance("conditional-boundary", [
+        %{"id" => 24, "type" => "conditionalBoundaryEvent", "activity" => 2, "condition" => "abort === true"},
+        %{"id" => 25, "type" => "messageBoundaryEvent", "activity" => 2, "message" => %{"name" => "cancel"}}
+      ])
+
+      _task_id = wait_for_external_task(pid)
+
+      :ok = Instance.update_variables_sync(pid, %{"abort" => true})
+
+      state =
+        wait_until(pid, fn state ->
+          Enum.any?(state.persistent_events, &match?(%PersistentData.BoundaryEventTriggered{boundary_node_id: 24}, &1))
+        end)
+
+      types = Enum.map(state.persistent_events, &(&1.__struct__ |> Module.split() |> List.last()))
+      update_index = Enum.find_index(state.persistent_events, &match?(%PersistentData.VariablesUpdated{}, &1))
+      trigger_index = Enum.find_index(state.persistent_events, &match?(%PersistentData.BoundaryEventTriggered{boundary_node_id: 24}, &1))
+
+      assert update_index < trigger_index
+      assert "BoundaryEventCancelled" in types
+      assert state.boundary_index == %{}
+    end
+
+    test "non-interrupting conditional boundary is one-shot and keeps activity wait open" do
+      {:ok, pid, _instance_id} = start_retry_boundary_instance("non-interrupting-conditional-boundary", [
+        %{"id" => 26, "type" => "nonInterruptingConditionalBoundaryEvent", "activity" => 2, "condition" => "notify === true"}
+      ])
+
+      _task_id = wait_for_external_task(pid)
+
+      :ok = Instance.update_variables_sync(pid, %{"notify" => true})
+
+      state =
+        wait_until(pid, fn state ->
+          map_size(state.tokens) == 2 and
+            Enum.any?(state.persistent_events, &match?(%PersistentData.BoundaryEventTriggered{boundary_node_id: 26, interrupting: false}, &1))
+        end)
+
+      assert state.tokens[0].state == :waiting_for_external_task
+      assert state.tokens[1].current_node == 126
+      assert state.boundary_index == %{}
     end
   end
 

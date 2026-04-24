@@ -394,6 +394,17 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
     track_token_id(acc, event.token)
   end
 
+  defp replay_single_event(%PersistentData.LoopConditionEvaluated{} = event, acc) do
+    state =
+      acc.state
+      |> TokenState.update_token_node(event.token, event.target_node || event.current_node)
+      |> TokenState.update_token_context(event.token, :loop_iterations, %{event.current_node => event.iteration})
+      |> TokenState.set_token_active(event.token)
+
+    %{acc | state: state, token_wait_states: Map.delete(acc.token_wait_states, event.token)}
+    |> track_token_id(event.token)
+  end
+
   defp replay_single_event(%PersistentData.VariablesUpdated{} = event, acc) do
     state =
       case Map.get(acc.state.tokens, event.token) do
@@ -437,6 +448,9 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
               interrupting: event.interrupting
             })
           }
+
+        {:conditional, _interrupting, _} ->
+          acc
 
         _ ->
           acc
@@ -486,6 +500,60 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
 
   defp replay_single_event(%PersistentData.BoundaryEventCancelled{} = event, acc) do
     delete_boundary_wait(acc, event)
+  end
+
+  defp replay_single_event(%PersistentData.CompensationHandlerRegistered{}, acc), do: acc
+
+  defp replay_single_event(%PersistentData.CompensatableActivityCompleted{} = event, acc) do
+    activity = %{
+      token: event.token,
+      family: event.family,
+      activity_node_id: event.activity_node_id,
+      handler_node_id: event.handler_node_id,
+      activity_instance_key: event.activity_instance_key
+    }
+
+    state = Map.update!(acc.state, :compensatable_activities, &Map.put(&1, event.activity_instance_key, activity))
+    %{acc | state: state}
+    |> track_token_id(event.token)
+  end
+
+  defp replay_single_event(%PersistentData.CompensationRequested{} = event, acc) do
+    track_token_id(acc, event.token)
+  end
+
+  defp replay_single_event(%PersistentData.CompensationHandlerStarted{} = event, acc) do
+    state = acc.state
+    handler_token = Token.new(event.handler_token, event.family, event.handler_node_id, %{})
+    handler_token =
+      handler_token
+      |> Token.set_context(:compensation_activity_key, event.activity_instance_key)
+      |> Token.set_context(:compensation_handler_node_id, event.handler_node_id)
+
+    state = %{state |
+      tokens: Map.put(state.tokens, event.handler_token, handler_token),
+      compensation_started: MapSet.put(state.compensation_started || MapSet.new(), event.activity_instance_key)
+    }
+
+    %{acc | state: state}
+    |> track_token_id(event.handler_token)
+  end
+
+  defp replay_single_event(%PersistentData.CompensationHandlerCompleted{} = event, acc) do
+    state =
+      acc.state
+      |> TokenState.update_token_node(event.token, event.current_node)
+
+    token = Map.get(state.tokens, event.token)
+    state =
+      if token do
+        %{state | tokens: Map.put(state.tokens, event.token, Token.complete(token))}
+      else
+        state
+      end
+
+    %{acc | state: state}
+    |> track_token_id(event.token)
   end
 
   defp replay_single_event(%PersistentData.MessageThrown{} = event, acc) do
@@ -672,6 +740,7 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
       boundary_node_id: event.boundary_node_id,
       timer_id: event.timer_id,
       name: event.name,
+      condition: Map.get(event, :condition),
       interrupting: event.interrupting != false,
       trigger_at: event.trigger_at
     }
@@ -701,6 +770,10 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
     |> remove_from_open_boundaries(:open_signal_boundaries, event.name, event.token)
     |> remove_from_open_boundaries(:open_ni_signal_boundaries, event.name, event.token)
     |> delete_boundary_index(event)
+  end
+
+  defp delete_boundary_wait(acc, %{boundary_type: :conditional} = event) do
+    delete_boundary_index(acc, event)
   end
 
   defp delete_boundary_wait(acc, event), do: delete_boundary_index(acc, event)

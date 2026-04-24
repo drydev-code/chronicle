@@ -12,6 +12,7 @@ defmodule Chronicle.Engine.Diagrams.SupportedFeaturesTest do
     assert "manualTask" in SupportedFeatures.supported_node_types()
     assert "intermediateCatchLinkEvent" in SupportedFeatures.supported_node_types()
     assert "intermediateThrowLinkEvent" in SupportedFeatures.supported_node_types()
+    assert "conditionalStartEvent" in SupportedFeatures.supported_node_types()
     assert "transaction" in SupportedFeatures.unsupported_node_types()
     assert SupportedFeatures.unsupported_reason("transaction") =~ "not implemented"
   end
@@ -70,6 +71,23 @@ defmodule Chronicle.Engine.Diagrams.SupportedFeaturesTest do
     assert reason =~ "Transaction subprocess"
   end
 
+  test "conditional start requires a condition expression" do
+    bpjs = %{
+      "name" => "bad-conditional-start",
+      "version" => 1,
+      "nodes" => [
+        %{"id" => 1, "type" => "conditionalStartEvent"},
+        %{"id" => 2, "type" => "blankEndEvent"}
+      ],
+      "connections" => [%{"from" => 1, "to" => 2}]
+    }
+
+    assert {:error, {:unsupported_node_type, "conditionalStartEvent", reason}} =
+             Parser.parse(Jason.encode!(bpjs))
+
+    assert reason =~ "require a condition"
+  end
+
   test "parser rejects embedded SubProcess alias rather than treating it as callActivity" do
     bpjs = %{
       "name" => "unsupported-subprocess",
@@ -109,6 +127,63 @@ defmodule Chronicle.Engine.Diagrams.SupportedFeaturesTest do
     task = definition.nodes[2]
 
     assert [%Nodes.BoundaryEvents.TimerBoundary{id: 3, outputs: [5]}] = task.boundary_events
+  end
+
+  test "lanes resolve actorType metadata without overriding explicit node actorType" do
+    bpjs = %{
+      "name" => "lane-routing",
+      "version" => 1,
+      "lanes" => [
+        %{
+          "id" => "operations-lane",
+          "name" => "Operations",
+          "properties" => %{"actorType" => "OperationsActor"},
+          "nodeIds" => [2, 3]
+        }
+      ],
+      "nodes" => [
+        %{"id" => 1, "type" => "blankStartEvent"},
+        %{"id" => 2, "type" => "externalTask", "kind" => "service", "key" => "service"},
+        %{
+          "id" => 3,
+          "type" => "userTask",
+          "key" => "user",
+          "properties" => %{"actorType" => "ExplicitActor"}
+        },
+        %{"id" => 4, "type" => "blankEndEvent"}
+      ],
+      "connections" => [
+        %{"from" => 1, "to" => 2},
+        %{"from" => 2, "to" => 3},
+        %{"from" => 3, "to" => 4}
+      ]
+    }
+
+    assert {:ok, definition} = Parser.parse(Jason.encode!(bpjs))
+
+    assert definition.lanes["operations-lane"].actor_type == "OperationsActor"
+    assert definition.node_lanes[2] == "operations-lane"
+    assert definition.nodes[2].properties["actorType"] == "OperationsActor"
+    assert definition.nodes[3].properties["actorType"] == "ExplicitActor"
+    assert definition.nodes[2].properties["lane"].name == "Operations"
+  end
+
+  test "parser rejects collaboration shapes while allowing lane metadata" do
+    bpjs = %{
+      "name" => "collaboration",
+      "version" => 1,
+      "participants" => [%{"id" => "pool"}],
+      "nodes" => [
+        %{"id" => 1, "type" => "blankStartEvent"},
+        %{"id" => 2, "type" => "blankEndEvent"}
+      ],
+      "connections" => [%{"from" => 1, "to" => 2}]
+    }
+
+    assert {:error, {:unsupported_node_type, "participants", reason}} =
+             Parser.parse(Jason.encode!(bpjs))
+
+    assert reason =~ "participants"
   end
 
   test "event-based gateway rejects unsupported outgoing branches during parsing" do

@@ -29,7 +29,7 @@ defmodule Chronicle.Engine.PersistentData do
   end
 
   defmodule ExternalTaskCreation do
-    defstruct [:token, :family, :current_node, :external_task, :retry_counter]
+    defstruct [:token, :family, :current_node, :external_task, :retry_counter, :actor_type]
   end
 
   defmodule ExternalTaskCompletion do
@@ -88,6 +88,13 @@ defmodule Chronicle.Engine.PersistentData do
     defstruct [:token, :family, :current_node, :condition, :matched, :target_node, :evaluated_at]
   end
 
+  defmodule LoopConditionEvaluated do
+    defstruct [
+      :token, :family, :current_node, :condition, :iteration,
+      :continue, :max_iterations, :target_node, :evaluated_at
+    ]
+  end
+
   defmodule VariablesUpdated do
     defstruct [:token, :family, :current_node, :variables, :updated_at]
   end
@@ -103,22 +110,42 @@ defmodule Chronicle.Engine.PersistentData do
   defmodule BoundaryEventCreated do
     defstruct [
       :token, :family, :current_node, :boundary_node_id, :boundary_type,
-      :interrupting, :name, :timer_id, :trigger_at
+      :interrupting, :name, :condition, :timer_id, :trigger_at
     ]
   end
 
   defmodule BoundaryEventTriggered do
     defstruct [
       :token, :family, :current_node, :boundary_node_id, :boundary_type,
-      :interrupting, :name, :timer_id, :triggered_at
+      :interrupting, :name, :condition, :timer_id, :triggered_at
     ]
   end
 
   defmodule BoundaryEventCancelled do
     defstruct [
       :token, :family, :current_node, :boundary_node_id, :boundary_type,
-      :name, :timer_id
+      :name, :condition, :timer_id
     ]
+  end
+
+  defmodule CompensationHandlerRegistered do
+    defstruct [:token, :family, :current_node, :boundary_node_id, :handler_node_id]
+  end
+
+  defmodule CompensatableActivityCompleted do
+    defstruct [:token, :family, :current_node, :activity_node_id, :handler_node_id, :activity_instance_key]
+  end
+
+  defmodule CompensationRequested do
+    defstruct [:token, :family, :current_node, :eligible_activity_keys, :requested_at]
+  end
+
+  defmodule CompensationHandlerStarted do
+    defstruct [:token, :family, :current_node, :activity_instance_key, :handler_node_id, :handler_token]
+  end
+
+  defmodule CompensationHandlerCompleted do
+    defstruct [:token, :family, :current_node, :activity_instance_key, :handler_node_id]
   end
 
   defmodule MessageThrown do

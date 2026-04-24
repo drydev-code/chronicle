@@ -1,10 +1,17 @@
 defmodule Chronicle.Engine.TokenProcessorBpmnFeaturesTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias Chronicle.Engine.{PersistentData, Token, TokenProcessor}
   alias Chronicle.Engine.Diagrams.Definition
   alias Chronicle.Engine.Instance.TokenState
   alias Chronicle.Engine.Nodes
+
+  setup_all do
+    case Chronicle.Engine.Scripting.ScriptPool.start_link([]) do
+      {:ok, pid} -> Process.unlink(pid)
+      {:error, {:already_started, _pid}} -> :ok
+    end
+  end
 
   test "manual task is an explicit persisted no-op transition" do
     state =
@@ -20,6 +27,65 @@ defmodule Chronicle.Engine.TokenProcessorBpmnFeaturesTest do
 
     assert state.tokens[0].state == :move_to_next_node
     assert state.tokens[0].next_node == 2
+  end
+
+  test "standard loop activity uses post-test condition with max-iteration guard" do
+    state =
+      base_state(%{
+        1 => %Nodes.Tasks.ManualTask{
+          id: 1,
+          outputs: [2],
+          properties: %{
+            "loopCharacteristics" => %{
+              "condition" => "loopIteration < 5",
+              "maxIterations" => 3,
+              "testBefore" => false
+            }
+          }
+        },
+        2 => %Nodes.EndEvents.BlankEndEvent{id: 2}
+      })
+
+    state =
+      Enum.reduce(1..7, state, fn _, acc ->
+        TokenProcessor.process_active_tokens(acc)
+      end)
+
+    loop_events =
+      Enum.filter(state.persistent_events, &match?(%PersistentData.LoopConditionEvaluated{}, &1))
+
+    assert Enum.map(loop_events, & &1.iteration) == [1, 2, 3]
+    assert Enum.map(loop_events, & &1.continue) == [true, true, false]
+    assert List.last(loop_events).target_node == 2
+    assert state.tokens[0].current_node == 2
+  end
+
+  test "compensation throw starts registered completed activity handlers once" do
+    state =
+      base_state(%{
+        1 => %Nodes.Tasks.ManualTask{
+          id: 1,
+          outputs: [2],
+          boundary_events: [
+            %Nodes.BoundaryEvents.CompensationBoundary{id: 20, attached_to: 1, outputs: [50]}
+          ]
+        },
+        2 => %Nodes.IntermediateThrow.CompensationEvent{id: 2, outputs: [3]},
+        3 => %Nodes.EndEvents.BlankEndEvent{id: 3},
+        50 => %Nodes.Tasks.ManualTask{id: 50, outputs: [51]},
+        51 => %Nodes.EndEvents.BlankEndEvent{id: 51}
+      })
+
+    state =
+      Enum.reduce(1..4, state, fn _, acc ->
+        TokenProcessor.process_active_tokens(acc)
+      end)
+
+    assert Enum.any?(state.persistent_events, &match?(%PersistentData.CompensatableActivityCompleted{activity_node_id: 1, handler_node_id: 50}, &1))
+    assert Enum.any?(state.persistent_events, &match?(%PersistentData.CompensationRequested{}, &1))
+    assert Enum.any?(state.persistent_events, &match?(%PersistentData.CompensationHandlerStarted{handler_node_id: 50}, &1))
+    assert map_size(state.tokens) == 2
+    assert MapSet.member?(state.compensation_started, "0:1:0")
   end
 
   test "event-based gateway creates durable waits for message and signal branches" do

@@ -26,10 +26,11 @@ defmodule Chronicle.Engine.Diagrams.DiagramStore do
     table = :ets.new(:diagram_store, [:named_table, :set, :public, read_concurrency: true])
     msg_table = :ets.new(:diagram_message_starts, [:named_table, :bag, :public, read_concurrency: true])
     sig_table = :ets.new(:diagram_signal_starts, [:named_table, :bag, :public, read_concurrency: true])
+    cond_table = :ets.new(:diagram_conditional_starts, [:named_table, :bag, :public, read_concurrency: true])
 
     rehydrate_from_db()
 
-    {:ok, %{table: table, msg_table: msg_table, sig_table: sig_table}}
+    {:ok, %{table: table, msg_table: msg_table, sig_table: sig_table, cond_table: cond_table}}
   end
 
   def register(name, version, tenant, definition, raw_content \\ nil) do
@@ -71,6 +72,17 @@ defmodule Chronicle.Engine.Diagrams.DiagramStore do
     |> Enum.map(fn {_, process_name} -> process_name end)
   end
 
+  def get_definitions_with_conditional_starts(tenant) do
+    :ets.lookup(:diagram_conditional_starts, tenant)
+    |> Enum.flat_map(fn {_, {name, version}} ->
+      case get(name, version, tenant) do
+        {:ok, definition} -> [definition]
+        _ -> []
+      end
+    end)
+    |> Enum.uniq_by(&{&1.name, &1.version, &1.tenant})
+  end
+
   @impl true
   def handle_call({:register, name, version, tenant, definition, raw_content}, _from, state) do
     # Persist first, populate ETS only after durable success. Reversed
@@ -104,6 +116,11 @@ defmodule Chronicle.Engine.Diagrams.DiagramStore do
 
     for sig_start <- Definition.get_signal_start_events(definition) do
       :ets.insert(:diagram_signal_starts, {{sig_start.signal, tenant}, name})
+    end
+
+    case Definition.get_conditional_start_events(definition) do
+      [] -> :ok
+      _ -> :ets.insert(:diagram_conditional_starts, {tenant, {name, version}})
     end
   end
 

@@ -10,6 +10,8 @@ defmodule Chronicle.Engine.Diagrams.Definition do
     nodes: %{non_neg_integer() => term()},
     connections: %{non_neg_integer() => [non_neg_integer()]},
     reverse_connections: %{non_neg_integer() => [non_neg_integer()]},
+    lanes: %{term() => map()},
+    node_lanes: %{non_neg_integer() => term()},
     recursive_connections: MapSet.t(),
     start_events: [non_neg_integer()],
     merging_gateways: [non_neg_integer()]
@@ -22,6 +24,8 @@ defmodule Chronicle.Engine.Diagrams.Definition do
     nodes: %{},
     connections: %{},
     reverse_connections: %{},
+    lanes: %{},
+    node_lanes: %{},
     recursive_connections: MapSet.new(),
     start_events: [],
     merging_gateways: []
@@ -63,6 +67,13 @@ defmodule Chronicle.Engine.Diagrams.Definition do
   def get_timer_start_events(%__MODULE__{nodes: nodes, start_events: starts}) do
     Enum.filter(starts, fn id ->
       match?(%Chronicle.Engine.Nodes.StartEvents.TimerStartEvent{}, Map.get(nodes, id))
+    end)
+    |> Enum.map(&Map.get(nodes, &1))
+  end
+
+  def get_conditional_start_events(%__MODULE__{nodes: nodes, start_events: starts}) do
+    Enum.filter(starts, fn id ->
+      match?(%Chronicle.Engine.Nodes.StartEvents.ConditionalStartEvent{}, Map.get(nodes, id))
     end)
     |> Enum.map(&Map.get(nodes, &1))
   end
