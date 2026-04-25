@@ -1,0 +1,14 @@
+{
+  "name": "example-call-activity-child",
+  "version": 1,
+  "tenant": "examples",
+  "nodes": [
+    {"id": 1, "key": "start", "type": "blankStartEvent"},
+    {"id": 2, "key": "child_work", "type": "manualTask"},
+    {"id": 3, "key": "child_done", "type": "blankEndEvent"}
+  ],
+  "connections": [
+    {"from": 1, "to": 2},
+    {"from": 2, "to": 3}
+  ]
+}

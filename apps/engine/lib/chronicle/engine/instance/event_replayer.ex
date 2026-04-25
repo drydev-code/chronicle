@@ -476,6 +476,7 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
         event.interrupting != false ->
           acc
           |> delete_boundary_wait(event)
+          |> delete_token_wait_handles(event.token)
           |> Map.put(:token_wait_states, Map.delete(acc.token_wait_states, event.token))
 
         event.boundary_type == :timer ->
@@ -673,6 +674,20 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
   end
 
   # --- Helpers ---
+
+  defp delete_token_wait_handles(acc, token_id) do
+    %{
+      acc
+      | open_external_tasks: reject_waits_for_token(acc.open_external_tasks, token_id),
+        open_call_waits: reject_waits_for_token(acc.open_call_waits, token_id)
+    }
+  end
+
+  defp reject_waits_for_token(waits, token_id) do
+    waits
+    |> Enum.reject(fn {_wait_id, owner_token_id} -> owner_token_id == token_id end)
+    |> Map.new()
+  end
 
   defp replay_call_resolution(event, acc) do
     state = acc.state

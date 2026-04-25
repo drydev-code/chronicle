@@ -1,6 +1,7 @@
 defmodule Chronicle.Server.Host.ExternalTasks.ServiceTask do
   @moduledoc "Template render + publish to bus for service tasks."
   alias Chronicle.Server.Host.ExternalTasks.Template
+  alias Chronicle.Server.Host.ExternalTasks.BuiltInExecutor
   alias Chronicle.Server.Host.VendorExtensions.ServiceTaskExtension
   alias Chronicle.Server.Host.LargeVariables
 
@@ -58,7 +59,13 @@ defmodule Chronicle.Server.Host.ExternalTasks.ServiceTask do
       tenant_id: event.tenant_id
     }
 
-    Chronicle.Server.Messaging.ServiceTaskPublisher.publish(service_task_event)
+    if BuiltInExecutor.supported?(extension) do
+      event
+      |> Map.put(:payload, payload)
+      |> BuiltInExecutor.execute_async(extension)
+    else
+      Chronicle.Server.Messaging.ServiceTaskPublisher.publish(service_task_event)
+    end
   end
 
   defp send_error_to_instance(event, reason) do

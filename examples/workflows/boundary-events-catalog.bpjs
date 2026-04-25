@@ -1,0 +1,37 @@
+{
+  "name": "example-boundary-events-catalog",
+  "version": 1,
+  "tenant": "examples",
+  "nodes": [
+    {"id": 1, "key": "start", "type": "blankStartEvent"},
+    {"id": 2, "key": "wait_for_work", "type": "externalTask", "kind": "service", "errorBehaviour": "fail"},
+    {"id": 3, "key": "done", "type": "blankEndEvent"},
+    {"id": 20, "key": "timeout", "type": "timerBoundaryEvent", "activity": 2, "timer": {"durationMs": 60000}},
+    {"id": 21, "key": "cancel_message", "type": "messageBoundaryEvent", "activity": 2, "message": {"name": "boundary.cancel"}},
+    {"id": 22, "key": "cancel_signal", "type": "signalBoundaryEvent", "activity": 2, "signal": "boundary.abort"},
+    {"id": 23, "key": "error_boundary", "type": "errorBoundaryEvent", "activity": 2},
+    {"id": 24, "key": "escalation_boundary", "type": "escalationBoundaryEvent", "activity": 2, "escalation": "manager"},
+    {"id": 25, "key": "condition_boundary", "type": "conditionalBoundaryEvent", "activity": 2, "condition": "cancel === true"},
+    {"id": 26, "key": "compensation_boundary", "type": "compensationBoundaryEvent", "activity": 2},
+    {"id": 30, "key": "timer_note", "type": "blankEndEvent"},
+    {"id": 31, "key": "message_note", "type": "blankEndEvent"},
+    {"id": 32, "key": "signal_note", "type": "blankEndEvent"},
+    {"id": 33, "key": "error_note", "type": "blankEndEvent"},
+    {"id": 34, "key": "escalation_note", "type": "blankEndEvent"},
+    {"id": 35, "key": "condition_note", "type": "blankEndEvent"},
+    {"id": 36, "key": "compensation_handler", "type": "manualTask"},
+    {"id": 37, "key": "compensation_note", "type": "blankEndEvent"}
+  ],
+  "connections": [
+    {"from": 1, "to": 2},
+    {"from": 2, "to": 3},
+    {"from": 20, "to": 30},
+    {"from": 21, "to": 31},
+    {"from": 22, "to": 32},
+    {"from": 23, "to": 33},
+    {"from": 24, "to": 34},
+    {"from": 25, "to": 35},
+    {"from": 26, "to": 36},
+    {"from": 36, "to": 37}
+  ]
+}

@@ -90,6 +90,11 @@ defmodule Chronicle.Server.Host.ExternalTaskRouter do
       properties: node_properties
     }
 
+    # Track task before dispatching. Built-in executors can complete quickly,
+    # so completion routing must be ready before the handler runs.
+    Logger.info("ExternalTaskRouter: registered task #{task_id} -> instance #{instance_id} (tenant #{tenant_id})")
+    state = %{state | tasks: Map.put(state.tasks, task_id, {tenant_id, instance_id})}
+
     try do
       Handler.handle_external_task(event)
     rescue
@@ -97,10 +102,7 @@ defmodule Chronicle.Server.Host.ExternalTaskRouter do
         Logger.error("ExternalTaskRouter: failed to handle task #{task_id}: #{inspect(e)}")
     end
 
-    # Track task for routing completions back
-    Logger.info("ExternalTaskRouter: registered task #{task_id} -> instance #{instance_id} (tenant #{tenant_id})")
-    tasks = Map.put(state.tasks, task_id, {tenant_id, instance_id})
-    {:noreply, %{state | tasks: tasks}}
+    {:noreply, state}
   end
 
   # -- Inbound: AMQP response → route to Instance --

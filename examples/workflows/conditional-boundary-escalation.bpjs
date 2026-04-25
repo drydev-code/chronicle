@@ -1,0 +1,17 @@
+{
+  "name": "example-conditional-boundary-escalation",
+  "version": 1,
+  "tenant": "examples",
+  "nodes": [
+    {"id": 1, "key": "start", "type": "blankStartEvent"},
+    {"id": 2, "key": "wait_for_work", "type": "externalTask", "kind": "service", "errorBehaviour": "retry"},
+    {"id": 3, "key": "work_done", "type": "blankEndEvent"},
+    {"id": 30, "key": "escalate_when_blocked", "type": "conditionalBoundaryEvent", "activity": 2, "condition": "blocked === true"},
+    {"id": 31, "key": "escalated", "type": "blankEndEvent"}
+  ],
+  "connections": [
+    {"from": 1, "to": 2},
+    {"from": 2, "to": 3},
+    {"from": 30, "to": 31}
+  ]
+}

@@ -173,7 +173,9 @@ defmodule Chronicle.Engine.Instance.TokenState do
         state
 
       {_token, true} ->
-        interrupt_token(state, token_id, boundary_node_id)
+        state
+        |> remove_token_wait_handles(token_id)
+        |> interrupt_token(token_id, boundary_node_id)
 
       {token, false} ->
         new_token_id = state.next_token_id
@@ -187,6 +189,21 @@ defmodule Chronicle.Engine.Instance.TokenState do
           pin_reason: :active_token
         }
     end
+  end
+
+  defp remove_token_wait_handles(state, token_id) do
+    %{
+      state
+      | external_tasks: reject_waits_for_token(state.external_tasks, token_id),
+        call_wait_list: reject_waits_for_token(state.call_wait_list, token_id),
+        script_waits: reject_waits_for_token(state.script_waits, token_id)
+    }
+  end
+
+  defp reject_waits_for_token(waits, token_id) do
+    waits
+    |> Enum.reject(fn {_wait_id, owner_token_id} -> owner_token_id == token_id end)
+    |> Map.new()
   end
 
   @doc """

@@ -18,6 +18,7 @@ RUN mix deps.get
 RUN mix deps.compile
 
 # Copy application sources
+COPY examples examples
 COPY apps apps
 
 RUN mix compile

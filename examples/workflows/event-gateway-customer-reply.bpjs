@@ -1,0 +1,26 @@
+{
+  "name": "example-event-gateway-customer-reply",
+  "version": 1,
+  "tenant": "examples",
+  "nodes": [
+    {"id": 1, "key": "start", "type": "blankStartEvent"},
+    {"id": 2, "key": "wait_for_customer", "type": "eventBasedGateway"},
+    {"id": 3, "key": "customer_replied", "type": "receiveTask", "message": {"name": "customer.reply"}},
+    {"id": 4, "key": "customer_cancelled", "type": "intermediateCatchSignalEvent", "signal": "customer.cancelled"},
+    {"id": 8, "key": "customer_timeout", "type": "intermediateCatchTimerEvent", "timer": {"durationMs": 60000}},
+    {"id": 5, "key": "continue_after_reply", "type": "manualTask"},
+    {"id": 6, "key": "reply_done", "type": "blankEndEvent"},
+    {"id": 7, "key": "cancelled", "type": "terminationEndEvent", "reason": "Customer cancelled"},
+    {"id": 9, "key": "timed_out", "type": "blankEndEvent"}
+  ],
+  "connections": [
+    {"from": 1, "to": 2},
+    {"from": 2, "to": 3},
+    {"from": 2, "to": 4},
+    {"from": 2, "to": 8},
+    {"from": 3, "to": 5},
+    {"from": 4, "to": 7},
+    {"from": 8, "to": 9},
+    {"from": 5, "to": 6}
+  ]
+}

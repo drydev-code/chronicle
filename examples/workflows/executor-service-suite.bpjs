@@ -1,0 +1,77 @@
+{
+  "name": "example-executor-service-suite",
+  "version": 1,
+  "tenant": "examples",
+  "nodes": [
+    {"id": 1, "key": "start", "type": "blankStartEvent"},
+    {
+      "id": 2,
+      "key": "derive_request",
+      "type": "externalTask",
+      "kind": "service",
+      "resultVariable": "request",
+      "properties": {
+        "topic": "transform",
+        "body": "{\"customerId\":\"{{customerId}}\",\"limit\":{{limit}}}"
+      }
+    },
+    {
+      "id": 3,
+      "key": "load_customer",
+      "type": "externalTask",
+      "kind": "service",
+      "resultVariable": "customer",
+      "properties": {
+        "topic": "database",
+        "extensions": {
+          "query": "select ? as customer_id",
+          "params": "[\"{{customerId}}\"]",
+          "resultMode": "first"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "key": "call_rest_service",
+      "type": "externalTask",
+      "kind": "service",
+      "resultVariable": "quote",
+      "properties": {
+        "topic": "rest",
+        "method": "POST",
+        "endpoint": "https://example.invalid/quote",
+        "body": "{\"customerId\":\"{{customerId}}\",\"limit\":{{limit}}}",
+        "extensions": {
+          "resultMode": "body",
+          "resultPath": "data.quote",
+          "timeoutMs": 5000
+        }
+      }
+    },
+    {
+      "id": 5,
+      "key": "summarize_with_ai",
+      "type": "externalTask",
+      "kind": "service",
+      "resultVariable": "summary",
+      "properties": {
+        "topic": "ai",
+        "endpoint": "https://example.invalid/ai",
+        "extensions": {
+          "model": "example-model",
+          "prompt": "Summarize customer {{customerId}} with limit {{limit}}",
+          "resultMode": "body",
+          "resultPath": "output.text"
+        }
+      }
+    },
+    {"id": 6, "key": "done", "type": "blankEndEvent", "exportAll": true}
+  ],
+  "connections": [
+    {"from": 1, "to": 2},
+    {"from": 2, "to": 3},
+    {"from": 3, "to": 4},
+    {"from": 4, "to": 5},
+    {"from": 5, "to": 6}
+  ]
+}

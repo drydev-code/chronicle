@@ -189,6 +189,7 @@ defmodule Chronicle.Engine.PersistentData do
     type = module |> Module.split() |> List.last()
     data
     |> Map.from_struct()
+    |> normalize_for_json()
     |> Map.put(:type, type)
   end
 
@@ -206,4 +207,20 @@ defmodule Chronicle.Engine.PersistentData do
     end)
     |> Map.delete(:__skip__)
   end
+
+  defp normalize_for_json(%{__struct__: module} = data) do
+    type = module |> Module.split() |> List.last()
+
+    data
+    |> Map.from_struct()
+    |> normalize_for_json()
+    |> Map.put(:type, type)
+  end
+
+  defp normalize_for_json(map) when is_map(map) do
+    Map.new(map, fn {key, value} -> {key, normalize_for_json(value)} end)
+  end
+
+  defp normalize_for_json(list) when is_list(list), do: Enum.map(list, &normalize_for_json/1)
+  defp normalize_for_json(value), do: value
 end

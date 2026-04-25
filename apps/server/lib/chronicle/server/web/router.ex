@@ -37,6 +37,11 @@ defmodule Chronicle.Server.Web.Router do
     post "/process-instance", ProcessInstanceController, :start
     post "/process-instance/conditional-starts", ProcessInstanceController, :evaluate_conditional_starts
     post "/process-instance/:id/variables", ProcessInstanceController, :update_variables
+    post "/external-tasks/:task_id/complete", ExternalTaskController, :complete
+    post "/external-tasks/:task_id/fail", ExternalTaskController, :fail
+    post "/external-tasks/:task_id/cancel", ExternalTaskController, :cancel
+    post "/user-tasks/:task_id/execute", ExternalTaskController, :execute_user_task
+    post "/user-tasks/:task_id/reject", ExternalTaskController, :reject_user_task
 
     # Deployment (non-destructive)
     post "/deployment/redeploy", DeploymentController, :redeploy

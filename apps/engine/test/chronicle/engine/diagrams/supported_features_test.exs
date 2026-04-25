@@ -88,7 +88,7 @@ defmodule Chronicle.Engine.Diagrams.SupportedFeaturesTest do
     assert reason =~ "require a condition"
   end
 
-  test "parser rejects embedded SubProcess alias rather than treating it as callActivity" do
+  test "SubProcess parses as callActivity compatibility node" do
     bpjs = %{
       "name" => "unsupported-subprocess",
       "version" => 1,
@@ -99,10 +99,8 @@ defmodule Chronicle.Engine.Diagrams.SupportedFeaturesTest do
       "connections" => [%{"from" => 1, "to" => 2}]
     }
 
-    assert {:error, {:unsupported_node_type, "SubProcess", reason}} =
-             Parser.parse(Jason.encode!(bpjs))
-
-    assert reason =~ "Embedded subprocess"
+    assert {:ok, definition} = Parser.parse(Jason.encode!(bpjs))
+    assert %Chronicle.Engine.Nodes.CallActivity{as_async_call: false} = definition.nodes[2]
   end
 
   test "boundary nodes are attached to their target activity as parsed structs" do

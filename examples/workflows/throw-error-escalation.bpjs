@@ -1,0 +1,15 @@
+{
+  "name": "example-throw-error-escalation",
+  "version": 1,
+  "tenant": "examples",
+  "nodes": [
+    {"id": 1, "key": "start", "type": "blankStartEvent"},
+    {"id": 2, "key": "throw_error", "type": "intermediateThrowErrorEvent", "errorMessage": "thrown error", "errorObject": {"code": "THROWN"}},
+    {"id": 10, "key": "escalation_start", "type": "blankStartEvent"},
+    {"id": 11, "key": "throw_escalation", "type": "intermediateThrowEscalationEvent", "escalation": "manager"}
+  ],
+  "connections": [
+    {"from": 1, "to": 2},
+    {"from": 10, "to": 11}
+  ]
+}

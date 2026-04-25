@@ -1,0 +1,42 @@
+{
+  "name": "example-service-user-approval",
+  "version": 1,
+  "tenant": "examples",
+  "lanes": [
+    {
+      "id": "automation",
+      "name": "Automation",
+      "actorType": "service-worker",
+      "nodes": [2]
+    },
+    {
+      "id": "operations",
+      "name": "Operations",
+      "actorType": "ops-user",
+      "nodes": [3]
+    }
+  ],
+  "nodes": [
+    {"id": 1, "key": "start", "type": "blankStartEvent"},
+    {"id": 2, "key": "price_order", "type": "externalTask", "kind": "service", "resultVariable": "pricing"},
+    {"id": 3, "key": "approve_order", "type": "userTask", "resultVariable": "approval"},
+    {
+      "id": 4,
+      "key": "approval_decision",
+      "type": "exclusiveGateway",
+      "defaultPath": 6,
+      "expressions": {
+        "5": "approval && approval.approved === true && pricing && pricing.total <= approval.limit"
+      }
+    },
+    {"id": 5, "key": "approved", "type": "blankEndEvent"},
+    {"id": 6, "key": "rejected", "type": "blankEndEvent"}
+  ],
+  "connections": [
+    {"from": 1, "to": 2},
+    {"from": 2, "to": 3},
+    {"from": 3, "to": 4},
+    {"from": 4, "to": 5},
+    {"from": 4, "to": 6}
+  ]
+}

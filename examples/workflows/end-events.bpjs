@@ -1,0 +1,27 @@
+{
+  "name": "example-end-events",
+  "version": 1,
+  "tenant": "examples",
+  "nodes": [
+    {"id": 1, "key": "blank_start", "type": "blankStartEvent"},
+    {"id": 2, "key": "blank_end", "type": "blankEndEvent"},
+    {"id": 10, "key": "error_start", "type": "blankStartEvent"},
+    {"id": 11, "key": "error_end", "type": "errorEndEvent", "errorMessage": "example-error", "errorObject": {"code": "E_EXAMPLE"}},
+    {"id": 20, "key": "signal_start", "type": "blankStartEvent"},
+    {"id": 21, "key": "signal_end", "type": "signalEndEvent", "signal": "done.signal"},
+    {"id": 30, "key": "escalation_start", "type": "blankStartEvent"},
+    {"id": 31, "key": "escalation_end", "type": "escalationEndEvent", "escalation": "manager"},
+    {"id": 40, "key": "termination_start", "type": "blankStartEvent"},
+    {"id": 41, "key": "termination_end", "type": "terminationEndEvent", "reason": "example termination"},
+    {"id": 50, "key": "compensation_start", "type": "blankStartEvent"},
+    {"id": 51, "key": "compensation_end", "type": "compensationEndEvent"}
+  ],
+  "connections": [
+    {"from": 1, "to": 2},
+    {"from": 10, "to": 11},
+    {"from": 20, "to": 21},
+    {"from": 30, "to": 31},
+    {"from": 40, "to": 41},
+    {"from": 50, "to": 51}
+  ]
+}

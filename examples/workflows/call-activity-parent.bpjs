@@ -1,0 +1,14 @@
+{
+  "name": "example-call-activity-parent",
+  "version": 1,
+  "tenant": "examples",
+  "nodes": [
+    {"id": 1, "key": "start", "type": "blankStartEvent"},
+    {"id": 2, "key": "call_child", "type": "callActivity", "processName": {"name": "example-call-activity-child"}, "keepBusinessKey": true},
+    {"id": 3, "key": "done", "type": "blankEndEvent"}
+  ],
+  "connections": [
+    {"from": 1, "to": 2},
+    {"from": 2, "to": 3}
+  ]
+}

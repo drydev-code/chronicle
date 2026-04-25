@@ -16,7 +16,7 @@ defmodule Chronicle.Server.Host.VendorExtensions do
         on_exception: Map.get(props, "onException"),
         retries: Map.get(props, "retries", 0),
         method: parse_method(Map.get(props, "method", "Post")),
-        body: Map.get(props, "body"),
+        body: Map.get(props, "body") || Map.get(props, "requestBody"),
         actor_type: Map.get(props, "actorType", "Actor"),
         extensions: Map.get(props, "extensions", %{})
       }
@@ -34,6 +34,7 @@ defmodule Chronicle.Server.Host.VendorExtensions do
         "POST" -> :post
         "PUT" -> :put
         "DELETE" -> :delete
+        "PATCH" -> :patch
         _ -> :post
       end
     end

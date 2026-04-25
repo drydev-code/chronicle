@@ -1,0 +1,22 @@
+{
+  "name": "example-script-rules-and-throws",
+  "version": 1,
+  "tenant": "examples",
+  "nodes": [
+    {"id": 1, "key": "start", "type": "blankStartEvent"},
+    {"id": 2, "key": "prepare_inputs", "type": "scriptTask", "script": "return { amount: 75, payload: { status: 'prepared' }, messageName: 'audit.prepared' };"},
+    {"id": 3, "key": "classify_risk", "type": "rulesTask", "dmnName": "example-risk-rules", "returnVariable": "risk"},
+    {"id": 4, "key": "send_audit", "type": "sendTask", "message": {"name": "audit.sent", "payloadVariableName": "payload"}},
+    {"id": 5, "key": "throw_message", "type": "intermediateThrowMessageEvent", "message": {"name": "audit.thrown", "payloadVariableName": "payload"}},
+    {"id": 6, "key": "throw_signal", "type": "intermediateThrowSignalEvent", "signal": "audit.signal"},
+    {"id": 7, "key": "message_end", "type": "messageEndEvent", "message": {"name": "audit.finished", "payloadVariableName": "payload"}}
+  ],
+  "connections": [
+    {"from": 1, "to": 2},
+    {"from": 2, "to": 3},
+    {"from": 3, "to": 4},
+    {"from": 4, "to": 5},
+    {"from": 5, "to": 6},
+    {"from": 6, "to": 7}
+  ]
+}

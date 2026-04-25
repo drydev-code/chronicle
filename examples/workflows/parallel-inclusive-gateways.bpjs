@@ -1,0 +1,39 @@
+{
+  "name": "example-parallel-inclusive-gateways",
+  "version": 1,
+  "tenant": "examples",
+  "nodes": [
+    {"id": 1, "key": "start", "type": "blankStartEvent"},
+    {"id": 2, "key": "parallel_split", "type": "parallelGateway"},
+    {"id": 3, "key": "left_parallel", "type": "manualTask"},
+    {"id": 4, "key": "right_parallel", "type": "manualTask"},
+    {"id": 5, "key": "parallel_join", "type": "parallelGateway", "isMerging": true},
+    {
+      "id": 6,
+      "key": "inclusive_split",
+      "type": "inclusiveGateway",
+      "expressions": {
+        "7": "takeA === true",
+        "8": "takeB === true"
+      },
+      "defaultPath": 7
+    },
+    {"id": 7, "key": "inclusive_a", "type": "manualTask"},
+    {"id": 8, "key": "inclusive_b", "type": "manualTask"},
+    {"id": 9, "key": "inclusive_join", "type": "inclusiveGateway", "isMerging": true},
+    {"id": 10, "key": "done", "type": "blankEndEvent"}
+  ],
+  "connections": [
+    {"from": 1, "to": 2},
+    {"from": 2, "to": 3},
+    {"from": 2, "to": 4},
+    {"from": 3, "to": 5},
+    {"from": 4, "to": 5},
+    {"from": 5, "to": 6},
+    {"from": 6, "to": 7},
+    {"from": 6, "to": 8},
+    {"from": 7, "to": 9},
+    {"from": 8, "to": 9},
+    {"from": 9, "to": 10}
+  ]
+}

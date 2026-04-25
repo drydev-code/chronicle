@@ -29,7 +29,8 @@ supervision tree. Run `:server` when you want a batteries-included service.
 - **Rules tasks** — DMN 1.3 decision tables.
 - **Call activities** — sync/async child processes with sequential collection
   loops.
-- **External tasks** — service and user task fan-out via AMQP.
+- **External tasks** — service and user task fan-out via AMQP, plus built-in
+  execution for common service-task topics.
 - **Process versioning** with `collection@version!tenant/name`.
 - **Multi-tenancy** — registry keyed by `{tenant, instance_id}`.
 - **Multi-DB** — MySQL, PostgreSQL, MS SQL Server adapters (runtime select).
@@ -41,15 +42,18 @@ The engine executes BPJS JSON diagrams and intentionally does not parse native
 BPMN XML in this release:
 
 - `.bpjs` — JSON diagram format (accepts PascalCase and camelCase keys).
+- Chronicle JSON: top-level `Name` / `Version` / `Resources` /
+  `Processes` diagrams are accepted for the supported Chronicle subset.
 - `.bpmn`: rejected with an unsupported-format error; XML parsing is out of scope for this release.
 
 Supported BPJS node types are declared in
 `Chronicle.Engine.Diagrams.SupportedFeatures`. Lane metadata is supported only
 for resolving `actorType` on service/user task publications. Unsupported BPMN
 features such as collaborations, pools, participants, message flows,
-embedded/event/transaction subprocesses, complex gateways, cancel/multiple
-events, and standard multi-instance loop characteristics fail during parsing
-instead of silently falling through.
+event/transaction subprocesses, complex gateways, cancel/multiple events, and
+standard multi-instance loop characteristics fail during parsing instead of
+silently falling through. `SubProcess` nodes are treated as call activities to
+separate processes, not as embedded BPMN subprocess scopes.
 
 Event-based gateways are limited to supported message, signal, receive-task,
 and timer branches; unsupported outgoing branches are rejected. Intermediate
@@ -79,6 +83,49 @@ multi-instance characteristics remain out of scope.
 
 Diagram files are shipped inside ZIP deployment packages alongside
 `.dmn` decision tables.
+
+## Service and user task execution
+
+Service tasks remain durable external tasks, but the server can now execute
+common service topics without a separate AMQP worker. Built-in executors are
+registered as plugins under `Chronicle.Server.Host.ExternalTasks.Executors`,
+and the list can be replaced with `config :server, :service_task_executors,
+[MyExecutor]`.
+
+Chronicle service extensions use the `Chronicle.*` prefix.
+
+- `topic: "rest"`, `"http"`, or `"https"` performs an outbound HTTP request
+  from the task `endpoint`, `method`, `body`, and optional
+  `extensions.headers` / `extensions.timeoutMs`.
+- `topic: "database"`, `"db"`, or `"sql"` runs `extensions.query` against the
+  configured Chronicle repo with optional `extensions.params`. SQL tasks are
+  read-only by default; set `extensions.allowWrite: true` to permit writes.
+- `topic: "ai"` or `"llm"` is treated as a REST-backed AI call and requires an
+  `endpoint`.
+- `topic: "email"` or `"mail"` validates and normalizes an email command
+  payload.
+- `topic: "transform"`, `"echo"`, or `"map"` renders a local template/JSON
+  payload without leaving Chronicle.
+
+Other topics are still published as `ServiceTaskExecutionRequestedEvent` for
+external workers. Human tasks are not executed by the engine; complete or
+reject them through the REST command endpoints:
+
+- `POST /api/user-tasks/:task_id/execute`
+- `POST /api/user-tasks/:task_id/reject`
+
+Generic service task command endpoints are also available:
+
+- `POST /api/external-tasks/:task_id/complete`
+- `POST /api/external-tasks/:task_id/fail`
+- `POST /api/external-tasks/:task_id/cancel`
+
+Chronicle-format parser compatibility can be checked with:
+
+```bash
+CHRONICLE_TEST_DIAGRAMS=/path/to/diagrams \
+  mix run --no-start ../../scripts/parse_chronicle_diagrams.exs
+```
 
 ## Quick start (docker)
 

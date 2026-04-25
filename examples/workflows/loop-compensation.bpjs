@@ -1,0 +1,30 @@
+{
+  "name": "example-loop-compensation",
+  "version": 1,
+  "tenant": "examples",
+  "nodes": [
+    {"id": 1, "key": "start", "type": "blankStartEvent"},
+    {
+      "id": 2,
+      "key": "reserve_inventory",
+      "type": "manualTask",
+      "standardLoop": {
+        "condition": "loopIteration < 5",
+        "maxIterations": 2,
+        "testBefore": false
+      }
+    },
+    {"id": 3, "key": "request_compensation", "type": "intermediateThrowCompensationEvent"},
+    {"id": 4, "key": "main_done", "type": "blankEndEvent"},
+    {"id": 20, "key": "inventory_compensation", "type": "compensationBoundaryEvent", "activity": 2},
+    {"id": 21, "key": "release_inventory", "type": "manualTask"},
+    {"id": 22, "key": "compensation_done", "type": "blankEndEvent"}
+  ],
+  "connections": [
+    {"from": 1, "to": 2},
+    {"from": 2, "to": 3},
+    {"from": 3, "to": 4},
+    {"from": 20, "to": 21},
+    {"from": 21, "to": 22}
+  ]
+}

@@ -1,0 +1,37 @@
+{
+  "name": "example-executor-error-handling",
+  "version": 1,
+  "tenant": "examples",
+  "nodes": [
+    {"id": 1, "key": "start", "type": "blankStartEvent"},
+    {
+      "id": 2,
+      "key": "call_unstable_rest_service",
+      "type": "externalTask",
+      "kind": "service",
+      "errorBehaviour": "fail",
+      "properties": {
+        "topic": "rest",
+        "method": "GET",
+        "endpoint": "https://example.invalid/fails",
+        "extensions": {
+          "failOnStatus": true,
+          "resultMode": "body"
+        }
+      }
+    },
+    {
+      "id": 20,
+      "key": "rest_error_boundary",
+      "type": "errorBoundaryEvent",
+      "attachedTo": 2
+    },
+    {"id": 3, "key": "success", "type": "blankEndEvent"},
+    {"id": 4, "key": "handled_error", "type": "blankEndEvent"}
+  ],
+  "connections": [
+    {"from": 1, "to": 2},
+    {"from": 2, "to": 3},
+    {"from": 20, "to": 4}
+  ]
+}

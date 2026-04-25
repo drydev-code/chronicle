@@ -1,0 +1,24 @@
+{
+  "name": "example-start-events",
+  "version": 1,
+  "tenant": "examples",
+  "nodes": [
+    {"id": 1, "key": "blank_start", "type": "blankStartEvent"},
+    {"id": 2, "key": "blank_done", "type": "blankEndEvent"},
+    {"id": 10, "key": "message_start", "type": "messageStartEvent", "message": {"name": "start.message"}},
+    {"id": 11, "key": "message_done", "type": "blankEndEvent"},
+    {"id": 20, "key": "signal_start", "type": "signalStartEvent", "signal": "start.signal"},
+    {"id": 21, "key": "signal_done", "type": "blankEndEvent"},
+    {"id": 30, "key": "timer_start", "type": "timerStartEvent", "timer": {"durationMs": 60000}},
+    {"id": 31, "key": "timer_done", "type": "blankEndEvent"},
+    {"id": 40, "key": "conditional_start", "type": "conditionalStartEvent", "condition": "startNow === true"},
+    {"id": 41, "key": "conditional_done", "type": "blankEndEvent"}
+  ],
+  "connections": [
+    {"from": 1, "to": 2},
+    {"from": 10, "to": 11},
+    {"from": 20, "to": 21},
+    {"from": 30, "to": 31},
+    {"from": 40, "to": 41}
+  ]
+}

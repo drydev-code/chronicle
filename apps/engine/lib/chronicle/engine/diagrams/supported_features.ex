@@ -23,7 +23,6 @@ defmodule Chronicle.Engine.Diagrams.SupportedFeatures do
   ))
 
   @unsupported_reasons %{
-    "subProcess" => "Embedded subprocess scopes are not implemented; use callActivity for a separate process.",
     "eventSubProcess" => "Event subprocesses are not implemented.",
     "transaction" => "Transaction subprocess and cancel semantics are not implemented.",
     "adHocSubProcess" => "Ad-hoc subprocesses are not implemented.",

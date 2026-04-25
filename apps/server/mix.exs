@@ -22,7 +22,7 @@ defmodule Chronicle.Server.MixProject do
   def application do
     [
       mod: {Chronicle.Server.Application, []},
-      extra_applications: [:logger, :runtime_tools]
+      extra_applications: [:logger, :runtime_tools, :inets, :ssl]
     ]
   end
 

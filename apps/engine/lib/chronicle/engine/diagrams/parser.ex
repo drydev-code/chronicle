@@ -30,6 +30,7 @@ defmodule Chronicle.Engine.Diagrams.Parser do
   defp do_parse_definition(data) do
     data = normalize_keys(data)
     reject_collaboration_shapes!(data)
+    resources = Map.get(data, "resources", %{})
     processes = Map.get(data, "processes", [data])
 
     definitions = Enum.map(processes, fn process ->
@@ -38,7 +39,7 @@ defmodule Chronicle.Engine.Diagrams.Parser do
       validate_unique_node_ids!(nodes_data)
 
       {lanes, node_lanes} = parse_lanes(Map.get(process, "lanes", []))
-      nodes = parse_nodes(nodes_data, lanes, node_lanes)
+      nodes = parse_nodes(nodes_data, lanes, node_lanes, resources)
       connections = parse_connections(Map.get(process, "connections", []))
       reverse_connections = build_reverse_connections(connections)
       start_events = find_start_events(nodes)
@@ -59,8 +60,8 @@ defmodule Chronicle.Engine.Diagrams.Parser do
 
       %Definition{
         name: Map.get(process, "name", "unknown"),
-        version: Map.get(process, "version"),
-        tenant: Map.get(process, "tenant"),
+        version: Map.get(process, "version") || Map.get(data, "version"),
+        tenant: Map.get(process, "tenant") || Map.get(data, "tenant"),
         nodes: nodes_with_outputs,
         connections: connections,
         reverse_connections: reverse_connections,
@@ -122,6 +123,10 @@ defmodule Chronicle.Engine.Diagrams.Parser do
   defp normalize_type("TerminateEndEvent"), do: "terminationEndEvent"
   defp normalize_type("XorGateway"), do: "exclusiveGateway"
   defp normalize_type("ServiceTask"), do: "externalTask"
+  defp normalize_type("ServiceTaskREST"), do: "externalTask"
+  defp normalize_type("ServiceTaskLLM"), do: "externalTask"
+  defp normalize_type("ServiceTaskEmail"), do: "externalTask"
+  defp normalize_type("ServiceTaskDB"), do: "externalTask"
   defp normalize_type("UserTask"), do: "userTask"
   defp normalize_type("FormStartEvent"), do: "blankStartEvent"
   defp normalize_type("ApiStartEvent"), do: "blankStartEvent"
@@ -138,10 +143,10 @@ defmodule Chronicle.Engine.Diagrams.Parser do
 
   # -- Node parsing --
 
-  defp parse_nodes(nodes_data, lanes, node_lanes) do
+  defp parse_nodes(nodes_data, lanes, node_lanes, resources) do
     Enum.into(nodes_data, %{}, fn node_data ->
       id = Map.get(node_data, "id")
-      node = parse_node(node_data)
+      node = parse_node(node_data, resources)
       node = apply_lane_actor_type(node, Map.get(lanes, Map.get(node_lanes, id)))
       {id, node}
     end)
@@ -200,16 +205,16 @@ defmodule Chronicle.Engine.Diagrams.Parser do
 
   defp apply_lane_actor_type(node, _lane), do: node
 
-  defp parse_node(%{"type" => original_type} = data) do
+  defp parse_node(%{"type" => original_type} = data, resources) do
     ensure_supported_original_type!(original_type)
     type = normalize_type(original_type)
     ensure_supported_node_type!(type)
 
     id = Map.get(data, "id")
     key = Map.get(data, "key")
-    properties = Map.get(data, "properties") || extract_extension_properties(data)
+    properties = build_properties(data, original_type)
     properties = maybe_put_loop_characteristics(properties, data)
-    base = %{id: id, key: key, properties: properties}
+    base = %{id: id, key: key, properties: properties, resources: resources, original_type: original_type}
 
     case type do
       t when t in ~w(blankStartEvent messageStartEvent signalStartEvent timerStartEvent conditionalStartEvent) ->
@@ -239,10 +244,6 @@ defmodule Chronicle.Engine.Diagrams.Parser do
       _ ->
         throw({:unsupported_node_type, type, "Node type is not in the Chronicle BPJS executable subset."})
     end
-  end
-
-  defp ensure_supported_original_type!("SubProcess") do
-    throw({:unsupported_node_type, "SubProcess", "Embedded subprocess scopes are not implemented; use callActivity for a separate process."})
   end
 
   defp ensure_supported_original_type!(type) do
@@ -395,7 +396,7 @@ defmodule Chronicle.Engine.Diagrams.Parser do
   defp parse_task_node("scriptTask", base, data) do
     %Nodes.ScriptTask{
       id: base.id, key: base.key,
-      script: Map.get(data, "script"),
+      script: build_script(data, base.resources),
       boundary_events: Map.get(data, "boundaryEvents", []),
       properties: base.properties
     }
@@ -405,12 +406,13 @@ defmodule Chronicle.Engine.Diagrams.Parser do
     kind = case Map.get(data, "kind") do
       "user" -> :user
       "service" -> :service
-      _ -> :service
+      _ ->
+        if base.original_type == "UserTask", do: :user, else: :service
     end
 
     %Nodes.ExternalTask{
       id: base.id, key: base.key, kind: kind,
-      result_variable: Map.get(data, "resultVariable"),
+      result_variable: external_task_result_variable(data, base.properties),
       error_behaviour: parse_error_behaviour(data),
       boundary_events: Map.get(data, "boundaryEvents", []),
       properties: base.properties
@@ -420,7 +422,7 @@ defmodule Chronicle.Engine.Diagrams.Parser do
   defp parse_task_node("userTask", base, data) do
     %Nodes.ExternalTask{
       id: base.id, key: base.key, kind: :user,
-      result_variable: Map.get(data, "resultVariable"),
+      result_variable: external_task_result_variable(data, base.properties),
       error_behaviour: parse_error_behaviour(data),
       boundary_events: Map.get(data, "boundaryEvents", []),
       properties: base.properties
@@ -514,7 +516,7 @@ defmodule Chronicle.Engine.Diagrams.Parser do
       id: base.id, key: base.key,
       process_name: process_name,
       keep_business_key: Map.get(data, "keepBusinessKey", false),
-      as_async_call: Map.get(data, "asAsyncCall", false),
+      as_async_call: if(base.original_type == "SubProcess", do: false, else: Map.get(data, "asAsyncCall", false)),
       sequential_loop: Map.get(data, "sequentialLoop", false),
       collection_name: Map.get(data, "collectionName"),
       element_name: Map.get(data, "elementName"),
@@ -929,6 +931,8 @@ defmodule Chronicle.Engine.Diagrams.Parser do
     case Map.get(data, "errorBehaviour") do
       "retry" -> :retry
       "ignore" -> :ignore
+      2 -> :retry
+      1 -> :ignore
       _ -> :fail
     end
   end
@@ -990,18 +994,213 @@ defmodule Chronicle.Engine.Diagrams.Parser do
 
   # -- Extension extraction --
 
+  defp build_properties(data, original_type) do
+    data
+    |> Map.get("properties", %{})
+    |> merge_properties(extract_extension_properties(data))
+    |> merge_properties(specialized_task_properties(original_type, data))
+  end
+
+  defp merge_properties(nil, right), do: right || %{}
+  defp merge_properties(left, nil), do: left || %{}
+  defp merge_properties(left, right) when is_map(left) and is_map(right), do: deep_merge_properties(left, right)
+  defp merge_properties(_left, right), do: right || %{}
+
+  defp deep_merge_properties(left, right) do
+    Map.merge(left, right, fn
+      "extensions", left_ext, right_ext when is_map(left_ext) and is_map(right_ext) ->
+        Map.merge(left_ext, right_ext)
+
+      _key, _left_value, right_value ->
+        right_value
+    end)
+  end
+
   defp extract_extension_properties(data) do
-    extensions = Map.get(data, "extensions", [])
+    extension_candidates(data)
+    |> Enum.reduce(%{}, fn extension, acc ->
+      case extension_properties(extension) do
+        props when is_map(props) -> Map.merge(acc, props)
+        _ -> acc
+      end
+    end)
+  end
 
-    ext =
-      Enum.find(extensions, fn e ->
-        name = Map.get(e, "name", "")
-        name == "RestTask" or name == "UserTask"
-      end)
+  defp extension_candidates(data) do
+    List.wrap(Map.get(data, "extensions", [])) ++ List.wrap(Map.get(data, "extension"))
+  end
 
-    case ext do
-      %{"data" => ext_data} when is_map(ext_data) -> ext_data
+  defp extension_properties(%{"key" => "__EditorData"}), do: %{}
+  defp extension_properties(%{"name" => name} = extension), do: named_extension_properties(name, extension)
+  defp extension_properties(%{"key" => key} = extension), do: named_extension_properties(key, extension)
+  defp extension_properties(%{"type" => type} = extension), do: named_extension_properties(type, extension)
+  defp extension_properties(extension) when is_map(extension), do: Map.get(extension, "data") || %{}
+  defp extension_properties(_), do: %{}
+
+  defp named_extension_properties(name, extension) do
+    name = normalize_extension_name(name)
+    data = Map.get(extension, "data") || Map.get(extension, "value") || %{}
+    data = decode_extension_data(data)
+
+    case name do
+      name when name in ["resttask", "servicetaskrest"] -> rest_properties(data)
+      name when name in ["llmtask", "aitask", "servicetaskllm"] -> ai_properties(data)
+      name when name in ["dbtask", "databasetask", "servicetaskdb"] -> db_properties(data)
+      name when name in ["emailtask", "servicetaskemail"] -> email_properties(data)
+      name when name in ["usertask"] -> user_task_properties(data)
       _ -> %{}
     end
   end
+
+  defp normalize_extension_name(name) when is_binary(name) do
+    name
+    |> String.trim()
+    |> String.replace_prefix("Chronicle.", "")
+    |> String.downcase()
+  end
+  defp normalize_extension_name(name), do: to_string(name) |> normalize_extension_name()
+
+  defp decode_extension_data(data) when is_binary(data) do
+    case Jason.decode(data) do
+      {:ok, decoded} -> normalize_keys(decoded)
+      {:error, _} -> %{"value" => data}
+    end
+  end
+  defp decode_extension_data(data) when is_map(data), do: normalize_keys(data)
+  defp decode_extension_data(data), do: data
+
+  defp specialized_task_properties(type, data) when type in ["ServiceTaskREST", "ServiceTaskLLM", "ServiceTaskEmail", "ServiceTaskDB"] do
+    properties = Map.get(data, "properties", %{})
+
+    case type do
+      "ServiceTaskREST" -> rest_properties(properties)
+      "ServiceTaskLLM" -> ai_properties(properties)
+      "ServiceTaskEmail" -> email_properties(properties)
+      "ServiceTaskDB" -> db_properties(properties)
+    end
+  end
+  defp specialized_task_properties("UserTask", data), do: user_task_properties(Map.get(data, "properties", %{}))
+  defp specialized_task_properties(_type, _data), do: %{}
+
+  defp rest_properties(data) do
+    %{
+      "topic" => "rest",
+      "endpoint" => Map.get(data, "endpoint") || Map.get(data, "endPoint"),
+      "method" => Map.get(data, "method"),
+      "body" => Map.get(data, "body") || Map.get(data, "requestBody"),
+      "extensions" => compact_map(%{
+        "headers" => Map.get(data, "headers"),
+        "bearerToken" => Map.get(data, "bearerToken"),
+        "apiKey" => Map.get(data, "apiKey"),
+        "resultMode" => Map.get(data, "resultMode") || "body",
+        "resultPath" => Map.get(data, "resultPath")
+      })
+    }
+    |> compact_map()
+  end
+
+  defp ai_properties(data) do
+    %{
+      "topic" => "ai",
+      "endpoint" => Map.get(data, "endpoint"),
+      "resultVariable" => Map.get(data, "resultVariable") || Map.get(data, "outputVariable"),
+      "extensions" => compact_map(%{
+        "model" => Map.get(data, "model"),
+        "prompt" => Map.get(data, "prompt") || Map.get(data, "userPrompt"),
+        "systemPrompt" => Map.get(data, "systemPrompt"),
+        "resultMode" => Map.get(data, "resultMode") || "body",
+        "resultPath" => Map.get(data, "resultPath")
+      })
+    }
+    |> compact_map()
+  end
+
+  defp db_properties(data) do
+    %{
+      "topic" => "database",
+      "resultVariable" => Map.get(data, "resultVariable"),
+      "extensions" => compact_map(%{
+        "connectionId" => Map.get(data, "connectionId"),
+        "queryType" => Map.get(data, "queryType"),
+        "query" => Map.get(data, "query"),
+        "params" => Map.get(data, "params") || Map.get(data, "parameters"),
+        "resultMode" => Map.get(data, "resultMode") || "result"
+      })
+    }
+    |> compact_map()
+  end
+
+  defp email_properties(data) do
+    %{
+      "topic" => "email",
+      "extensions" => compact_map(Map.take(data, ["fromEmail", "to", "cc", "bcc", "subject", "body", "isHtml", "attachments"]))
+    }
+    |> compact_map()
+  end
+
+  defp user_task_properties(data) do
+    %{
+      "view" => Map.get(data, "view"),
+      "assignments" => Map.get(data, "assignments"),
+      "subject" => Map.get(data, "subject") || Map.get(data, "formTitle"),
+      "configuration" => Map.get(data, "configuration") || Map.get(data, "formSchema"),
+      "actorType" => Map.get(data, "actorType")
+    }
+    |> compact_map()
+  end
+
+  defp compact_map(map) do
+    map
+    |> Enum.reject(fn {_k, v} -> v in [nil, "", %{}, []] end)
+    |> Map.new()
+  end
+
+  defp external_task_result_variable(data, properties) do
+    Map.get(data, "resultVariable") ||
+      Map.get(properties || %{}, "resultVariable") ||
+      Map.get(properties || %{}, "outputVariable")
+  end
+
+  defp build_script(data, resources) do
+    input_scripts = script_refs_to_source(Map.get(data, "inputScripts", []), resources)
+    main_script = script_ref_to_source(Map.get(data, "script"), resources)
+    output_scripts = script_refs_to_source(Map.get(data, "outputScripts", []), resources)
+
+    keep_all =
+      if Map.get(data, "exportAllToTokenContext") do
+        ["KeepAll();"]
+      else
+        []
+      end
+
+    (keep_all ++ input_scripts ++ List.wrap(main_script) ++ output_scripts)
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Enum.join("\n")
+  end
+
+  defp script_refs_to_source(refs, resources) when is_list(refs) do
+    Enum.map(refs, &script_ref_to_source(&1, resources))
+  end
+  defp script_refs_to_source(_refs, _resources), do: []
+
+  defp script_ref_to_source(nil, _resources), do: nil
+  defp script_ref_to_source(script, _resources) when is_binary(script), do: script
+  defp script_ref_to_source(ref, resources) do
+    resource = Map.get(resources, to_string(ref)) || Map.get(resources, ref)
+    resource_to_script(resource)
+  end
+
+  defp resource_to_script(nil), do: nil
+  defp resource_to_script(%{"source" => source, "returnVariable" => return_variable}) when is_binary(return_variable) and return_variable != "" do
+    source = String.trim_trailing(String.trim(source), ";")
+    "Set(\"#{return_variable}\", (#{source}));"
+  end
+  defp resource_to_script(%{"source" => source}) when is_binary(source), do: source
+  defp resource_to_script(%{"data" => data, "isBase64Data" => true}) when is_binary(data) do
+    case Base.decode64(data) do
+      {:ok, decoded} -> decoded
+      :error -> nil
+    end
+  end
+  defp resource_to_script(_), do: nil
 end

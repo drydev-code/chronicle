@@ -1,0 +1,25 @@
+{
+  "name": "example-intermediate-catches-and-link",
+  "version": 1,
+  "tenant": "examples",
+  "nodes": [
+    {"id": 1, "key": "start", "type": "blankStartEvent"},
+    {"id": 2, "key": "wait_timer", "type": "intermediateTimerEvent", "timer": {"durationMs": 60000}},
+    {"id": 3, "key": "wait_message", "type": "intermediateCatchMessageEvent", "message": {"name": "catch.message"}},
+    {"id": 4, "key": "wait_signal", "type": "intermediateCatchSignalEvent", "signal": "catch.signal"},
+    {"id": 5, "key": "wait_condition", "type": "intermediateCatchConditionalEvent", "condition": "ready === true"},
+    {"id": 6, "key": "throw_link", "type": "intermediateThrowLinkEvent", "linkName": "skip_to_here"},
+    {"id": 7, "key": "dead_path", "type": "manualTask"},
+    {"id": 8, "key": "catch_link", "type": "intermediateCatchLinkEvent", "linkName": "skip_to_here"},
+    {"id": 9, "key": "done", "type": "blankEndEvent"}
+  ],
+  "connections": [
+    {"from": 1, "to": 2},
+    {"from": 2, "to": 3},
+    {"from": 3, "to": 4},
+    {"from": 4, "to": 5},
+    {"from": 5, "to": 6},
+    {"from": 6, "to": 7},
+    {"from": 8, "to": 9}
+  ]
+}
