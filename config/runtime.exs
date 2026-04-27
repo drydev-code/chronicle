@@ -1,5 +1,71 @@
 import Config
 
+csv = fn value ->
+  value
+  |> to_string()
+  |> String.split(",", trim: true)
+  |> Enum.map(&String.trim/1)
+  |> Enum.reject(&(&1 == ""))
+end
+
+cert_pems = fn value ->
+  value
+  |> to_string()
+  |> String.split("-----END CERTIFICATE-----", trim: true)
+  |> Enum.map(&(&1 <> "-----END CERTIFICATE-----"))
+end
+
+config :server,
+       :connector_registry,
+       System.get_env(
+         "CONNECTOR_REGISTRY_JSON",
+         System.get_env("CHRONICLE_CONNECTOR_REGISTRY_JSON", "")
+       )
+
+signer_private_key_path =
+  System.get_env("AMQP_SIGNER_PRIVATE_KEY_PATH", System.get_env("AMQP_SIGNING_PRIVATE_KEY_PATH"))
+
+signer_certificate_path =
+  System.get_env("AMQP_SIGNER_CERTIFICATE_PATH", System.get_env("AMQP_SIGNING_CERTIFICATE_PATH"))
+
+trusted_certificate_paths =
+  System.get_env("AMQP_TRUSTED_CERTIFICATE_PATHS", "")
+  |> csv.()
+
+trusted_certificate_fingerprints =
+  System.get_env("AMQP_TRUSTED_CERTIFICATE_FINGERPRINTS", "")
+  |> csv.()
+
+config :server, :amqp_signing,
+  enabled: System.get_env("AMQP_SIGNING_ENABLED", "false") == "true",
+  require_signatures: System.get_env("AMQP_REQUIRE_SIGNATURES", "false") == "true",
+  private_key_path: signer_private_key_path,
+  certificate_path: signer_certificate_path,
+  signer: [
+    private_key_path: signer_private_key_path,
+    certificate_path: signer_certificate_path
+  ],
+  trust: [
+    certificate_paths: trusted_certificate_paths,
+    certificate_fingerprints: trusted_certificate_fingerprints
+  ],
+  trusted_certificate_paths: trusted_certificate_paths,
+  trusted_certificate_fingerprints: trusted_certificate_fingerprints,
+  trusted_certificates:
+    System.get_env("AMQP_TRUSTED_CERTIFICATES_PEM", "")
+    |> cert_pems.(),
+  validate_certificate_dates:
+    System.get_env("AMQP_VALIDATE_CERTIFICATE_DATES", "true") != "false",
+  certificate_expiry_warning_days:
+    System.get_env("AMQP_CERTIFICATE_EXPIRY_WARNING_DAYS", "30")
+    |> String.to_integer(),
+  require_signature_message_types:
+    System.get_env("AMQP_REQUIRE_SIGNATURE_MESSAGE_TYPES", "")
+    |> csv.(),
+  require_signature_directions:
+    System.get_env("AMQP_REQUIRE_SIGNATURE_DIRECTIONS", "")
+    |> csv.()
+
 if System.get_env("EVICTION_ENABLED") do
   eviction_max = System.get_env("EVICTION_MAX_RESIDENT")
   eviction_max_int = if eviction_max, do: String.to_integer(eviction_max), else: nil

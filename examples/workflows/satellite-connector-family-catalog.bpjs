@@ -1,0 +1,114 @@
+{
+  "name": "example-satellite-connector-family-catalog",
+  "version": 1,
+  "tenant": "examples",
+  "transport": {
+    "maxRetries": 5,
+    "backoff": "exponential-jitter",
+    "deadLetterScope": "connectorId"
+  },
+  "lease": {
+    "expectedRuntimeMs": 30000,
+    "heartbeatIntervalMs": 10000,
+    "warnAfterMs": 60000
+  },
+  "nodes": [
+    {"id": 1, "key": "start", "type": "blankStartEvent"},
+    {
+      "id": 2,
+      "key": "shape_payload",
+      "type": "externalTask",
+      "kind": "service",
+      "resultVariable": "payload",
+      "properties": {
+        "topic": "transform",
+        "connectorId": "transform-main",
+        "body": "{\"customerId\":\"{{customerId}}\",\"message\":\"{{message}}\"}"
+      }
+    },
+    {
+      "id": 3,
+      "key": "lookup_customer",
+      "type": "externalTask",
+      "kind": "service",
+      "resultVariable": "customer",
+      "properties": {
+        "topic": "database",
+        "connectorId": "database-main",
+        "extensions": {
+          "connectionId": "default",
+          "provider": {
+            "adapter": "sqlite",
+            "readOnly": true
+          },
+          "query": "select ? as customer_id",
+          "params": "[\"{{customerId}}\"]",
+          "resultMode": "first"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "key": "call_partner_api",
+      "type": "externalTask",
+      "kind": "service",
+      "resultVariable": "partner",
+      "properties": {
+        "topic": "rest",
+        "connectorId": "rest-main",
+        "method": "POST",
+        "endpoint": "http://satellite-mock:8080/rest/catalog",
+        "body": "{\"customerId\":\"{{customerId}}\",\"message\":\"{{message}}\"}",
+        "extensions": {
+          "auth": {"type": "api_key", "location": "header", "name": "x-api-key", "value": "satellite-key"},
+          "resultMode": "body",
+          "resultPath": "data.path"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "key": "summarize",
+      "type": "externalTask",
+      "kind": "service",
+      "resultVariable": "summary",
+      "properties": {
+        "topic": "ai",
+        "connectorId": "ai-main",
+        "endpoint": "http://satellite-mock:8080/ai/chat",
+        "extensions": {
+          "model": "mock-model",
+          "prompt": "Summarize {{message}} for {{customerId}}",
+          "resultMode": "body",
+          "resultPath": "text"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "key": "prepare_email",
+      "type": "externalTask",
+      "kind": "service",
+      "resultVariable": "email",
+      "properties": {
+        "topic": "email",
+        "connectorId": "email-main",
+        "extensions": {
+          "to": "ops@example.test",
+          "subject": "Connector catalog {{customerId}}",
+          "body": "Summary: {{summary}}",
+          "resultPath": "status"
+        }
+      }
+    },
+    {"id": 7, "key": "done", "type": "blankEndEvent", "exportAll": true}
+  ],
+  "connections": [
+    {"from": 1, "to": 2},
+    {"from": 2, "to": 3},
+    {"from": 3, "to": 4},
+    {"from": 4, "to": 5},
+    {"from": 5, "to": 6},
+    {"from": 6, "to": 7}
+  ]
+}

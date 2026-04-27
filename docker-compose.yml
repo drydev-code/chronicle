@@ -26,6 +26,13 @@ services:
       timeout: 5s
       retries: 10
 
+  satellite-mock:
+    build:
+      context: .
+      dockerfile: satellites/mock/Dockerfile
+    ports:
+      - "18080:8080"
+
   app:
     build:
       context: .
@@ -49,9 +56,94 @@ services:
       EVICTION_IDLE_MS: "5000"
       EVICTION_SCAN_MS: "3000"
       SECRET_KEY_BASE: "dev_secret_key_base_at_least_64_bytes_long_for_phoenix_endpoint_config_placeholder"
+      CONNECTOR_REGISTRY_JSON: >-
+        {"connectors":[
+          {"id":"rest-main","topics":["rest","http","https"],"placement":"satellite"},
+          {"id":"ai-main","topics":["ai","llm"],"placement":"satellite"},
+          {"id":"database-main","topics":["database","db","sql"],"placement":"satellite"},
+          {"id":"email-main","topics":["email","mail"],"placement":"satellite"},
+          {"id":"transform-main","topics":["transform","echo","map"],"placement":"satellite"}
+        ]}
+      AMQP_SIGNING_ENABLED: "true"
+      AMQP_REQUIRE_SIGNATURES: "false"
+      AMQP_SIGNING_PRIVATE_KEY_PATH: "/app/config/certs/dev-chronicle-key.pem"
+      AMQP_SIGNING_CERTIFICATE_PATH: "/app/config/certs/dev-chronicle-cert.pem"
+      AMQP_TRUSTED_CERTIFICATE_PATHS: "/app/config/certs/dev-chronicle-cert.pem"
     depends_on:
       db:
         condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      satellite-mock:
+        condition: service_started
+
+  satellite-rest-ai:
+    build:
+      context: .
+      dockerfile: satellites/python/Dockerfile
+    command: ["python", "-u", "-m", "chronicle_satellite.entrypoints.rest_ai"]
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+      SATELLITE_CONNECTOR_IDS: "rest-main,ai-main"
+      SATELLITE_REST_BEARER_TOKEN: "satellite-token"
+      CHRONICLE_MESSAGE_SIGNING: "true"
+      CHRONICLE_REQUIRE_SIGNATURES: "true"
+      CHRONICLE_SIGNING_KEY: "/satellite/config/certs/dev-chronicle-key.pem"
+      CHRONICLE_SIGNING_CERT: "/satellite/config/certs/dev-chronicle-cert.pem"
+      CHRONICLE_TRUSTED_CERTS: "/satellite/config/certs/dev-chronicle-cert.pem"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      satellite-mock:
+        condition: service_started
+
+  satellite-database:
+    build:
+      context: .
+      dockerfile: satellites/python/Dockerfile
+    command: ["python", "-u", "-m", "chronicle_satellite.entrypoints.database"]
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+      SATELLITE_CONNECTOR_IDS: "database-main"
+      DB_HOST: db
+      DB_USER: root
+      DB_PASS: root
+      DB_NAME: chronicle_dev
+      DB_PORT: "3306"
+      CHRONICLE_MESSAGE_SIGNING: "true"
+      CHRONICLE_REQUIRE_SIGNATURES: "true"
+      CHRONICLE_SIGNING_KEY: "/satellite/config/certs/dev-chronicle-key.pem"
+      CHRONICLE_SIGNING_CERT: "/satellite/config/certs/dev-chronicle-cert.pem"
+      CHRONICLE_TRUSTED_CERTS: "/satellite/config/certs/dev-chronicle-cert.pem"
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  satellite-email-transform:
+    build:
+      context: .
+      dockerfile: satellites/python/Dockerfile
+    command: ["python", "-u", "-m", "chronicle_satellite.entrypoints.email_transform"]
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+      SATELLITE_CONNECTOR_IDS: "email-main,transform-main"
+      CHRONICLE_MESSAGE_SIGNING: "true"
+      CHRONICLE_REQUIRE_SIGNATURES: "true"
+      CHRONICLE_SIGNING_KEY: "/satellite/config/certs/dev-chronicle-key.pem"
+      CHRONICLE_SIGNING_CERT: "/satellite/config/certs/dev-chronicle-cert.pem"
+      CHRONICLE_TRUSTED_CERTS: "/satellite/config/certs/dev-chronicle-cert.pem"
+    depends_on:
       rabbitmq:
         condition: service_healthy
 

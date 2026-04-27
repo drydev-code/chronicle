@@ -92,16 +92,103 @@ registered as plugins under `Chronicle.Server.Host.ExternalTasks.Executors`,
 and the list can be replaced with `config :server, :service_task_executors,
 [MyExecutor]`.
 
+Production deployments can route service tasks to connector satellites through
+the connector registry. The BPJS/Peak service-task handler remains the
+`topic` property (`rest`, `database`, `ai`, and so on); `connectorId` selects
+the registered connector implementation:
+
+```bash
+CONNECTOR_REGISTRY_JSON='{"connectors":[{"id":"rest-main","topics":["rest"],"placement":"satellite"}]}'
+```
+
+Satellites consume the same durable AMQP
+`ServiceTaskExecutionRequestedEvent` messages that external workers use and
+publish existing `ServiceTaskExecutedEvent` / `ServiceTaskFailedEvent`
+responses back to Chronicle. This keeps the engine event-sourcing contract
+unchanged while moving secrets, network access, and connector dependencies out
+of the main server. The Docker Compose stack includes:
+
+- `satellite-rest-ai`: Python reference satellite for REST and AI connectors.
+- `satellite-database`: Python reference satellite for database connectors.
+- `satellite-email-transform`: Python reference satellite for email and
+  transform connectors.
+- `satellite-mock`: local HTTP/AI test endpoint used by satellite examples.
+
+Transport retries are broker/consumer delivery retries, not BPMN activity
+failures. Chronicle's default transport retry budget is 5 attempts and process
+definitions may override it with `transport.maxRetries`. Transport retries use
+exponential backoff with jitter so reconnect storms do not synchronize across
+satellites. After the transport budget is exhausted, deployments should route
+the message to a RabbitMQ dead-letter queue scoped by connector ID, such as
+`Chronicle.DLQ.rest-main` or `Chronicle.DLQ.database-main`, so replay and
+quarantine can be managed per connector.
+
+Long-running connector work uses a soft lease model. A process definition can
+publish lease hints such as `lease.expectedRuntimeMs`,
+`lease.heartbeatIntervalMs`, and `lease.warnAfterMs`, but Chronicle does not
+impose a hard runtime cap from those hints. A satellite may heartbeat for as
+long as the connector is still making progress. Business failures, BPMN retry
+timers, and boundary routing remain `ServiceTaskFailedEvent` state inside
+Chronicle rather than RabbitMQ dead-letter state.
+
+Chronicle and the Python satellites can sign AMQP payloads with RSA-SHA256 and
+verify them against trusted X.509 certificates. The compose stack enables this
+for the reference satellites with development-only certificates in
+`config/certs`. Production deployments should configure distinct signer and
+trust material:
+
+- Chronicle server: `AMQP_SIGNING_ENABLED=true`,
+  `AMQP_SIGNER_PRIVATE_KEY_PATH` or legacy `AMQP_SIGNING_PRIVATE_KEY_PATH`,
+  `AMQP_SIGNER_CERTIFICATE_PATH` or legacy
+  `AMQP_SIGNING_CERTIFICATE_PATH`, and comma-separated
+  `AMQP_TRUSTED_CERTIFICATE_PATHS`.
+- Python satellites: `CHRONICLE_MESSAGE_SIGNING=true`,
+  `CHRONICLE_SIGNER_KEY` or legacy `CHRONICLE_SIGNING_KEY`,
+  `CHRONICLE_SIGNER_CERT` or legacy `CHRONICLE_SIGNING_CERT`, and
+  comma-separated `CHRONICLE_TRUSTED_CERTS`.
+- Pin accepted signer certificates with
+  `AMQP_TRUSTED_CERTIFICATE_FINGERPRINTS` or
+  `CHRONICLE_TRUSTED_CERT_FINGERPRINTS` using SHA-256 certificate
+  fingerprints. Certificate validity dates are checked by default and warn
+  when expiry is within 30 days.
+- Require signatures globally with `AMQP_REQUIRE_SIGNATURES` /
+  `CHRONICLE_REQUIRE_SIGNATURES`, or selectively with
+  `AMQP_REQUIRE_SIGNATURE_MESSAGE_TYPES`,
+  `AMQP_REQUIRE_SIGNATURE_DIRECTIONS`,
+  `CHRONICLE_REQUIRE_SIGNATURE_MESSAGE_TYPES`, and
+  `CHRONICLE_REQUIRE_SIGNATURE_DIRECTIONS`.
+
+The Python satellites expose `/livez`, `/readyz`, `/heartbeat`, and
+Prometheus-style `/metrics` on `SATELLITE_OBSERVABILITY_PORT` (default `8090`).
+Logs are JSON lines with correlation, task, tenant, topic, and connector IDs.
+For local connector coverage without RabbitMQ, run:
+
+```bash
+python scripts/smoke_satellite_examples.py
+```
+
 Chronicle service extensions use the `Chronicle.*` prefix.
 
 - `topic: "rest"`, `"http"`, or `"https"` performs an outbound HTTP request
   from the task `endpoint`, `method`, `body`, and optional
-  `extensions.headers` / `extensions.timeoutMs`.
+  `extensions.headers` / `extensions.timeoutMs`. The reference satellite also
+  supports `extensions.auth` with `none`, `bearer`, `basic`, `api_key`, and
+  `oauth2_client_credentials`.
 - `topic: "database"`, `"db"`, or `"sql"` runs `extensions.query` against the
-  configured Chronicle repo with optional `extensions.params`. SQL tasks are
-  read-only by default; set `extensions.allowWrite: true` to permit writes.
+  configured Chronicle repo with optional `extensions.params` when executed
+  locally. In the reference satellite, `extensions.connectionId` selects a
+  configured satellite database connection. Satellite database connections are
+  provider-specific and may declare `adapter` (`sqlite`, `mysql`, `postgres`,
+  or `mssql`), host/port/database credentials, read/write policy, table
+  allowlists or denylists, transaction mode, and result mode. SQL tasks are
+  read-only by default; set `extensions.allowWrite: true` only for approved
+  write connectors. For vector search workflows, keep embedding/provider
+  metadata such as `embeddingModel`, `embeddingProvider`, `vectorDimensions`,
+  and `metric` with the database/vector connector result so later searches know
+  which index and model family produced the vectors.
 - `topic: "ai"` or `"llm"` is treated as a REST-backed AI call and requires an
-  `endpoint`.
+  `endpoint`; the reference satellite normalizes OpenAI-compatible chat
+  responses into `text`, `raw`, `usage`, `model`, and `finishReason`.
 - `topic: "email"` or `"mail"` validates and normalizes an email command
   payload.
 - `topic: "transform"`, `"echo"`, or `"map"` renders a local template/JSON

@@ -1,0 +1,5 @@
+-r requirements-rest-ai.txt
+
+# Optional provider/validation extras for Chronicle AI connector tasks.
+litellm
+jsonschema

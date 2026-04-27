@@ -1,0 +1,107 @@
+{
+  "name": "example-ai-connector-platform",
+  "version": 1,
+  "tenant": "examples",
+  "transport": {
+    "maxRetries": 5,
+    "backoff": "exponential-jitter",
+    "deadLetterScope": "connectorId"
+  },
+  "lease": {
+    "expectedRuntimeMs": 60000,
+    "heartbeatIntervalMs": 10000,
+    "warnAfterMs": 120000
+  },
+  "nodes": [
+    {"id": 1, "key": "start", "type": "blankStartEvent"},
+    {
+      "id": 2,
+      "key": "classify_ticket_http",
+      "type": "externalTask",
+      "kind": "service",
+      "resultVariable": "classification",
+      "properties": {
+        "topic": "ai",
+        "connectorId": "ai-main",
+        "endpoint": "https://api.openai.com/v1/chat/completions",
+        "extensions": {
+          "auth": {"type": "bearer", "tokenEnv": "OPENAI_API_KEY"},
+          "models": ["gpt-4.1-mini", "gpt-4.1-nano"],
+          "prompt": "Classify this support ticket as billing, technical, or account: {{ticket}}",
+          "schema": {
+            "type": "object",
+            "required": ["category", "confidence"],
+            "properties": {
+              "category": {"type": "string", "enum": ["billing", "technical", "account"]},
+              "confidence": {"type": "number"}
+            }
+          },
+          "resultPath": "json"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "key": "embed_ticket_litellm",
+      "type": "externalTask",
+      "kind": "service",
+      "resultVariable": "ticketEmbedding",
+      "properties": {
+        "topic": "ai",
+        "connectorId": "ai-main",
+        "extensions": {
+          "provider": "litellm",
+          "operation": "embeddings",
+          "model": "text-embedding-3-small",
+          "input": "{{ticket}}",
+          "apiKeyEnv": "OPENAI_API_KEY",
+          "vectorMetadata": {
+            "provider": "litellm",
+            "embeddingModel": "text-embedding-3-small",
+            "vectorDimensions": 1536,
+            "metric": "cosine",
+            "sourceId": "{{ticketId}}"
+          },
+          "resultPath": "embeddings.0"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "key": "store_ticket_vector",
+      "type": "externalTask",
+      "kind": "service",
+      "resultVariable": "vectorWrite",
+      "properties": {
+        "topic": "database",
+        "connectorId": "ticket-vector-store",
+        "extensions": {
+          "connectionId": "ticket-vector-store",
+          "provider": {
+            "adapter": "postgres",
+            "capability": "vector-search",
+            "index": "support_ticket_embeddings"
+          },
+          "query": "insert into support_ticket_embeddings(ticket_id, category, embedding_model, vector_dimensions, distance_metric, embedding) values (:ticket_id, :category, :embedding_model, :vector_dimensions, :distance_metric, :embedding)",
+          "params": {
+            "ticket_id": "{{ticketId}}",
+            "category": "{{classification.category}}",
+            "embedding_model": "text-embedding-3-small",
+            "vector_dimensions": 1536,
+            "distance_metric": "cosine",
+            "embedding": "{{ticketEmbedding}}"
+          },
+          "allowWrite": true,
+          "resultMode": "affected"
+        }
+      }
+    },
+    {"id": 5, "key": "done", "type": "blankEndEvent", "exportAll": true}
+  ],
+  "connections": [
+    {"from": 1, "to": 2},
+    {"from": 2, "to": 3},
+    {"from": 3, "to": 4},
+    {"from": 4, "to": 5}
+  ]
+}

@@ -1,0 +1,204 @@
+{
+  "name": "example-satellite-executor-suite",
+  "version": 1,
+  "tenant": "examples",
+  "transport": {
+    "maxRetries": 5,
+    "backoff": "exponential-jitter",
+    "deadLetterScope": "connectorId"
+  },
+  "lease": {
+    "expectedRuntimeMs": 45000,
+    "heartbeatIntervalMs": 10000,
+    "warnAfterMs": 90000
+  },
+  "nodes": [
+    {"id": 1, "key": "start", "type": "blankStartEvent"},
+    {
+      "id": 2,
+      "key": "derive_request",
+      "type": "externalTask",
+      "kind": "service",
+      "resultVariable": "request",
+      "properties": {
+        "topic": "transform",
+        "connectorId": "transform-main",
+        "body": "{\"customerId\":\"{{customerId}}\",\"limit\":{{limit}}}"
+      }
+    },
+    {
+      "id": 3,
+      "key": "load_customer",
+      "type": "externalTask",
+      "kind": "service",
+      "resultVariable": "customer",
+      "properties": {
+        "topic": "database",
+        "connectorId": "database-main",
+        "extensions": {
+          "connectionId": "default",
+          "provider": {
+            "adapter": "sqlite",
+            "readOnly": true
+          },
+          "query": "select ? as customer_id",
+          "params": "[\"{{customerId}}\"]",
+          "resultMode": "first"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "key": "call_rest_no_auth",
+      "type": "externalTask",
+      "kind": "service",
+      "resultVariable": "restNoAuth",
+      "properties": {
+        "topic": "rest",
+        "connectorId": "rest-main",
+        "method": "POST",
+        "endpoint": "http://satellite-mock:8080/rest/no-auth",
+        "body": "{\"customerId\":\"{{customerId}}\",\"limit\":{{limit}}}",
+        "extensions": {
+          "resultMode": "body",
+          "resultPath": "data.path",
+          "timeoutMs": 5000
+        }
+      }
+    },
+    {
+      "id": 5,
+      "key": "call_rest_bearer",
+      "type": "externalTask",
+      "kind": "service",
+      "resultVariable": "restBearer",
+      "properties": {
+        "topic": "rest",
+        "connectorId": "rest-main",
+        "method": "GET",
+        "endpoint": "http://satellite-mock:8080/auth/bearer",
+        "extensions": {
+          "auth": {"type": "bearer", "token": "satellite-token"},
+          "resultMode": "body",
+          "resultPath": "data.authorization"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "key": "call_rest_basic",
+      "type": "externalTask",
+      "kind": "service",
+      "resultVariable": "restBasic",
+      "properties": {
+        "topic": "rest",
+        "connectorId": "rest-main",
+        "method": "GET",
+        "endpoint": "http://satellite-mock:8080/auth/basic",
+        "extensions": {
+          "auth": {
+            "type": "basic",
+            "username": "satellite",
+            "password": "secret"
+          },
+          "resultMode": "body",
+          "resultPath": "data.authorization"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "key": "call_rest_api_key",
+      "type": "externalTask",
+      "kind": "service",
+      "resultVariable": "restApiKey",
+      "properties": {
+        "topic": "rest",
+        "connectorId": "rest-main",
+        "method": "GET",
+        "endpoint": "http://satellite-mock:8080/auth/api-key",
+        "extensions": {
+          "auth": {
+            "type": "api_key",
+            "location": "header",
+            "name": "x-api-key",
+            "value": "satellite-key"
+          },
+          "resultMode": "body",
+          "resultPath": "data.apiKey"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "key": "call_rest_oauth",
+      "type": "externalTask",
+      "kind": "service",
+      "resultVariable": "restOAuth",
+      "properties": {
+        "topic": "rest",
+        "connectorId": "rest-main",
+        "method": "GET",
+        "endpoint": "http://satellite-mock:8080/auth/oauth",
+        "extensions": {
+          "auth": {
+            "type": "oauth2_client_credentials",
+            "tokenUrl": "http://satellite-mock:8080/oauth/token",
+            "clientId": "satellite-client",
+            "clientSecret": "satellite-secret"
+          },
+          "resultMode": "body",
+          "resultPath": "data.authorization"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "key": "summarize_with_ai",
+      "type": "externalTask",
+      "kind": "service",
+      "resultVariable": "summary",
+      "properties": {
+        "topic": "ai",
+        "connectorId": "ai-main",
+        "endpoint": "http://satellite-mock:8080/ai/chat",
+        "extensions": {
+          "model": "mock-model",
+          "prompt": "Summarize customer {{customerId}} with limit {{limit}}",
+          "resultMode": "body",
+          "resultPath": "text"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "key": "prepare_email",
+      "type": "externalTask",
+      "kind": "service",
+      "resultVariable": "email",
+      "properties": {
+        "topic": "email",
+        "connectorId": "email-main",
+        "extensions": {
+          "to": "ops@example.test",
+          "subject": "Satellite summary",
+          "body": "Summary: {{summary}}",
+          "resultPath": "status"
+        }
+      }
+    },
+    {"id": 11, "key": "done", "type": "blankEndEvent", "exportAll": true}
+  ],
+  "connections": [
+    {"from": 1, "to": 2},
+    {"from": 2, "to": 3},
+    {"from": 3, "to": 4},
+    {"from": 4, "to": 5},
+    {"from": 5, "to": 6},
+    {"from": 6, "to": 7},
+    {"from": 7, "to": 8},
+    {"from": 8, "to": 9},
+    {"from": 9, "to": 10},
+    {"from": 10, "to": 11}
+  ]
+}

@@ -23,4 +23,7 @@ config :logger, :console,
 
 config :phoenix, :json_library, Jason
 
+config :server, :connector_registry, []
+config :server, :amqp_signing, enabled: false, require_signatures: false
+
 import_config "#{config_env()}.exs"

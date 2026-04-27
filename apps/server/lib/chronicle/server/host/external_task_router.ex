@@ -43,7 +43,11 @@ defmodule Chronicle.Server.Host.ExternalTaskRouter do
   @impl true
   def handle_call({:task_completed, task_id, payload, result}, _from, state) do
     case route_known_task(state, task_id, fn tenant_id, instance_id ->
-           route_to_instance_or_cell(tenant_id, instance_id, {:complete, task_id, payload, result})
+           route_to_instance_or_cell(
+             tenant_id,
+             instance_id,
+             {:complete, task_id, payload, result}
+           )
          end) do
       {:ok, state} -> {:reply, :ok, state}
       {:error, reason, state} -> {:reply, {:error, reason}, state}
@@ -53,7 +57,11 @@ defmodule Chronicle.Server.Host.ExternalTaskRouter do
   def handle_call({:task_failed, task_id, error, retry?, backoff_ms}, _from, state) do
     case Map.get(state.tasks, task_id) do
       {tenant_id, instance_id} ->
-        case route_to_instance_or_cell(tenant_id, instance_id, {:error, task_id, error, retry?, backoff_ms}) do
+        case route_to_instance_or_cell(
+               tenant_id,
+               instance_id,
+               {:error, task_id, error, retry?, backoff_ms}
+             ) do
           :ok ->
             state = if retry?, do: state, else: %{state | tasks: Map.delete(state.tasks, task_id)}
             {:reply, :ok, state}
@@ -69,7 +77,11 @@ defmodule Chronicle.Server.Host.ExternalTaskRouter do
 
   def handle_call({:task_cancelled, task_id, reason, continuation_node_id}, _from, state) do
     case route_known_task(state, task_id, fn tenant_id, instance_id ->
-           route_to_instance_or_cell(tenant_id, instance_id, {:cancel, task_id, reason, continuation_node_id})
+           route_to_instance_or_cell(
+             tenant_id,
+             instance_id,
+             {:cancel, task_id, reason, continuation_node_id}
+           )
          end) do
       {:ok, state} -> {:reply, :ok, state}
       {:error, reason, state} -> {:reply, {:error, reason}, state}
@@ -77,8 +89,11 @@ defmodule Chronicle.Server.Host.ExternalTaskRouter do
   end
 
   @impl true
-  def handle_info({:external_task_created, instance_id, business_key, tenant_id,
-                   task_id, kind, payload, node_key, node_properties}, state) do
+  def handle_info(
+        {:external_task_created, instance_id, business_key, tenant_id, task_id, kind, payload,
+         node_key, node_properties},
+        state
+      ) do
     event = %{
       instance_id: instance_id,
       business_key: business_key,
@@ -92,7 +107,10 @@ defmodule Chronicle.Server.Host.ExternalTaskRouter do
 
     # Track task before dispatching. Built-in executors can complete quickly,
     # so completion routing must be ready before the handler runs.
-    Logger.info("ExternalTaskRouter: registered task #{task_id} -> instance #{instance_id} (tenant #{tenant_id})")
+    Logger.info(
+      "ExternalTaskRouter: registered task #{task_id} -> instance #{instance_id} (tenant #{tenant_id})"
+    )
+
     state = %{state | tasks: Map.put(state.tasks, task_id, {tenant_id, instance_id})}
 
     try do
@@ -109,16 +127,21 @@ defmodule Chronicle.Server.Host.ExternalTaskRouter do
 
   @impl true
   def handle_info({:task_completed, task_id, payload, result}, state) do
-    Logger.info("ExternalTaskRouter: received task_completed for task_id=#{inspect(task_id)}, known_tasks=#{inspect(Map.keys(state.tasks))}")
+    Logger.info(
+      "ExternalTaskRouter: received task_completed for task_id=#{inspect(task_id)}, known_tasks=#{inspect(Map.keys(state.tasks))}"
+    )
+
     case Map.get(state.tasks, task_id) do
       {tenant_id, instance_id} ->
         Logger.info("ExternalTaskRouter: found task mapping -> instance #{instance_id}")
-        route_to_instance_or_cell(tenant_id, instance_id,
-          {:complete, task_id, payload, result})
+        route_to_instance_or_cell(tenant_id, instance_id, {:complete, task_id, payload, result})
         {:noreply, %{state | tasks: Map.delete(state.tasks, task_id)}}
 
       nil ->
-        Logger.warning("ExternalTaskRouter: unknown task_id #{inspect(task_id)} completed (not in known tasks)")
+        Logger.warning(
+          "ExternalTaskRouter: unknown task_id #{inspect(task_id)} completed (not in known tasks)"
+        )
+
         {:noreply, state}
     end
   end
@@ -127,8 +150,12 @@ defmodule Chronicle.Server.Host.ExternalTaskRouter do
   def handle_info({:task_failed, task_id, error, retry?, backoff_ms}, state) do
     case Map.get(state.tasks, task_id) do
       {tenant_id, instance_id} ->
-        route_to_instance_or_cell(tenant_id, instance_id,
-          {:error, task_id, error, retry?, backoff_ms})
+        route_to_instance_or_cell(
+          tenant_id,
+          instance_id,
+          {:error, task_id, error, retry?, backoff_ms}
+        )
+
         if retry? do
           {:noreply, state}
         else
@@ -153,52 +180,142 @@ defmodule Chronicle.Server.Host.ExternalTaskRouter do
     case Instance.lookup(tenant_id, instance_id) do
       {:ok, pid} ->
         Logger.info("ExternalTaskRouter: found instance pid=#{inspect(pid)}, completing task")
-        Instance.complete_external_task_sync(pid, task_id, payload, result)
+
+        call_resident_or_cell(
+          pid,
+          fn -> Instance.complete_external_task_sync(pid, task_id, payload, result) end,
+          fn ->
+            wake_load_cell(
+              tenant_id,
+              instance_id,
+              {:wake, :external_task_complete, task_id, payload, result}
+            )
+          end
+        )
+
       _ ->
         # Instance may be evicted — try LoadCell
         case InstanceLoadCell.lookup(tenant_id, instance_id) do
           {:ok, cell_pid} ->
-            Logger.info("ExternalTaskRouter: instance evicted, waking via LoadCell for task #{task_id}")
+            Logger.info(
+              "ExternalTaskRouter: instance evicted, waking via LoadCell for task #{task_id}"
+            )
+
             GenServer.cast(cell_pid, {:wake, :external_task_complete, task_id, payload, result})
             :ok
+
           _ ->
-            Logger.warning("ExternalTaskRouter: instance #{instance_id} not found (resident or evicted) for task #{task_id}")
+            Logger.warning(
+              "ExternalTaskRouter: instance #{instance_id} not found (resident or evicted) for task #{task_id}"
+            )
+
             {:error, :instance_not_found}
         end
     end
   end
 
-  defp route_to_instance_or_cell(tenant_id, instance_id, {:error, task_id, error, retry?, backoff_ms}) do
+  defp route_to_instance_or_cell(
+         tenant_id,
+         instance_id,
+         {:error, task_id, error, retry?, backoff_ms}
+       ) do
     case Instance.lookup(tenant_id, instance_id) do
       {:ok, pid} ->
-        Instance.error_external_task_sync(pid, task_id, error, retry?, backoff_ms)
+        call_resident_or_cell(
+          pid,
+          fn -> Instance.error_external_task_sync(pid, task_id, error, retry?, backoff_ms) end,
+          fn ->
+            wake_load_cell(
+              tenant_id,
+              instance_id,
+              {:wake, :external_task_error, task_id, error, retry?, backoff_ms}
+            )
+          end
+        )
+
       _ ->
         case InstanceLoadCell.lookup(tenant_id, instance_id) do
           {:ok, cell_pid} ->
-            Logger.info("ExternalTaskRouter: instance evicted, waking via LoadCell for failed task #{task_id}")
-            GenServer.cast(cell_pid, {:wake, :external_task_error, task_id, error, retry?, backoff_ms})
+            Logger.info(
+              "ExternalTaskRouter: instance evicted, waking via LoadCell for failed task #{task_id}"
+            )
+
+            GenServer.cast(
+              cell_pid,
+              {:wake, :external_task_error, task_id, error, retry?, backoff_ms}
+            )
+
             :ok
+
           _ ->
-            Logger.warning("ExternalTaskRouter: instance #{instance_id} not found for failed task #{task_id}")
+            Logger.warning(
+              "ExternalTaskRouter: instance #{instance_id} not found for failed task #{task_id}"
+            )
+
             {:error, :instance_not_found}
         end
     end
   end
 
-  defp route_to_instance_or_cell(tenant_id, instance_id, {:cancel, task_id, reason, continuation_node_id}) do
+  defp route_to_instance_or_cell(
+         tenant_id,
+         instance_id,
+         {:cancel, task_id, reason, continuation_node_id}
+       ) do
     case Instance.lookup(tenant_id, instance_id) do
       {:ok, pid} ->
-        Instance.cancel_external_task_sync(pid, task_id, reason, continuation_node_id)
+        call_resident_or_cell(
+          pid,
+          fn ->
+            Instance.cancel_external_task_sync(pid, task_id, reason, continuation_node_id)
+          end,
+          fn ->
+            wake_load_cell(
+              tenant_id,
+              instance_id,
+              {:wake, :external_task_cancel, task_id, reason, continuation_node_id}
+            )
+          end
+        )
 
       _ ->
         case InstanceLoadCell.lookup(tenant_id, instance_id) do
           {:ok, cell_pid} ->
-            GenServer.cast(cell_pid, {:wake, :external_task_cancel, task_id, reason, continuation_node_id})
+            GenServer.cast(
+              cell_pid,
+              {:wake, :external_task_cancel, task_id, reason, continuation_node_id}
+            )
+
             :ok
 
           _ ->
             {:error, :instance_not_found}
         end
+    end
+  end
+
+  defp call_resident_or_cell(pid, resident_fun, load_cell_fun) do
+    if Process.alive?(pid) do
+      resident_fun.()
+    else
+      load_cell_fun.()
+    end
+  catch
+    :exit, _reason -> load_cell_fun.()
+  end
+
+  defp wake_load_cell(tenant_id, instance_id, message) do
+    case InstanceLoadCell.lookup(tenant_id, instance_id) do
+      {:ok, cell_pid} ->
+        GenServer.cast(cell_pid, message)
+        :ok
+
+      _ ->
+        Logger.warning(
+          "ExternalTaskRouter: instance #{instance_id} not found resident or evicted"
+        )
+
+        {:error, :instance_not_found}
     end
   end
 

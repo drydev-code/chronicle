@@ -19,11 +19,21 @@ defmodule Chronicle.Server.Messaging.WireFormat do
     # Realm headers for the Chronicle.Events headers exchange routing
     realm_headers = Map.new(realms, fn realm -> {"Chronicle.Realm.#{realm}", "True"} end)
 
-    headers = Map.merge(realm_headers, %{
-      "Chronicle.CorrelationId" => correlation_id
-    })
+    headers =
+      Map.merge(realm_headers, %{
+        "Chronicle.CorrelationId" => correlation_id
+      })
 
     payload = Jason.encode!(body)
+
+    headers =
+      Map.merge(
+        headers,
+        Chronicle.Server.Messaging.MessageSignature.sign_if_configured(payload,
+          message_type: message_type,
+          direction: :outgoing
+        )
+      )
 
     # Routing key: {messageType}.#.{tenantId}
     tenant_part = if tenant_id && tenant_id != "", do: tenant_id, else: "#"
@@ -48,14 +58,31 @@ defmodule Chronicle.Server.Messaging.WireFormat do
     # Util.ServiceBus sets props.Type; NServiceBus uses header
     message_type = get_message_type(metadata, headers)
 
-    body = case Jason.decode(payload) do
-      {:ok, decoded} -> normalize_keys(decoded)
-      {:error, _} -> %{"raw" => payload}
+    body =
+      case Jason.decode(payload) do
+        {:ok, decoded} -> normalize_keys(decoded)
+        {:error, _} -> %{"raw" => payload}
+      end
+
+    signature =
+      Chronicle.Server.Messaging.MessageSignature.verify_if_required(payload, headers,
+        message_type: message_type,
+        direction: :incoming
+      )
+
+    if Chronicle.Server.Messaging.MessageSignature.required?(
+         message_type: message_type,
+         direction: :incoming
+       ) and match?({:error, _}, signature) do
+      raise ArgumentError, "invalid AMQP message signature: #{inspect(signature)}"
     end
 
     %{
       message_type: message_type,
-      correlation_id: Map.get(headers, "Chronicle.CorrelationId") || Map.get(headers, "NServiceBus.CorrelationId"),
+      correlation_id:
+        Map.get(headers, "Chronicle.CorrelationId") ||
+          Map.get(headers, "NServiceBus.CorrelationId"),
+      signature: signature,
       body: body
     }
   end
@@ -64,6 +91,7 @@ defmodule Chronicle.Server.Messaging.WireFormat do
   def normalize_keys(map) when is_map(map) do
     Map.new(map, fn {k, v} -> {to_camel(k), normalize_keys(v)} end)
   end
+
   def normalize_keys(list) when is_list(list), do: Enum.map(list, &normalize_keys/1)
   def normalize_keys(other), do: other
 
@@ -71,9 +99,12 @@ defmodule Chronicle.Server.Messaging.WireFormat do
     case key do
       <<first::utf8, rest::binary>> when first in ?A..?Z ->
         <<first + 32>> <> rest
-      _ -> key
+
+      _ ->
+        key
     end
   end
+
   defp to_camel(key), do: key
 
   def message_type_match?(decoded, expected) do
@@ -99,6 +130,7 @@ defmodule Chronicle.Server.Messaging.WireFormat do
   defp extract_headers(%{headers: headers}) when is_list(headers) do
     Map.new(headers, fn {key, _type, value} -> {key, value} end)
   end
+
   defp extract_headers(%{headers: headers}) when is_map(headers), do: headers
   defp extract_headers(_), do: %{}
 end

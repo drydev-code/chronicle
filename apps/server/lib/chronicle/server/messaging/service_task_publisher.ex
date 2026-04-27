@@ -11,9 +11,22 @@ defmodule Chronicle.Server.Messaging.ServiceTaskPublisher do
 
   @message_type "Chronicle.Messages.Workflow+ServiceTaskExecutionRequestedEvent"
   @default_events_exchange "Chronicle.Events"
+  @default_transport_retry 5
 
   def publish(event) do
-    body = %{
+    body = wire_body(event)
+
+    envelope =
+      WireFormat.encode(@message_type, body,
+        correlation_id: event.correlation_id,
+        tenant_id: event.tenant_id
+      )
+
+    do_publish(envelope)
+  end
+
+  def wire_body(event) do
+    %{
       "CorrelationId" => event.correlation_id,
       "ProcessId" => event.process_id,
       "ProcessTenantId" => event.tenant_id,
@@ -21,33 +34,42 @@ defmodule Chronicle.Server.Messaging.ServiceTaskPublisher do
       "ServiceTaskId" => event.service_task_id,
       "ExternalTaskId" => event.external_task_id,
       "Topic" => event.topic,
-      "Retry" => 1,
+      "Retry" => @default_transport_retry,
       "Retries" => event.retries,
       "OnException" => event.on_exception,
       "TaskProperties" => encode_task_properties(event.task_properties),
+      "Connector" => encode_connector(event.task_properties),
+      "Execution" => encode_execution(event),
       "Data" => event.data,
       "ActorType" => event.actor_type,
       "TenantId" => event.tenant_id
     }
-
-    envelope = WireFormat.encode(@message_type, body,
-      correlation_id: event.correlation_id,
-      tenant_id: event.tenant_id
-    )
-
-    do_publish(envelope)
   end
 
   defp encode_task_properties(nil), do: %{}
+
   defp encode_task_properties(ext) when is_struct(ext) do
     Map.from_struct(ext)
     |> Enum.reject(fn {_k, v} -> is_nil(v) or v == %{} end)
     |> Map.new(fn {k, v} -> {camelize(k), encode_value(k, v)} end)
   end
+
   defp encode_task_properties(props), do: props
 
-  defp encode_value(:method, atom) when is_atom(atom), do: atom |> Atom.to_string() |> String.upcase()
+  defp encode_value(:method, atom) when is_atom(atom),
+    do: atom |> Atom.to_string() |> String.upcase()
+
   defp encode_value(_key, value), do: value
+
+  defp encode_connector(%{connector: connector}) when is_map(connector), do: connector
+  defp encode_connector(_), do: nil
+
+  defp encode_execution(%{execution: execution}) when is_map(execution), do: execution
+
+  defp encode_execution(%{task_properties: task_properties}),
+    do: encode_execution(task_properties)
+
+  defp encode_execution(_), do: nil
 
   defp camelize(atom) when is_atom(atom) do
     atom
@@ -64,15 +86,23 @@ defmodule Chronicle.Server.Messaging.ServiceTaskPublisher do
     headers = Map.to_list(envelope.headers)
 
     case AmqpConnection.publish(exchange, envelope.routing_key, envelope.payload,
-      headers: headers,
-      type: envelope.message_type
-    ) do
-      :ok -> :ok
-      {:error, :not_connected} ->
-        Phoenix.PubSub.broadcast(Chronicle.PubSub, "messaging:outbound",
-          {:service_task_requested, envelope})
+           headers: headers,
+           type: envelope.message_type
+         ) do
+      :ok ->
         :ok
-      error -> error
+
+      {:error, :not_connected} ->
+        Phoenix.PubSub.broadcast(
+          Chronicle.PubSub,
+          "messaging:outbound",
+          {:service_task_requested, envelope}
+        )
+
+        :ok
+
+      error ->
+        error
     end
   end
 end

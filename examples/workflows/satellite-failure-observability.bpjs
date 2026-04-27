@@ -1,0 +1,119 @@
+{
+  "name": "example-satellite-failure-observability",
+  "version": 1,
+  "tenant": "examples",
+  "transport": {
+    "maxRetries": 5,
+    "backoff": "exponential-jitter",
+    "deadLetterScope": "connectorId"
+  },
+  "lease": {
+    "expectedRuntimeMs": 15000,
+    "heartbeatIntervalMs": 5000,
+    "warnAfterMs": 30000
+  },
+  "nodes": [
+    {"id": 1, "key": "start", "type": "blankStartEvent"},
+    {
+      "id": 2,
+      "key": "rest_requires_bearer",
+      "type": "externalTask",
+      "kind": "service",
+      "errorBehaviour": "fail",
+      "properties": {
+        "topic": "rest",
+        "connectorId": "rest-main",
+        "method": "GET",
+        "endpoint": "http://satellite-mock:8080/auth/bearer",
+        "extensions": {
+          "failOnStatus": true,
+          "resultMode": "body"
+        }
+      }
+    },
+    {"id": 20, "key": "rest_error_boundary", "type": "errorBoundaryEvent", "attachedTo": 2},
+    {
+      "id": 3,
+      "key": "database_write_blocked",
+      "type": "externalTask",
+      "kind": "service",
+      "errorBehaviour": "fail",
+      "properties": {
+        "topic": "database",
+        "connectorId": "database-main",
+        "extensions": {
+          "connectionId": "default",
+          "provider": {
+            "adapter": "sqlite",
+            "readOnly": true
+          },
+          "query": "delete from customers where id = ?",
+          "params": "[\"{{customerId}}\"]",
+          "allowWrite": false
+        }
+      }
+    },
+    {"id": 30, "key": "database_error_boundary", "type": "errorBoundaryEvent", "attachedTo": 3},
+    {
+      "id": 4,
+      "key": "ai_gateway_rejected",
+      "type": "externalTask",
+      "kind": "service",
+      "errorBehaviour": "fail",
+      "properties": {
+        "topic": "ai",
+        "connectorId": "ai-main",
+        "endpoint": "http://satellite-mock:8080/auth/bearer",
+        "extensions": {
+          "model": "mock-model",
+          "prompt": "This call intentionally lacks auth for {{customerId}}",
+          "failOnStatus": true,
+          "resultMode": "body"
+        }
+      }
+    },
+    {"id": 40, "key": "ai_error_boundary", "type": "errorBoundaryEvent", "attachedTo": 4},
+    {
+      "id": 5,
+      "key": "email_missing_body",
+      "type": "externalTask",
+      "kind": "service",
+      "errorBehaviour": "fail",
+      "properties": {
+        "topic": "email",
+        "connectorId": "email-main",
+        "extensions": {
+          "to": "ops@example.test",
+          "subject": "Missing body example"
+        }
+      }
+    },
+    {"id": 50, "key": "email_error_boundary", "type": "errorBoundaryEvent", "attachedTo": 5},
+    {
+      "id": 6,
+      "key": "normalize_failure_notice",
+      "type": "externalTask",
+      "kind": "service",
+      "resultVariable": "notice",
+      "properties": {
+        "topic": "transform",
+        "connectorId": "transform-main",
+        "body": "{\"handled\":true,\"source\":\"satellite-failure-observability\",\"customerId\":\"{{customerId}}\"}"
+      }
+    },
+    {"id": 7, "key": "handled", "type": "blankEndEvent", "exportAll": true},
+    {"id": 8, "key": "unexpected_success", "type": "blankEndEvent"}
+  ],
+  "connections": [
+    {"from": 1, "to": 2},
+    {"from": 2, "to": 8},
+    {"from": 20, "to": 3},
+    {"from": 3, "to": 8},
+    {"from": 30, "to": 4},
+    {"from": 4, "to": 8},
+    {"from": 40, "to": 5},
+    {"from": 5, "to": 8},
+    {"from": 50, "to": 6},
+    {"from": 6, "to": 7}
+  ]
+}

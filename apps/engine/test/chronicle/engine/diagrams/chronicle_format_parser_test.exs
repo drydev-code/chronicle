@@ -30,7 +30,9 @@ defmodule Chronicle.Engine.Diagrams.ChronicleFormatParserTest do
     assert {:ok, definition} = Parser.parse(json)
     assert definition.name == "ChronicleCompatMain"
     assert definition.version == 7
-    assert %Nodes.ExternalTask{result_variable: "result", error_behaviour: :retry} = definition.nodes[2]
+
+    assert %Nodes.ExternalTask{result_variable: "result", error_behaviour: :retry} =
+             definition.nodes[2]
   end
 
   test "parses Chronicle resources into script task source" do
@@ -112,6 +114,48 @@ defmodule Chronicle.Engine.Diagrams.ChronicleFormatParserTest do
     assert definition.nodes[2].properties["extensions"]["resultPath"] == "data.id"
     assert definition.nodes[3].properties["topic"] == "database"
     assert definition.nodes[3].result_variable == "rows"
+  end
+
+  test "normalizes BPJS service task retry and runtime hints into execution metadata" do
+    bpjs = %{
+      "name" => "RuntimeMetadata",
+      "nodes" => [
+        %{"id" => 1, "type" => "blankStartEvent"},
+        %{
+          "id" => 2,
+          "key" => "call_vendor",
+          "type" => "ServiceTaskREST",
+          "properties" => %{
+            "endpoint" => "https://example.test/api",
+            "method" => "POST",
+            "retries" => 3,
+            "retry" => %{"backoffMs" => 250, "maxBackoffMs" => 2_000},
+            "runtimeTimeout" => 45_000,
+            "maxRuntime" => 60_000,
+            "leaseTimeout" => 15_000,
+            "execution" => %{"queue" => "critical"},
+            "extensions" => %{"execution" => %{"placement" => "satellite"}}
+          }
+        },
+        %{"id" => 3, "type" => "blankEndEvent"}
+      ],
+      "connections" => [%{"from" => 1, "to" => 2}, %{"from" => 2, "to" => 3}]
+    }
+
+    assert {:ok, definition} = Parser.parse(Jason.encode!(bpjs))
+    assert %Nodes.ExternalTask{properties: properties} = definition.nodes[2]
+
+    assert properties["retries"] == 3
+
+    assert properties["execution"] == %{
+             "placement" => "satellite",
+             "queue" => "critical",
+             "retries" => 3,
+             "retry" => %{"backoffMs" => 250, "maxBackoffMs" => 2_000},
+             "runtimeTimeout" => 45_000,
+             "maxRuntime" => 60_000,
+             "leaseTimeout" => 15_000
+           }
   end
 
   test "external Chronicle diagrams parse for the Chronicle-supported subset" do
