@@ -1,14 +1,11 @@
-from ..app import ChronicleSatellite
-from ..registry import email_transform_executors
-
-
-DEFAULT_TOPICS = "email,mail,transform,echo,map"
+from chronicle_satellite.app import ChronicleSatellite
+from chronicle_satellite.registry import email_transform_executors
 
 
 def build_satellite() -> ChronicleSatellite:
     return ChronicleSatellite(
         email_transform_executors(),
-        default_topics=DEFAULT_TOPICS,
+        default_topics="email,mail,transform,echo,map",
         default_queue="Chronicle.Satellite.EmailTransform",
         name="Chronicle email/transform satellite",
     )

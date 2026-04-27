@@ -1,14 +1,11 @@
-from ..app import ChronicleSatellite
-from ..registry import rest_ai_executors
-
-
-DEFAULT_TOPICS = "rest,http,https,ai,llm"
+from chronicle_satellite.app import ChronicleSatellite
+from chronicle_satellite.registry import rest_ai_executors
 
 
 def build_satellite() -> ChronicleSatellite:
     return ChronicleSatellite(
         rest_ai_executors(),
-        default_topics=DEFAULT_TOPICS,
+        default_topics="rest,http,https,ai,llm",
         default_queue="Chronicle.Satellite.RestAi",
         name="Chronicle REST/AI satellite",
     )

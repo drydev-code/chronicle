@@ -60,11 +60,17 @@ Monitor these dimensions:
 - Chronicle workflow events: retry attempts, boundary catches, and terminal
   failed tasks.
 
-Dead-letter queues should be configured as RabbitMQ policies per deployment
-when required. Use per-connector-ID DLQs so a failing `rest-main` connector does
-not block replay for `database-main` or `ai-main`. Keep the satellite behavior
-focused on clear acknowledgements, structured failure publication, and
-replay-friendly task identifiers.
+The reference satellites declare per-connector retry and dead-letter queues in
+their own queue namespace. Examples:
+
+- `Chronicle.Satellite.RestAi.Retry.rest-main.1`
+- `Chronicle.Satellite.RestAi.DLQ.rest-main`
+- `Chronicle.Satellite.Database.DLQ.database-main`
+
+Use per-connector-ID DLQs so a failing `rest-main` connector does not block
+replay for `database-main` or `ai-main`. Keep the satellite behavior focused on
+clear acknowledgements, structured failure publication, and replay-friendly
+task identifiers.
 
 ## Example Coverage
 

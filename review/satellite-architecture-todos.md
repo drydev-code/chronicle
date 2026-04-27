@@ -1,15 +1,17 @@
-# Satellite Architecture TODOs
+# Satellite Architecture Status And TODOs
 
 Date: 2026-04-27
 
-This file tracks the satellite connector architecture after the refactor.
+This file tracks the satellite connector architecture now merged into `main`.
 
 ## Implemented
 
-- Split Python satellites by sensible runtime boundaries:
-  - REST/AI
-  - database
-  - email/transform
+- Split Python satellites into separate deployable app directories:
+  - `satellites/rest-ai`
+  - `satellites/database`
+  - `satellites/email-transform`
+  Shared AMQP, signing, metrics, registry helpers, and executor code live under
+  `satellites/shared/python/chronicle_satellite`.
 - Docker Compose starts all three satellites plus the local mock connector
   service.
 - `SATELLITE_TOPICS` was removed from the Chronicle placement path.
@@ -38,10 +40,10 @@ This file tracks the satellite connector architecture after the refactor.
   `/metrics`, and emit structured JSON task lifecycle logs.
 - Example diagrams cover happy-path connector families and expected satellite
   failure observability.
-- RabbitMQ transport reliability decisions are documented: default max
-  transport retries is 5, process definitions can override that budget,
-  delivery retries use exponential backoff with jitter, and broker DLQs are
-  scoped per connector ID.
+- RabbitMQ transport reliability is implemented in the reference satellites:
+  default max transport retries is 5, process definitions can override that
+  budget, delivery retries use exponential backoff with jitter, and retry/DLQ
+  queues are scoped by satellite queue plus connector ID.
 - Task runtime uses soft leases with process-configurable hints. Hints drive
   monitoring and warning behavior, while successful heartbeats can continue for
   unlimited connector runtime.
@@ -59,8 +61,8 @@ This file tracks the satellite connector architecture after the refactor.
 - Back connector credentials with a real secret-provider interface, starting
   with env/secret references and leaving room for Vault, Kubernetes, and cloud
   secret managers.
-- Add deployable RabbitMQ policy snippets for the documented per-connector-ID
-  DLQ and replay topology.
+- Add operational replay runbooks for the implemented per-connector-ID DLQ
+  queues, including how to inspect, drain, requeue, or quarantine messages.
 - Add provider certification tests with real deployment credentials for the
   concrete REST providers, LiteLLM/OpenAI-compatible gateways, and databases
   each production environment uses.

@@ -1,5 +1,0 @@
-from chronicle_satellite.entrypoints.all import main
-
-
-if __name__ == "__main__":
-    main()

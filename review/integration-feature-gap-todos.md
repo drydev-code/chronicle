@@ -1,6 +1,6 @@
 # Integration Feature Gap TODOs
 
-Date: 2026-04-25
+Date: 2026-04-27
 
 This file tracks integration/platform gaps outside the core BPJS BPMN runtime.
 The engine/runtime docs already cover BPMN coverage; this file focuses on
@@ -51,9 +51,10 @@ Implemented today:
   connector, executor, duration, and sanitized error metadata.
 - Example diagrams and smoke tests cover happy-path connector families and
   representative failure paths.
-- Transport retry policy is documented as 5 attempts by default, overridable by
-  process definition, with exponential jitter backoff and per-connector-ID
-  RabbitMQ DLQs after the transport budget is exhausted.
+- Transport retry policy is implemented as 5 attempts by default, overridable
+  by process definition, with exponential jitter backoff and retry/DLQ queues
+  scoped by satellite queue plus connector ID after the transport budget is
+  exhausted.
 - External connector runtime uses soft lease hints rather than hard expiry.
   Chronicle keeps BPMN business failures, retry timers, and boundary routing in
   workflow state instead of offloading them to RabbitMQ DLQs.
@@ -264,8 +265,7 @@ Need:
 
 Should have:
 
-- Deployable per-connector-ID RabbitMQ DLQ and replay policies for exhausted
-  transport retries.
+- Replay runbooks for the implemented per-connector-ID RabbitMQ DLQ queues.
 - Monitoring for soft lease hints and missing heartbeats on long-running
   external work.
 - Graceful shutdown that does not abandon in-flight built-in tasks.
@@ -279,9 +279,9 @@ Nice to have:
 
 Need:
 
-- Document every built-in executor property with examples.
-- Add examples for REST auth modes, AI OpenAI-compatible calls, and DB
-  connection IDs after they exist.
+- Keep every built-in and satellite executor property documented with examples.
+- Maintain examples for REST auth modes, AI OpenAI-compatible calls, and DB
+  connection IDs as connector behavior expands.
 - Add generated JSON schema for Chronicle service-task extensions.
 
 Nice to have:

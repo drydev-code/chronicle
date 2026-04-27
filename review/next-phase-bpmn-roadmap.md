@@ -1,15 +1,16 @@
-# Next Phase BPMN Roadmap
+# Completed BPJS BPMN Phase Roadmap
 
-Date: 2026-04-24
+Date: 2026-04-27
 
-This phase intentionally stays within Chronicle's BPJS JSON target. Do not add
-native BPMN XML import. Every newly claimed feature must be parseable,
-executable, replayable, and covered by focused runtime plus restart/eviction
-tests before updating `SupportedFeatures` or public docs.
+This file records the BPJS BPMN subset phase that has now been implemented.
+Chronicle still intentionally stays within BPJS JSON and does not import native
+BPMN XML. Every newly claimed feature remains subject to the same rule:
+parseable, executable, replayable, and covered by focused runtime plus
+restart/eviction tests before updating `SupportedFeatures` or public docs.
 
 ## Goal
 
-Implement the next practical BPJS BPMN subset expansion:
+Implemented practical BPJS BPMN subset expansion:
 
 1. Lanes as `actorType` metadata in the Chronicle schema.
 2. Conditional start and conditional boundary events.
@@ -28,7 +29,9 @@ Preserve the current event-sourcing/CQRS invariants:
 
 ## Phase 1: Lanes As actorType
 
-### Desired Semantics
+Status: implemented.
+
+### Semantics
 
 Lanes are supported as assignment/routing metadata, not full BPMN collaboration
 semantics. Chronicle should treat lanes as a way to resolve an `actorType` for
@@ -61,7 +64,7 @@ Out of scope:
 - `apps/server/lib/chronicle/server/messaging/*publisher.ex`
 - Parser/runtime/server tests under `apps/engine/test` and `apps/server/test`
 
-### Acceptance Tests
+### Acceptance Coverage
 
 - BPJS with lane membership parses into lane/actor metadata.
 - Explicit node actor type overrides lane actor type.
@@ -72,7 +75,9 @@ Out of scope:
 
 ## Phase 2: Conditional Start Events
 
-### Desired Semantics
+Status: implemented.
+
+### Semantics
 
 Conditional start events allow a deployed BPJS definition to start when a
 variable-change command/event satisfies the start condition.
@@ -88,11 +93,10 @@ Initial scope:
   `ProcessInstanceStart` must record the selected conditional start node and
   start parameters.
 
-Open design decision:
+Chosen semantics:
 
-- Whether conditional starts are evaluated against a tenant/global variable
-  store, a business-key scoped variable update, or only explicit API payloads.
-  Prefer business-key scoped payloads if this needs correlation semantics.
+- Conditional starts are evaluated from explicit variable payloads and persist
+  the chosen `start_node_id` on `ProcessInstanceStart`.
 
 Out of scope:
 
@@ -111,7 +115,7 @@ Out of scope:
 - `apps/engine/test/chronicle/engine/diagrams/*`
 - `apps/engine/test/chronicle/engine/instance/*`
 
-### Acceptance Tests
+### Acceptance Coverage
 
 - Conditional start parses and unsupported malformed conditional starts fail.
 - False condition does not start an instance.
@@ -122,7 +126,9 @@ Out of scope:
 
 ## Phase 3: Conditional Boundary Events
 
-### Desired Semantics
+Status: implemented.
+
+### Semantics
 
 Conditional boundary events behave like the existing message/signal/timer
 boundary lifecycle, driven by durable variable updates and explicit conditional
@@ -142,11 +148,10 @@ Initial scope:
   keep the original activity wait open. Decide whether they are repeatable or
   one-shot and persist/replay that behavior explicitly.
 
-Recommended semantics:
+Chosen semantics:
 
-- Non-interrupting conditional boundaries should be repeatable only if BPJS
-  models express repeat behavior explicitly. Otherwise make them one-shot, like
-  non-interrupting timer boundaries, to avoid accidental infinite spawning.
+- Non-interrupting conditional boundaries are one-shot, like non-interrupting
+  timer boundaries, to avoid accidental infinite spawning.
 
 Out of scope:
 
@@ -164,7 +169,7 @@ Out of scope:
 - `apps/engine/lib/chronicle/engine/instance/event_replayer.ex`
 - `apps/engine/lib/chronicle/engine/evicted_wait_restorer.ex`
 
-### Acceptance Tests
+### Acceptance Coverage
 
 - Conditional boundary create/cancel/trigger events are durable and replayable.
 - Interrupting conditional boundary through `Instance.update_variables/2`
@@ -176,7 +181,9 @@ Out of scope:
 
 ## Phase 4: Standard Loop Activity Characteristics
 
-### Desired Semantics
+Status: implemented.
+
+### Semantics
 
 Support standard BPMN-style loop behavior for supported activities, distinct
 from multi-instance and distinct from the call-activity collection loop already
@@ -199,7 +206,7 @@ Out of scope:
 - Completion conditions across multiple instances.
 - Looping gateways/events unless explicitly modeled as supported activities.
 
-### Suggested PersistentData
+### PersistentData
 
 - `LoopIterationStarted` or equivalent if iteration start affects replay.
 - `LoopConditionEvaluated` with token, current node, iteration, condition,
@@ -207,7 +214,7 @@ Out of scope:
 
 Prefer one event only if it is enough to replay exactly.
 
-### Acceptance Tests
+### Acceptance Coverage
 
 - Activity loops until condition is false and then continues to the outgoing
   path.
@@ -220,7 +227,9 @@ Prefer one event only if it is enough to replay exactly.
 
 ## Phase 5: Compensation Events
 
-### Desired Semantics
+Status: implemented.
+
+### Semantics
 
 Compensation should be implemented as scoped, durable compensation handling,
 not as a simple throw event shortcut.
@@ -241,7 +250,7 @@ Out of scope for first pass:
 - Full BPMN scope hierarchy unless implemented as part of subprocess support.
 - Compensation across process boundaries unless explicitly needed.
 
-### Suggested PersistentData
+### PersistentData
 
 - `CompensationHandlerRegistered`
 - `CompensatableActivityCompleted`
@@ -251,7 +260,7 @@ Out of scope for first pass:
 
 The exact set can be smaller if replay fidelity is still complete.
 
-### Acceptance Tests
+### Acceptance Coverage
 
 - Unsupported compensation shapes fail parse/runtime validation.
 - Completed compensatable activity can be compensated once.
@@ -259,12 +268,10 @@ The exact set can be smaller if replay fidelity is still complete.
 - Eviction/restart does not lose pending compensation handlers.
 - Compensation side effects are queued until durable append succeeds.
 
-## Documentation Updates Required At The End
+## Current Next Batch
 
-- `README.md`
-- `review/bpmn-feature-matrix.md`
-- `review/remaining-engine-work.md`
-- `apps/engine/lib/chronicle/engine/diagrams/supported_features.ex`
-
-Update these only when the feature is parseable, executable, replayable, and
-tested.
+The next BPMN runtime expansion should focus on embedded subprocesses, event
+subprocesses, transaction/cancel semantics, multiple/parallel-multiple events,
+and standard sequential/parallel multi-instance characteristics. Keep this file
+as historical context for the completed phase; use
+`review/remaining-engine-work.md` for the current open BPMN work list.

@@ -1,6 +1,6 @@
 # Remaining Engine Work
 
-Date: 2026-04-24
+Date: 2026-04-27
 
 This file tracks work that is still missing after the current BPJS BPMN subset
 durability pass. Items already implemented in the current tree are intentionally

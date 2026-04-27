@@ -1,14 +1,11 @@
-from ..app import ChronicleSatellite
-from ..registry import database_executors
-
-
-DEFAULT_TOPICS = "database,db,sql"
+from chronicle_satellite.app import ChronicleSatellite
+from chronicle_satellite.registry import database_executors
 
 
 def build_satellite() -> ChronicleSatellite:
     return ChronicleSatellite(
         database_executors(),
-        default_topics=DEFAULT_TOPICS,
+        default_topics="database,db,sql",
         default_queue="Chronicle.Satellite.Database",
         name="Chronicle database satellite",
     )

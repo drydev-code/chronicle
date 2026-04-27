@@ -19,7 +19,7 @@ def main() -> int:
     args = parser.parse_args()
 
     repo_root = Path(args.repo_root).resolve()
-    sys.path.insert(0, str(repo_root / "satellites" / "python"))
+    sys.path.insert(0, str(repo_root / "satellites" / "shared" / "python"))
 
     from chronicle_satellite.executors.database import close_cached_connections, execute_database
     from chronicle_satellite.executors.email_transform import execute_email, execute_transform

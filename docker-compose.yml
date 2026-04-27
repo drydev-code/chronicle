@@ -80,8 +80,7 @@ services:
   satellite-rest-ai:
     build:
       context: .
-      dockerfile: satellites/python/Dockerfile
-    command: ["python", "-u", "-m", "chronicle_satellite.entrypoints.rest_ai"]
+      dockerfile: satellites/rest-ai/Dockerfile
     environment:
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: "5672"
@@ -103,8 +102,7 @@ services:
   satellite-database:
     build:
       context: .
-      dockerfile: satellites/python/Dockerfile
-    command: ["python", "-u", "-m", "chronicle_satellite.entrypoints.database"]
+      dockerfile: satellites/database/Dockerfile
     environment:
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: "5672"
@@ -130,8 +128,7 @@ services:
   satellite-email-transform:
     build:
       context: .
-      dockerfile: satellites/python/Dockerfile
-    command: ["python", "-u", "-m", "chronicle_satellite.entrypoints.email_transform"]
+      dockerfile: satellites/email-transform/Dockerfile
     environment:
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: "5672"

@@ -108,20 +108,27 @@ responses back to Chronicle. This keeps the engine event-sourcing contract
 unchanged while moving secrets, network access, and connector dependencies out
 of the main server. The Docker Compose stack includes:
 
-- `satellite-rest-ai`: Python reference satellite for REST and AI connectors.
-- `satellite-database`: Python reference satellite for database connectors.
-- `satellite-email-transform`: Python reference satellite for email and
-  transform connectors.
+- `satellite-rest-ai`: separate Python app for REST and AI connectors
+  (`satellites/rest-ai`).
+- `satellite-database`: separate Python app for database connectors
+  (`satellites/database`).
+- `satellite-email-transform`: separate Python app for email and transform
+  connectors (`satellites/email-transform`).
 - `satellite-mock`: local HTTP/AI test endpoint used by satellite examples.
+
+The satellite apps share only the common SDK under `satellites/shared/python`;
+they have separate Dockerfiles, dependency manifests, entrypoints, and Compose
+services.
 
 Transport retries are broker/consumer delivery retries, not BPMN activity
 failures. Chronicle's default transport retry budget is 5 attempts and process
 definitions may override it with `transport.maxRetries`. Transport retries use
 exponential backoff with jitter so reconnect storms do not synchronize across
-satellites. After the transport budget is exhausted, deployments should route
-the message to a RabbitMQ dead-letter queue scoped by connector ID, such as
-`Chronicle.DLQ.rest-main` or `Chronicle.DLQ.database-main`, so replay and
-quarantine can be managed per connector.
+satellites. After the transport budget is exhausted, the reference satellites
+publish the message to a RabbitMQ dead-letter queue scoped by satellite queue
+and connector ID, such as `Chronicle.Satellite.RestAi.DLQ.rest-main` or
+`Chronicle.Satellite.Database.DLQ.database-main`, so replay and quarantine can
+be managed per connector.
 
 Long-running connector work uses a soft lease model. A process definition can
 publish lease hints such as `lease.expectedRuntimeMs`,
@@ -224,12 +231,16 @@ docker compose up --build
 
 This starts:
 
-| Service   | Host port | Purpose                         |
-| --------- | --------- | ------------------------------- |
-| app       | `4000`    | HTTP REST + LiveDashboard       |
-| mysql     | `33060`   | Primary store + databus         |
-| rabbitmq  | `56720`   | AMQP — external task fan-out    |
-| rabbitmq  | `15673`   | Management UI (guest/guest)     |
+| Service | Host port | Purpose |
+| --- | --- | --- |
+| app | `4000` | HTTP REST + LiveDashboard |
+| mysql | `33060` | Primary store + databus |
+| rabbitmq | `56720` | AMQP external task fan-out |
+| rabbitmq | `15673` | Management UI (guest/guest) |
+| satellite-rest-ai | internal `8090` | REST/AI connector satellite |
+| satellite-database | internal `8090` | Database connector satellite |
+| satellite-email-transform | internal `8090` | Email/transform connector satellite |
+| satellite-mock | `18080` | Local REST/AI mock service for examples |
 
 Run the integration suite against the same stack:
 
@@ -267,6 +278,16 @@ RABBITMQ_HOST  amqp broker host
 RABBITMQ_PORT  amqp port (default: 5672)
 RABBITMQ_USER  amqp user (default: guest)
 RABBITMQ_PASS  amqp password (default: guest)
+
+CONNECTOR_REGISTRY_JSON  optional seed registry for connector IDs, topics,
+                         placement, capabilities, and execution metadata
+
+AMQP_SIGNING_ENABLED       true | false
+AMQP_REQUIRE_SIGNATURES    true | false
+AMQP_SIGNER_PRIVATE_KEY_PATH / AMQP_SIGNING_PRIVATE_KEY_PATH
+AMQP_SIGNER_CERTIFICATE_PATH / AMQP_SIGNING_CERTIFICATE_PATH
+AMQP_TRUSTED_CERTIFICATE_PATHS
+AMQP_TRUSTED_CERTIFICATE_FINGERPRINTS
 
 EVICTION_ENABLED    true | false (default: false)
 EVICTION_IDLE_MS    idle threshold ms (default: 300000)

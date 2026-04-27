@@ -2,15 +2,18 @@
 
 You are working in `D:\Drydev\chronicle`.
 
-Goal: implement the next Chronicle BPJS BPMN subset phase completely while
-preserving event-sourcing/CQRS semantics.
+Goal: implement the next Chronicle BPJS BPMN subset phase or production
+hardening batch without regressing the current event-sourced runtime,
+connector registry, or satellite architecture.
 
 Start by reading:
 
 - `README.md`
 - `review/bpmn-feature-matrix.md`
 - `review/remaining-engine-work.md`
-- `review/next-phase-bpmn-roadmap.md`
+- `review/integration-feature-gap-todos.md`
+- `review/satellite-architecture-todos.md`
+- `review/satellite-observability.md`
 - `apps/engine/lib/chronicle/engine/diagrams/parser.ex`
 - `apps/engine/lib/chronicle/engine/diagrams/supported_features.ex`
 - `apps/engine/lib/chronicle/engine/diagrams/definition.ex`
@@ -19,32 +22,34 @@ Start by reading:
 - `apps/engine/lib/chronicle/engine/instance/boundary_lifecycle.ex`
 - `apps/engine/lib/chronicle/engine/instance/wait_registry.ex`
 - `apps/engine/lib/chronicle/engine/instance/event_replayer.ex`
-- `apps/engine/lib/chronicle/engine/evicted_wait_restorer.ex`
-- `apps/engine/lib/chronicle/engine/persistent_data.ex`
-- `apps/engine/lib/chronicle/engine/nodes/start_events.ex`
-- `apps/engine/lib/chronicle/engine/nodes/boundary_events.ex`
-- `apps/engine/lib/chronicle/engine/nodes/activity.ex`
-- `apps/engine/lib/chronicle/engine/nodes/external_task.ex`
-- `apps/engine/lib/chronicle/engine/nodes/call_activity.ex`
 - `apps/server/lib/chronicle/server/host/external_task_router.ex`
-- `apps/server/lib/chronicle/server/messaging/message_consumer.ex`
-- `apps/server/lib/chronicle/server/web/router.ex`
+- `apps/server/lib/chronicle/server/host/external_tasks/connector_registry.ex`
+- `apps/server/lib/chronicle/server/messaging/message_signature.ex`
+- `satellites/README.md`
+- `satellites/rest-ai/main.py`
+- `satellites/database/main.py`
+- `satellites/email-transform/main.py`
+- `satellites/shared/python/chronicle_satellite/app.py`
+- `satellites/shared/python/chronicle_satellite/executors/rest_ai.py`
+- `satellites/shared/python/chronicle_satellite/executors/database.py`
 
 Current baseline:
 
-- Commit: `e6a6b4c Complete BPJS supported subset P0 work`.
-- Last required verification passed:
-  - `docker compose --profile test build test`
-  - `docker compose --profile test run --rm test`
-- Engine: 76 tests, 0 failures.
-- Server: 9 tests, 0 failures.
-- Known harmless log noise: `elixir_uuid` Bitwise deprecation, `recon` OTP
-  float warning, server MyXQL databus access-denied logs, and intentional
-  negative-path engine error logs from tests.
+- Branch pushed: `main`.
+- Latest merged commit: `ea14208 Implement Chronicle satellite connectors`.
+- Last full verification before push:
+  - Docker engine suite: 102 tests, 0 failures.
+  - Docker server suite: 40 tests, 0 failures.
+  - Python satellite tests: 44 tests, 0 failures.
+  - Python signing tests: 6 tests, 0 failures.
+  - `python scripts/smoke_satellite_examples.py`.
+  - Docker Compose satellite smoke: deployed and started all satellite example
+    diagrams; happy paths completed; intentional REST auth failure became a
+    Chronicle `ServiceTaskFailedEvent`.
 
 Hard constraints:
 
-- Do not implement native BPMN XML import. Chronicle targets BPJS JSON diagrams.
+- Do not implement native BPMN XML import unless explicitly scoped.
 - Event log is source of truth. Commands must append durable events before
   mutating projections, continuing tokens, publishing PubSub/AMQP effects, or
   acknowledging work.
@@ -52,70 +57,45 @@ Hard constraints:
 - Unsupported BPMN features must fail during parsing/runtime validation.
 - Update `SupportedFeatures` only when parseable, executable, replayable, and
   tested.
-- Add `PersistentData` structs for replay-critical transitions.
-- Update `EventReplayer` for every new persistent transition.
-- Keep side effects queued until durable append succeeds.
-- Keep README and review docs aligned.
+- Keep service-task placement based on BPJS task properties and the connector
+  registry. Do not reintroduce `SATELLITE_TOPICS` as a Chronicle routing
+  contract.
+- Keep BPMN business failures in Chronicle state. RabbitMQ retry/DLQ handling
+  is for transport failures before Chronicle receives a connector response.
+- Keep AMQP signing/verification and certificate pinning behavior covered by
+  tests when changing message envelopes.
 
-Implement all items in `review/next-phase-bpmn-roadmap.md`:
+Current open production hardening candidates:
 
-1. Lanes as `actorType` metadata:
-   - Parse BPJS lane metadata and lane-node membership.
-   - Resolve node actor type from explicit node metadata first, lane metadata
-     second, existing defaults last.
-   - Include actor type in external/user task publication payloads.
-   - Add parser/runtime/server tests.
-   - Keep collaboration, pools, participants, and message flows unsupported.
+1. Replace development `x-user-id` auth with production authentication:
+   API keys, JWT/JWKS, OIDC, route scopes, tenant authorization, and audit
+   logging.
+2. Add tenant-scoped connector authorization before dispatch.
+3. Add secret-provider references for REST, AI, database, email, and future
+   connectors, starting with environment references and leaving room for
+   Vault, Kubernetes, and cloud secret managers.
+4. Add per-connector health/status, concurrency limits, circuit breakers,
+   rate-limit metrics, and outbound host allowlists.
+5. Add provider certification tests using real deployment credentials and
+   network/TLS policy for the concrete REST providers, AI gateways, and
+   databases a deployment uses.
 
-2. Conditional start events:
-   - Parse and validate conditional start event nodes.
-   - Add a public command/API for evaluating conditional starts from variable
-     payloads or business-key scoped variable updates.
-   - Persist replay-critical start decisions. `ProcessInstanceStart.start_node_id`
-     must identify the conditional start node.
-   - Add false-condition, true-condition, and replay tests.
-   - Keep event subprocess starts out of scope unless explicitly designed.
+Current open BPMN candidates:
 
-3. Conditional boundary events:
-   - Parse interrupting and non-interrupting conditional boundary event nodes.
-   - Register conditional boundary waits for the current wait-capable activity
-     subset.
-   - Evaluate open conditional boundaries only after durable variable update
-     events persist.
-   - Interrupting conditional boundaries must append `BoundaryEventTriggered`,
-     sibling `BoundaryEventCancelled`, and retry `TimerCanceled` where relevant
-     before cleanup/continuation.
-   - Define non-interrupting conditional boundary semantics. Prefer one-shot
-     unless BPJS has explicit repeat metadata.
-   - Add replay and evicted wait collection tests.
+1. Embedded subprocesses with scoped variables and scoped boundary events.
+2. Event subprocesses, including interrupting/non-interrupting starts.
+3. Transaction subprocesses with cancel semantics.
+4. Multiple and parallel-multiple events.
+5. Standard sequential/parallel multi-instance activity characteristics.
 
-4. Standard loop activity characteristics:
-   - Parse BPJS standard loop metadata on supported activities.
-   - Support condition plus max-iteration guard.
-   - Choose and document pre-test/post-test semantics. Prefer post-test if BPJS
-     has no explicit marker.
-   - Persist replay-critical loop iteration/condition transitions.
-   - Add runtime, replay, and boundary-cleanup tests.
-   - Keep multi-instance activity characteristics out of scope.
+Before final response on the next implementation batch:
 
-5. Compensation events:
-   - Implement compensation only with durable handler registration/request/start
-     completion semantics.
-   - Parse supported compensation boundary/throw/end shapes; reject unsupported
-     shapes.
-   - Record completed compensatable activity instances in the event log.
-   - Start compensation handlers deterministically and idempotently across
-     replay/restart.
-   - Add replay, eviction, and side-effect ordering tests.
-   - Keep transaction subprocess/cancel semantics out of scope unless explicitly
-     designed separately.
-
-Before final response:
-
-- Run:
+- Run the relevant focused tests.
+- For cross-cutting runtime changes, also run:
   - `docker compose --profile test build test`
   - `docker compose --profile test run --rm test`
-- Commit the completed work.
-- Summarize implemented changes.
-- Summarize BPMN features still intentionally unsupported.
-- Mention any tests that could not be run.
+- For satellite changes, also run:
+  - `$env:PYTHONPATH='satellites/shared/python'; python -m unittest discover -s satellites\shared\python\tests -v`
+  - `$env:PYTHONPATH='satellites/shared/python'; python -m unittest discover -s satellites\shared\python -p '*test*.py' -v`
+  - `python scripts\smoke_satellite_examples.py`
+- Update README and review docs in the same change.

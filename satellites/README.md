@@ -1,21 +1,31 @@
-# Chronicle Python Satellites
+# Chronicle Satellites
 
-This directory now exposes a reusable `chronicle_satellite` package plus a few focused entrypoints:
+Satellites are separate deployable apps. They share a small Python SDK under
+`satellites/shared/python/chronicle_satellite`, but each satellite owns its
+own app directory, Dockerfile, dependencies, and runtime entrypoint:
 
-- `python -m chronicle_satellite.entrypoints.all` keeps the previous all-in-one behavior.
-- `python -m chronicle_satellite.entrypoints.rest_ai` handles `rest,http,https,ai,llm` and imports `requests`.
-- `python -m chronicle_satellite.entrypoints.database` handles `database,db,sql` and imports DB drivers.
-- `python -m chronicle_satellite.entrypoints.email_transform` handles `email,mail,transform,echo,map` with only lightweight executor code.
+- `satellites/rest-ai`: REST and AI/LLM connector app.
+- `satellites/database`: database connector app.
+- `satellites/email-transform`: email and transform connector app.
+- `satellites/mock`: local HTTP/AI mock service for examples and smoke tests.
 
-Each entrypoint owns its built-in topic family. Use `SATELLITE_CONNECTOR_IDS` to restrict a running satellite to specific connector IDs from BPJS task properties or the Chronicle connector registry. `SATELLITE_QUEUE`, `SATELLITE_PREFETCH`, and the RabbitMQ environment variables keep their existing behavior. The all-in-one launcher still defaults to `Chronicle.Satellite`; specialized launchers default to distinct queues so they can run side by side.
+Use `SATELLITE_CONNECTOR_IDS` to restrict a running satellite to specific
+connector IDs from BPJS task properties or the Chronicle connector registry.
+`SATELLITE_QUEUE`, `SATELLITE_PREFETCH`, and the RabbitMQ environment variables
+keep their existing behavior. Each app defaults to its own queue namespace:
+`Chronicle.Satellite.RestAi`, `Chronicle.Satellite.Database`, or
+`Chronicle.Satellite.EmailTransform`.
 
 Set `CHRONICLE_MESSAGE_SIGNING=true` with `CHRONICLE_SIGNER_KEY` / `CHRONICLE_SIGNING_KEY`, `CHRONICLE_SIGNER_CERT` / `CHRONICLE_SIGNING_CERT`, and comma-separated `CHRONICLE_TRUSTED_CERTS` to sign outgoing AMQP payloads and verify Chronicle requests using X.509 certificates. `CHRONICLE_TRUSTED_CERT_FINGERPRINTS` pins accepted signer certificates by SHA-256 fingerprint, and certificate validity dates are checked by default. Require signatures globally with `CHRONICLE_REQUIRE_SIGNATURES=true`, or selectively with `CHRONICLE_REQUIRE_SIGNATURE_MESSAGE_TYPES` and `CHRONICLE_REQUIRE_SIGNATURE_DIRECTIONS`.
 
-The original `requirements.txt` remains the full dependency set. Use `requirements-rest-ai.txt`, `requirements-database.txt`, or `requirements-email-transform.txt` when building narrower satellite images.
+Each app has its own `requirements.txt`. The REST/AI app includes HTTP,
+LiteLLM, and JSON-schema dependencies; the database app includes the SQL
+drivers; the email/transform app keeps only the lightweight AMQP/signing
+dependencies.
 
 ## Health, Readiness, And Metrics
 
-Each entrypoint starts a lightweight HTTP observability server in the satellite
+Each app starts a lightweight HTTP observability server in the satellite
 process. It has no extra dependency and is intended for Docker Compose and
 Kubernetes probes.
 
@@ -74,12 +84,14 @@ Operationally, watch these signals together:
 - RabbitMQ queue depth and any broker-level dead-letter queues for messages
   that cannot be routed or are rejected before reaching the satellite.
 
-If you add broker dead-lettering for a deployment, keep it broker-scoped and
-document the queue policy alongside the connector registry. Prefer one DLQ per
-connector ID, for example `Chronicle.DLQ.rest-main` and
-`Chronicle.DLQ.database-main`, so replay can be paused or drained without
-mixing unrelated providers. The satellite logs the task/correlation/connector
-IDs needed to replay or quarantine failed work without exposing credentials.
+The reference satellite declares per-connector retry and dead-letter queues for
+its own queue namespace. Examples include
+`Chronicle.Satellite.RestAi.Retry.rest-main.1`,
+`Chronicle.Satellite.RestAi.DLQ.rest-main`, and
+`Chronicle.Satellite.Database.DLQ.database-main`. Keep custom broker policies
+aligned with that shape so replay can be paused or drained without mixing
+unrelated providers. The satellite logs the task/correlation/connector IDs
+needed to replay or quarantine failed work without exposing credentials.
 
 ## Local Smoke
 
@@ -96,7 +108,7 @@ asserts expected REST, database, and email failure observations.
 
 ## AI connector tasks
 
-`topic: "ai"` and `topic: "llm"` use the AI service layer. The default path remains OpenAI-compatible HTTP when an `endpoint` is present, so existing chat-completion tasks keep working. Set `extensions.provider: "litellm"` or `CHRONICLE_AI_PROVIDER=litellm` to route through LiteLLM when the optional `requirements-ai.txt` dependencies are installed.
+`topic: "ai"` and `topic: "llm"` use the AI service layer. The default path remains OpenAI-compatible HTTP when an `endpoint` is present, so existing chat-completion tasks keep working. Set `extensions.provider: "litellm"` or `CHRONICLE_AI_PROVIDER=litellm` to route through LiteLLM; the REST/AI app includes the LiteLLM dependencies.
 
 Useful AI extensions:
 
