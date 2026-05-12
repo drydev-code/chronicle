@@ -11,6 +11,12 @@ defmodule Chronicle.Server.Web.Endpoint do
   plug Plug.RequestId
   plug Plug.Telemetry, event_prefix: [:phoenix, :endpoint]
 
+  plug Plug.Static,
+    at: "/",
+    from: {:server, "priv/static"},
+    gzip: false,
+    only: ~w(editor)
+
   plug Plug.Parsers,
     parsers: [:urlencoded, :multipart, :json],
     pass: ["*/*"],

@@ -9,6 +9,11 @@ defmodule Chronicle.Server.Web.Router do
     plug(Chronicle.Server.Web.Plugs.Tenant)
   end
 
+  pipeline :browser do
+    plug(:accepts, ["html"])
+    plug(Chronicle.Server.Web.Plugs.Tenant)
+  end
+
   pipeline :authenticated do
     plug(Chronicle.Server.Web.Plugs.Auth)
   end
@@ -18,14 +23,24 @@ defmodule Chronicle.Server.Web.Router do
     # future: add role check
   end
 
-  # Public scope: endpoints safe for unauthenticated callers.
-  # Currently none of the existing routes are safe-by-default; keep this
-  # scope empty until genuinely public endpoints (e.g. health checks) are
-  # added.
+  # Public process designer. Deliberately unauthenticated for local/simple
+  # deployments; put it behind infrastructure auth before exposing it broadly.
   scope "/api", Chronicle.Server.Web.Controllers do
     pipe_through(:api)
 
-    # (intentionally empty — no public endpoints today)
+    get("/process-definitions", ProcessDefinitionController, :index)
+    get("/process-definitions/template", ProcessDefinitionController, :template)
+    get("/process-definitions/:id", ProcessDefinitionController, :show)
+    post("/process-definitions", ProcessDefinitionController, :create)
+    put("/process-definitions/:id", ProcessDefinitionController, :update)
+    delete("/process-definitions/:id", ProcessDefinitionController, :delete)
+  end
+
+  scope "/", Chronicle.Server.Web.Controllers do
+    pipe_through(:browser)
+
+    get("/", ProcessDefinitionController, :app)
+    get("/processes", ProcessDefinitionController, :app)
   end
 
   # Authenticated scope: everything that reads state or starts a normal
@@ -105,15 +120,15 @@ defmodule Chronicle.Server.Web.Router do
   scope "/api", Chronicle.Server.Web.Controllers do
     pipe_through([:api, :admin])
 
-    # Process Instance — migrations + stress test
+    # Process Instance - migrations + stress test
     post("/process-instance/:id/migrate", ProcessInstanceController, :migrate)
     post("/process-instance/stress-test", ProcessInstanceController, :stress_test)
 
-    # Deployment — uploads + mock
+    # Deployment - uploads + mock
     post("/deployment", DeploymentController, :upload)
     post("/deployment/mock", DeploymentController, :deploy_mock)
 
-    # Management — terminate-all
+    # Management - terminate-all
     delete("/management/terminate-all", ManagementController, :terminate_all)
     post("/management/connectors/reload", ConnectorRegistryController, :reload)
     put("/management/connectors/:id", ConnectorRegistryController, :upsert)

@@ -56,6 +56,17 @@ defmodule Chronicle.Persistence.Queries do
     Repo.all(from d in Deployment, order_by: [asc: d.deployed_at])
   end
 
+  @doc "Load deployments for a tenant/kind, newest versions first."
+  def load_deployments(tenant_id, kind \\ "bpmn") do
+    tenant = tenant_key(tenant_id)
+
+    Repo.all(
+      from d in Deployment,
+        where: d.tenant_id == ^tenant and d.kind == ^kind,
+        order_by: [asc: d.name, desc: d.version]
+    )
+  end
+
   @doc """
   Load a single deployment by its unique key. `tenant_id` may be `nil` to
   reference the default tenant sentinel.
@@ -70,6 +81,30 @@ defmodule Chronicle.Persistence.Queries do
           d.tenant_id == ^tenant and d.name == ^name and
             d.version == ^ver and d.kind == ^kind
     )
+  end
+
+  @doc "Load one deployment row by id."
+  def load_deployment_by_id(id) do
+    Repo.one(from d in Deployment, where: d.id == ^id)
+  end
+
+  @doc "Return the highest stored version for a process name/kind in a tenant."
+  def latest_deployment_version(tenant_id, name, kind \\ "bpmn") do
+    tenant = tenant_key(tenant_id)
+
+    Repo.one(
+      from d in Deployment,
+        where: d.tenant_id == ^tenant and d.name == ^name and d.kind == ^kind,
+        select: max(d.version)
+    ) || 0
+  end
+
+  @doc "Delete one deployment row by id."
+  def delete_deployment_by_id(id) do
+    case load_deployment_by_id(id) do
+      nil -> {:error, :not_found}
+      deployment -> Repo.delete(deployment)
+    end
   end
 
   @doc "Expose the tenant sentinel so stores can denormalize consistently."
