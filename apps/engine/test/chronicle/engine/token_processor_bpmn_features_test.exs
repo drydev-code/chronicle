@@ -1,7 +1,7 @@
 defmodule Chronicle.Engine.TokenProcessorBpmnFeaturesTest do
   use ExUnit.Case, async: false
 
-  alias Chronicle.Engine.{PersistentData, Token, TokenProcessor}
+  alias Chronicle.Engine.{ExecutionContext, PersistentData, Token, TokenProcessor}
   alias Chronicle.Engine.Diagrams.Definition
   alias Chronicle.Engine.Instance.TokenState
   alias Chronicle.Engine.Nodes
@@ -11,6 +11,8 @@ defmodule Chronicle.Engine.TokenProcessorBpmnFeaturesTest do
       {:ok, pid} -> Process.unlink(pid)
       {:error, {:already_started, _pid}} -> :ok
     end
+
+    :ok
   end
 
   test "manual task is an explicit persisted no-op transition" do
@@ -81,9 +83,27 @@ defmodule Chronicle.Engine.TokenProcessorBpmnFeaturesTest do
         TokenProcessor.process_active_tokens(acc)
       end)
 
-    assert Enum.any?(state.persistent_events, &match?(%PersistentData.CompensatableActivityCompleted{activity_node_id: 1, handler_node_id: 50}, &1))
-    assert Enum.any?(state.persistent_events, &match?(%PersistentData.CompensationRequested{}, &1))
-    assert Enum.any?(state.persistent_events, &match?(%PersistentData.CompensationHandlerStarted{handler_node_id: 50}, &1))
+    assert Enum.any?(
+             state.persistent_events,
+             &match?(
+               %PersistentData.CompensatableActivityCompleted{
+                 activity_node_id: 1,
+                 handler_node_id: 50
+               },
+               &1
+             )
+           )
+
+    assert Enum.any?(
+             state.persistent_events,
+             &match?(%PersistentData.CompensationRequested{}, &1)
+           )
+
+    assert Enum.any?(
+             state.persistent_events,
+             &match?(%PersistentData.CompensationHandlerStarted{handler_node_id: 50}, &1)
+           )
+
     assert map_size(state.tokens) == 2
     assert MapSet.member?(state.compensation_started, "0:1:0")
   end
@@ -187,7 +207,13 @@ defmodule Chronicle.Engine.TokenProcessorBpmnFeaturesTest do
       })
 
     token = Token.continue(state.tokens[0])
-    token = Token.set_context(token, :continuation_context, {:ok, [%{"node_id" => 1, "result" => false}]})
+
+    token =
+      Token.set_context(
+        token,
+        :continuation_context,
+        {:ok, [%{"node_id" => 1, "result" => false}]}
+      )
 
     waiting_state =
       state
@@ -195,7 +221,13 @@ defmodule Chronicle.Engine.TokenProcessorBpmnFeaturesTest do
       |> TokenProcessor.process_active_tokens()
 
     token = Token.continue(waiting_state.tokens[0])
-    token = Token.set_context(token, :continuation_context, {:ok, [%{"node_id" => 1, "result" => true}]})
+
+    token =
+      Token.set_context(
+        token,
+        :continuation_context,
+        {:ok, [%{"node_id" => 1, "result" => true}]}
+      )
 
     resumed_state = %{
       waiting_state
@@ -232,7 +264,8 @@ defmodule Chronicle.Engine.TokenProcessorBpmnFeaturesTest do
         1 => Token.new(1, 0, 3)
       })
 
-    first_arrival = TokenProcessor.process_active_tokens(%{state | active_tokens: MapSet.new([0])})
+    first_arrival =
+      TokenProcessor.process_active_tokens(%{state | active_tokens: MapSet.new([0])})
 
     assert first_arrival.tokens[0].state == :waiting_for_join
     assert MapSet.member?(first_arrival.waiting_tokens, 0)
@@ -302,6 +335,72 @@ defmodule Chronicle.Engine.TokenProcessorBpmnFeaturesTest do
              state.persistent_events
 
     assert state.tokens[0].next_node == 2
+  end
+
+  test "external task completion updates actors separately from result variables" do
+    node = %Nodes.ExternalTask{
+      id: 1,
+      kind: :user,
+      result_variable: "approval",
+      outputs: [2],
+      properties: %{}
+    }
+
+    token =
+      Token.new(0, 0, 1, %{"existing" => true})
+      |> Token.set_context(:continuation_context, {
+        :complete,
+        %{
+          "approved" => true,
+          "__actor" => %{"type" => "Reviewer", "id" => "user-1", "role" => "QA"}
+        },
+        nil
+      })
+
+    context =
+      ExecutionContext.new(
+        instance_id: "inst",
+        instance_pid: self(),
+        token: token,
+        definition: %Definition{name: "actor-update", nodes: %{1 => node}},
+        node: node,
+        tenant_id: "tenant",
+        business_key: "bk"
+      )
+
+    assert {:next_with_params, 2, params} = Nodes.ExternalTask.continue_after_wait(context)
+    assert params["approval"] == %{"approved" => true}
+
+    assert params["Actors"]["Reviewer"] == %{
+             "type" => "Reviewer",
+             "id" => "user-1",
+             "role" => "QA"
+           }
+
+    refute Map.has_key?(params["approval"], "__actor")
+  end
+
+  test "external task completion without result variable merges payload into token params" do
+    node = %Nodes.ExternalTask{id: 1, kind: :service, outputs: [2], properties: %{}}
+
+    token =
+      Token.new(0, 0, 1, %{"existing" => true})
+      |> Token.set_context(:continuation_context, {:complete, %{"answer" => 42}, nil})
+
+    context =
+      ExecutionContext.new(
+        instance_id: "inst",
+        instance_pid: self(),
+        token: token,
+        definition: %Definition{name: "result-merge", nodes: %{1 => node}},
+        node: node,
+        tenant_id: "tenant",
+        business_key: "bk"
+      )
+
+    assert {:next_with_params, 2, params} = Nodes.ExternalTask.continue_after_wait(context)
+    assert params["existing"] == true
+    assert params["answer"] == 42
   end
 
   defp base_state(nodes) do

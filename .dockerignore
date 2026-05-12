@@ -1,0 +1,9 @@
+_build/
+deps/
+.git/
+editor/.git/
+node_modules/
+**/node_modules/
+editor/dist/
+editor/dist-ssr/
+*.log

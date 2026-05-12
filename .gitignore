@@ -10,6 +10,7 @@ cover/
 doc/
 .fetch
 tmp/
+tmp-*.png
 node_modules/
 .env
 .DS_Store

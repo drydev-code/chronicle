@@ -106,6 +106,24 @@ defmodule Chronicle.Persistence.DeploymentQueriesTest do
     end
   end
 
+  describe "deployment management helpers" do
+    @tag :integration
+    test "loads tenant deployments newest version first and deletes by id" do
+      {:ok, old} = Queries.save_deployment("tenant-list", "proc", 1, "bpmn", "v1")
+      {:ok, latest} = Queries.save_deployment("tenant-list", "proc", 2, "bpmn", "v2")
+      {:ok, _other_kind} = Queries.save_deployment("tenant-list", "proc", 3, "dmn", "<dmn/>")
+      {:ok, _other_tenant} = Queries.save_deployment("other", "proc", 9, "bpmn", "other")
+
+      assert Queries.latest_deployment_version("tenant-list", "proc", "bpmn") == 2
+      assert [^latest, ^old] = Queries.load_deployments("tenant-list", "bpmn")
+
+      assert {:ok, deleted} = Queries.delete_deployment_by_id(old.id)
+      assert deleted.id == old.id
+      assert is_nil(Queries.load_deployment_by_id(old.id))
+      assert {:error, :not_found} = Queries.delete_deployment_by_id(old.id)
+    end
+  end
+
   describe "validation" do
     test "only bpmn and dmn kinds are accepted" do
       assert_raise FunctionClauseError, fn ->

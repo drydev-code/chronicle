@@ -48,7 +48,15 @@ defmodule Chronicle.Engine.Diagrams.DiagramStorePersistenceTest do
       start_store(DiagramStore)
 
       {:ok, definition} = Chronicle.Engine.Diagrams.Parser.parse(@sample_bpjs)
-      :ok = DiagramStore.register(definition.name, definition.version, "tenant-x", definition, @sample_bpjs)
+
+      :ok =
+        DiagramStore.register(
+          definition.name,
+          definition.version,
+          "tenant-x",
+          definition,
+          @sample_bpjs
+        )
 
       loaded = Queries.load_deployment("tenant-x", "persistent-proc", 7, "bpmn")
       assert loaded, "expected a persisted Deployment row"
@@ -61,7 +69,15 @@ defmodule Chronicle.Engine.Diagrams.DiagramStorePersistenceTest do
       # Stage a row via the write-through path, then stop & restart the store.
       start_store(DiagramStore)
       {:ok, definition} = Chronicle.Engine.Diagrams.Parser.parse(@sample_bpjs)
-      :ok = DiagramStore.register(definition.name, definition.version, "tenant-x", definition, @sample_bpjs)
+
+      :ok =
+        DiagramStore.register(
+          definition.name,
+          definition.version,
+          "tenant-x",
+          definition,
+          @sample_bpjs
+        )
 
       stop_store(DiagramStore)
       start_store(DiagramStore)
@@ -100,6 +116,40 @@ defmodule Chronicle.Engine.Diagrams.DiagramStorePersistenceTest do
 
       assert {:ok, _} = DiagramStore.get("persistent-proc", 7, "legacy")
       refute Queries.load_deployment("legacy", "persistent-proc", 7, "bpmn")
+    end
+  end
+
+  describe "message start index" do
+    @tag :integration
+    test "lists registered message starts and resolves their definitions" do
+      start_store(DiagramStore)
+
+      bpjs =
+        Jason.encode!(%{
+          "name" => "message-start-proc",
+          "version" => 3,
+          "nodes" => [
+            %{"id" => 10, "type" => "messageStartEvent", "message" => "CustomerCreated"},
+            %{"id" => 20, "type" => "blankEndEvent"}
+          ],
+          "connections" => [%{"from" => 10, "to" => 20}]
+        })
+
+      {:ok, definition} = Chronicle.Engine.Diagrams.Parser.parse(bpjs)
+
+      :ok =
+        DiagramStore.register(definition.name, definition.version, "tenant-msg", definition, bpjs)
+
+      assert "CustomerCreated" in DiagramStore.get_registered_start_messages("tenant-msg")
+
+      assert ["message-start-proc"] =
+               DiagramStore.get_process_names_for_message("CustomerCreated", "tenant-msg")
+
+      assert [resolved] =
+               DiagramStore.get_message_start_definitions("CustomerCreated", "tenant-msg")
+
+      assert resolved.name == "message-start-proc"
+      assert resolved.version == 3
     end
   end
 

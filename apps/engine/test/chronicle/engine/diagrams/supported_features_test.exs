@@ -71,6 +71,51 @@ defmodule Chronicle.Engine.Diagrams.SupportedFeaturesTest do
     assert reason =~ "Transaction subprocess"
   end
 
+  test "parser captures message correlation scripts on triggering message nodes" do
+    bpjs = %{
+      "name" => "message-correlation",
+      "version" => 1,
+      "nodes" => [
+        %{
+          "id" => 1,
+          "type" => "messageStartEvent",
+          "message" => %{
+            "name" => "OrderUpdated",
+            "correlationScript" => "message.status === 'open'"
+          }
+        },
+        %{
+          "id" => 2,
+          "type" => "receiveTask",
+          "message" => "OrderUpdated",
+          "correlationExpression" => "message.status === 'received'"
+        },
+        %{
+          "id" => 3,
+          "type" => "intermediateCatchMessageEvent",
+          "message" => "OrderUpdated",
+          "properties" => %{"correlation" => "message.status === 'caught'"}
+        },
+        %{
+          "id" => 4,
+          "type" => "messageBoundaryEvent",
+          "activity" => 2,
+          "message" => %{
+            "name" => "OrderUpdated",
+            "correlationScript" => "message.status === 'cancelled'"
+          }
+        }
+      ]
+    }
+
+    assert {:ok, definition} = Parser.parse(Jason.encode!(bpjs))
+
+    assert definition.nodes[1].message.correlation == "message.status === 'open'"
+    assert definition.nodes[2].message.correlation == "message.status === 'received'"
+    assert definition.nodes[3].message.correlation == "message.status === 'caught'"
+    assert definition.nodes[4].message.correlation == "message.status === 'cancelled'"
+  end
+
   test "conditional start requires a condition expression" do
     bpjs = %{
       "name" => "bad-conditional-start",
@@ -110,7 +155,12 @@ defmodule Chronicle.Engine.Diagrams.SupportedFeaturesTest do
       "nodes" => [
         %{"id" => 1, "type" => "blankStartEvent"},
         %{"id" => 2, "type" => "externalTask", "kind" => "service", "key" => "task"},
-        %{"id" => 3, "type" => "timerBoundaryEvent", "activity" => 2, "timer" => %{"durationMs" => 100}},
+        %{
+          "id" => 3,
+          "type" => "timerBoundaryEvent",
+          "activity" => 2,
+          "timer" => %{"durationMs" => 100}
+        },
         %{"id" => 4, "type" => "blankEndEvent"},
         %{"id" => 5, "type" => "blankEndEvent"}
       ],

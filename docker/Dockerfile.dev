@@ -13,13 +13,18 @@ COPY mix.exs mix.lock ./
 COPY config config
 COPY apps/engine/mix.exs apps/engine/
 COPY apps/server/mix.exs apps/server/
+COPY editor/package.json editor/package-lock.json editor/
 
 RUN mix deps.get
 RUN mix deps.compile
+RUN cd editor && npm ci
 
 # Copy application sources
 COPY examples examples
 COPY apps apps
+COPY editor editor
+
+RUN cd editor && npm run build:chronicle
 
 RUN mix compile
 

@@ -1,0 +1,4 @@
+
+[submodule "editor"]
+	path = editor
+	url = https://github.com/drydev-code/chronicle-editor.git

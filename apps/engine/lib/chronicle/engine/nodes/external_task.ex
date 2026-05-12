@@ -8,8 +8,15 @@ defmodule Chronicle.Engine.Nodes.ExternalTask do
   @type kind :: :user | :service
 
   defstruct [
-    :id, :key, :kind, :result_variable, :error_behaviour,
-    :inputs, :outputs, :boundary_events, :properties
+    :id,
+    :key,
+    :kind,
+    :result_variable,
+    :error_behaviour,
+    :inputs,
+    :outputs,
+    :boundary_events,
+    :properties
   ]
 
   @impl true
@@ -44,18 +51,26 @@ defmodule Chronicle.Engine.Nodes.ExternalTask do
 
   defp handle_completion(context, payload, _result) do
     node = context.node
+    {actor_updates, payload} = Chronicle.Engine.Actors.extract_updates(payload)
+    parameters = Chronicle.Engine.Actors.apply_updates(context.token.parameters, actor_updates)
+
     # Store payload under result_variable in token params
-    merged = if node.result_variable && node.result_variable != "" do
-      Map.put(context.token.parameters, node.result_variable, payload)
-    else
-      # No result_variable: merge payload directly if it's a map
-      case payload do
-        p when is_map(p) -> Map.merge(context.token.parameters, p)
-        _ -> context.token.parameters
+    merged =
+      if node.result_variable && node.result_variable != "" do
+        Map.put(parameters, node.result_variable, payload)
+      else
+        # No result_variable: merge payload directly if it's a map
+        case payload do
+          p when is_map(p) -> Map.merge(parameters, p)
+          _ -> parameters
+        end
       end
-    end
+
     first_output = List.first(node.outputs || [])
-    if first_output, do: NodeResult.next_with_params(first_output, merged), else: NodeResult.complete(%Chronicle.Engine.CompletionData.Blank{})
+
+    if first_output,
+      do: NodeResult.next_with_params(first_output, merged),
+      else: NodeResult.complete(%Chronicle.Engine.CompletionData.Blank{})
   end
 
   defp handle_error(context, error_data, retry?, backoff_ms) do
@@ -73,6 +88,7 @@ defmodule Chronicle.Engine.Nodes.ExternalTask do
       _ ->
         # Fail: propagate to error boundary or crash
         boundary = Chronicle.Engine.Nodes.Activity.get_boundary_event_to_error(node, error_data)
+
         if boundary do
           NodeResult.next(boundary.id)
         else
@@ -83,15 +99,20 @@ defmodule Chronicle.Engine.Nodes.ExternalTask do
 
   defp handle_simulation(context) do
     {event, _ctx} = ExecutionContext.next_simulation_event(context)
+
     case event do
       %Chronicle.Engine.PersistentData.ExternalTaskCreation{} ->
         NodeResult.simulation_barrier_then_wait(:waiting_for_external_task)
+
       %Chronicle.Engine.PersistentData.ExternalTaskCompletion{successful: true, next_node: next} ->
         NodeResult.next(next)
+
       %Chronicle.Engine.PersistentData.ExternalTaskCompletion{successful: false} ->
         NodeResult.simulation_barrier_then_execute()
+
       %Chronicle.Engine.PersistentData.ExternalTaskCancellation{continuation_node_id: node_id} ->
         NodeResult.next(node_id)
+
       _ ->
         NodeResult.simulation_barrier_then_wait(:waiting_for_external_task)
     end

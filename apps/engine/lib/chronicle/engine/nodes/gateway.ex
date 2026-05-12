@@ -8,8 +8,15 @@ defmodule Chronicle.Engine.Nodes.Gateway do
   @type kind :: :parallel | :exclusive | :inclusive | :event_based
 
   defstruct [
-    :id, :key, :kind, :is_merging, :expressions, :default_path,
-    :inputs, :outputs, :properties
+    :id,
+    :key,
+    :kind,
+    :is_merging,
+    :expressions,
+    :default_path,
+    :inputs,
+    :outputs,
+    :properties
   ]
 
   @impl true
@@ -52,6 +59,7 @@ defmodule Chronicle.Engine.Nodes.Gateway do
   defp normalize_expression_results({:ok, results}) when is_list(results) do
     normalize_expression_results(results)
   end
+
   defp normalize_expression_results(results) when is_list(results) do
     Enum.map(results, fn
       %{"node_id" => node_id, "result" => result} -> {node_id, result}
@@ -59,6 +67,7 @@ defmodule Chronicle.Engine.Nodes.Gateway do
       other -> {0, other}
     end)
   end
+
   defp normalize_expression_results(other), do: [{0, other}]
 
   # Fork behavior
@@ -131,7 +140,14 @@ defmodule Chronicle.Engine.Nodes.Gateway do
 
   defp continue_event_based(context, node) do
     trigger = context.token.context.continuation_context
-    selected = select_event_candidate(context.definition, node.outputs || [], trigger, context.token.context[:event_gateway_candidates] || [])
+
+    selected =
+      select_event_candidate(
+        context.definition,
+        node.outputs || [],
+        trigger,
+        context.token.context[:event_gateway_candidates] || []
+      )
 
     case selected do
       nil ->
@@ -159,6 +175,15 @@ defmodule Chronicle.Engine.Nodes.Gateway do
 
   defp branch_type(nil), do: nil
   defp branch_type(branch), do: branch.__struct__ |> Module.split() |> List.last()
+
+  defp select_event_candidate(
+         definition,
+         _outputs,
+         {:message, _name, _payload, selected_node_id},
+         _candidates
+       ) do
+    Chronicle.Engine.Diagrams.Definition.get_node(definition, selected_node_id)
+  end
 
   defp select_event_candidate(definition, _outputs, {:message, name, _payload}, candidates) do
     case Enum.find(candidates, &(&1[:type] == :message and &1[:name] == name)) do
@@ -188,7 +213,9 @@ defmodule Chronicle.Engine.Nodes.Gateway do
     selected = Enum.find(expression_results, fn {_node_id, result} -> result == true end)
 
     case selected do
-      {node_id, _} -> NodeResult.next(node_id)
+      {node_id, _} ->
+        NodeResult.next(node_id)
+
       nil ->
         path = effective_default(node) || List.first(node.outputs || [])
         NodeResult.next(path)
@@ -197,7 +224,8 @@ defmodule Chronicle.Engine.Nodes.Gateway do
 
   defp fork_inclusive(node, expression_results) do
     # Select ALL true paths
-    true_paths = expression_results
+    true_paths =
+      expression_results
       |> Enum.filter(fn {_node_id, result} -> result == true end)
       |> Enum.map(fn {node_id, _} -> node_id end)
 
@@ -205,8 +233,10 @@ defmodule Chronicle.Engine.Nodes.Gateway do
       [] ->
         path = effective_default(node) || List.first(node.outputs || [])
         NodeResult.next(path)
+
       [single] ->
         NodeResult.next(single)
+
       paths ->
         NodeResult.fork(paths, [])
     end
@@ -217,7 +247,10 @@ defmodule Chronicle.Engine.Nodes.Gateway do
   defp effective_default(%{default_path: dp}), do: dp
   defp effective_default(_), do: nil
 
-  defp resolve_message_name(%{static_text: text, variable_content: nil}, _params) when not is_nil(text), do: text
+  defp resolve_message_name(%{static_text: text, variable_content: nil}, _params)
+       when not is_nil(text),
+       do: text
+
   defp resolve_message_name(%{static_text: text}, _params) when not is_nil(text), do: text
   defp resolve_message_name(%{name: name}, _params), do: name
   defp resolve_message_name(name, _params) when is_binary(name), do: name

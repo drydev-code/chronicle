@@ -13,6 +13,11 @@ defmodule Chronicle.Engine.Instance.WaitRegistryTest do
       {:error, {:already_started, _pid}} -> :ok
     end
 
+    case Chronicle.Engine.Scripting.ScriptPool.start_link([]) do
+      {:ok, pid} -> Process.unlink(pid)
+      {:error, {:already_started, _pid}} -> :ok
+    end
+
     :ok
   end
 
@@ -51,9 +56,54 @@ defmodule Chronicle.Engine.Instance.WaitRegistryTest do
   end
 
   describe "boundary lifecycle cleanup" do
+    test "message wait ignores payloads that fail correlation and consumes payloads that match" do
+      token =
+        Token.new(1, 0, 10, %{"expected" => "approved"})
+        |> Token.set_waiting(:waiting_for_message)
+
+      state =
+        Map.merge(TokenState.base_state(), %{
+          id: "inst-1",
+          tenant_id: "tenant-a",
+          business_key: "bk-1",
+          definition: %Chronicle.Engine.Diagrams.Definition{
+            nodes: %{
+              10 => %Nodes.IntermediateCatch.MessageEvent{
+                id: 10,
+                message: %{
+                  name: "reply",
+                  correlation: "message.status === expected"
+                },
+                outputs: [11]
+              }
+            }
+          },
+          tokens: %{1 => token},
+          waiting_tokens: MapSet.new([1]),
+          message_waits: %{"reply" => [1]}
+        })
+
+      assert {:ignored, ^state} =
+               WaitRegistry.handle_message(state, "reply", %{"status" => "rejected"})
+
+      assert {:resumed, state} =
+               WaitRegistry.handle_message(state, "reply", %{"status" => "approved"})
+
+      assert state.message_waits == %{}
+
+      assert state.tokens[1].context.continuation_context ==
+               {:message, "reply", %{"status" => "approved"}}
+    end
+
     test "interrupting boundary trigger removes sibling boundary waits and timers" do
       ref = make_ref()
-      message_boundary = %Nodes.BoundaryEvents.MessageBoundary{id: 20, message: "cancel", outputs: [30]}
+
+      message_boundary = %Nodes.BoundaryEvents.MessageBoundary{
+        id: 20,
+        message: "cancel",
+        outputs: [30]
+      }
+
       signal_boundary = %Nodes.BoundaryEvents.SignalBoundary{id: 21, signal: "sig", outputs: [31]}
 
       state =
@@ -62,7 +112,13 @@ defmodule Chronicle.Engine.Instance.WaitRegistryTest do
             1 => [
               %{type: :message, boundary_node_id: 20, name: "cancel", interrupting: true},
               %{type: :signal, boundary_node_id: 21, name: "sig", interrupting: true},
-              %{type: :timer, boundary_node_id: 22, timer_id: "timer-1", timer_ref: ref, interrupting: true}
+              %{
+                type: :timer,
+                boundary_node_id: 22,
+                timer_id: "timer-1",
+                timer_ref: ref,
+                interrupting: true
+              }
             ]
           },
           message_boundaries: %{"cancel" => [{1, message_boundary}]},
@@ -109,6 +165,69 @@ defmodule Chronicle.Engine.Instance.WaitRegistryTest do
       assert state.ni_message_boundaries == %{"notify" => [{1, message_boundary}]}
       assert state.tokens[2].current_node == 20
       assert MapSet.member?(state.active_tokens, 2)
+    end
+
+    test "message boundary ignores payloads that fail correlation" do
+      message_boundary = %Nodes.BoundaryEvents.MessageBoundary{
+        id: 20,
+        message: %{name: "cancel", correlation: "message.reason === 'abort'"},
+        outputs: [30]
+      }
+
+      state =
+        boundary_state(%{
+          message_boundaries: %{"cancel" => [{1, message_boundary}]}
+        })
+
+      assert {:ignored, ^state} =
+               WaitRegistry.handle_message(state, "cancel", %{"reason" => "retry"})
+
+      assert {:boundary, state} =
+               WaitRegistry.handle_message(state, "cancel", %{"reason" => "abort"})
+
+      assert state.tokens[1].current_node == 20
+      assert state.tokens[1].state == :execute_current_node
+    end
+
+    test "event gateway selects the message branch whose correlation matches" do
+      token =
+        Token.new(1, 0, 10, %{})
+        |> Token.set_waiting(:waiting_for_event_gateway)
+        |> Token.set_context(:event_gateway_candidates, [
+          %{type: :message, name: "reply", node_id: 11},
+          %{type: :message, name: "reply", node_id: 12}
+        ])
+
+      state =
+        Map.merge(TokenState.base_state(), %{
+          id: "inst-1",
+          tenant_id: "tenant-a",
+          business_key: "bk-1",
+          definition: %Chronicle.Engine.Diagrams.Definition{
+            nodes: %{
+              10 => %Nodes.Gateway{id: 10, kind: :event_based},
+              11 => %Nodes.IntermediateCatch.MessageEvent{
+                id: 11,
+                message: %{name: "reply", correlation: "message.kind === 'first'"},
+                outputs: [20]
+              },
+              12 => %Nodes.IntermediateCatch.MessageEvent{
+                id: 12,
+                message: %{name: "reply", correlation: "message.kind === 'second'"},
+                outputs: [21]
+              }
+            }
+          },
+          tokens: %{1 => token},
+          waiting_tokens: MapSet.new([1]),
+          message_waits: %{"reply" => [1]}
+        })
+
+      assert {:resumed, state} =
+               WaitRegistry.handle_message(state, "reply", %{"kind" => "second"})
+
+      assert state.tokens[1].context.continuation_context ==
+               {:message, "reply", %{"kind" => "second"}, 12}
     end
   end
 

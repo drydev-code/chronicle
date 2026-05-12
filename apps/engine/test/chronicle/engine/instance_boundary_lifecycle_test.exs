@@ -111,6 +111,100 @@ defmodule Chronicle.Engine.InstanceBoundaryLifecycleTest do
     end
   end
 
+  describe "message correlation" do
+    test "intermediate catch leaves the wait open until the correlation script matches" do
+      bpjs = %{
+        "name" => "message-correlation-catch",
+        "version" => 1,
+        "nodes" => [
+          %{"id" => 1, "type" => "blankStartEvent"},
+          %{
+            "id" => 2,
+            "type" => "intermediateCatchMessageEvent",
+            "message" => %{
+              "name" => "reply",
+              "correlationScript" => "message.status === 'approved'"
+            }
+          },
+          %{"id" => 3, "type" => "blankEndEvent"}
+        ],
+        "connections" => [
+          %{"from" => 1, "to" => 2},
+          %{"from" => 2, "to" => 3}
+        ]
+      }
+
+      {:ok, definition} = Chronicle.Engine.Diagrams.Parser.parse(Jason.encode!(bpjs))
+
+      {:ok, pid} =
+        Instance.start_link(
+          {definition, %{tenant_id: "tenant-boundary", business_key: "bk-message"}}
+        )
+
+      wait_until(pid, &(&1.message_waits == %{"reply" => [0]}))
+
+      :ok = Instance.send_message_sync(pid, "reply", %{"status" => "rejected"})
+      state = :sys.get_state(pid)
+
+      assert state.message_waits == %{"reply" => [0]}
+
+      refute Enum.any?(
+               state.persistent_events,
+               &match?(%PersistentData.MessageHandled{name: "reply"}, &1)
+             )
+
+      :ok = Instance.send_message_sync(pid, "reply", %{"status" => "approved"})
+
+      state =
+        wait_until(pid, fn state ->
+          Enum.any?(
+            state.persistent_events,
+            &match?(%PersistentData.MessageHandled{name: "reply"}, &1)
+          )
+        end)
+
+      assert state.message_waits == %{}
+    end
+
+    test "message boundary does not persist a trigger when correlation is false" do
+      {:ok, pid, _instance_id} = start_retry_boundary_instance("message-boundary-correlation", [
+        %{
+          "id" => 20,
+          "type" => "messageBoundaryEvent",
+          "activity" => 2,
+          "message" => %{
+            "name" => "cancel",
+            "correlationScript" => "message.reason === 'abort'"
+          }
+        }
+      ])
+
+      _task_id = wait_for_external_task(pid)
+
+      :ok = Instance.send_message_sync(pid, "cancel", %{"reason" => "retry"})
+      state = :sys.get_state(pid)
+
+      refute Enum.any?(
+               state.persistent_events,
+               &match?(%PersistentData.BoundaryEventTriggered{boundary_node_id: 20}, &1)
+             )
+
+      assert state.tokens[0].state == :waiting_for_external_task
+
+      :ok = Instance.send_message_sync(pid, "cancel", %{"reason" => "abort"})
+
+      state =
+        wait_until(pid, fn state ->
+          Enum.any?(
+            state.persistent_events,
+            &match?(%PersistentData.BoundaryEventTriggered{boundary_node_id: 20}, &1)
+          )
+        end)
+
+      assert state.tokens[0].current_node == 120
+    end
+  end
+
   describe "non-interrupting timer semantics" do
     test "non-interrupting timer boundary is one-shot and replay does not restore it" do
       {:ok, pid, instance_id} = start_retry_boundary_instance("non-interrupting-timer-boundary", [
