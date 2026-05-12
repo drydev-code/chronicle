@@ -24,9 +24,15 @@ defmodule Chronicle.Engine.Diagrams.DiagramStore do
   @impl true
   def init(_) do
     table = :ets.new(:diagram_store, [:named_table, :set, :public, read_concurrency: true])
-    msg_table = :ets.new(:diagram_message_starts, [:named_table, :bag, :public, read_concurrency: true])
-    sig_table = :ets.new(:diagram_signal_starts, [:named_table, :bag, :public, read_concurrency: true])
-    cond_table = :ets.new(:diagram_conditional_starts, [:named_table, :bag, :public, read_concurrency: true])
+
+    msg_table =
+      :ets.new(:diagram_message_starts, [:named_table, :bag, :public, read_concurrency: true])
+
+    sig_table =
+      :ets.new(:diagram_signal_starts, [:named_table, :bag, :public, read_concurrency: true])
+
+    cond_table =
+      :ets.new(:diagram_conditional_starts, [:named_table, :bag, :public, read_concurrency: true])
 
     rehydrate_from_db()
 
@@ -39,12 +45,18 @@ defmodule Chronicle.Engine.Diagrams.DiagramStore do
 
   def get(name, version, tenant) do
     key = {name, version, tenant}
+
     case :ets.lookup(:diagram_store, key) do
-      [{^key, %{state: :loaded, definition: def}}] -> {:ok, def}
-      [{^key, %{state: :not_loaded}}] -> {:loading, key}
+      [{^key, %{state: :loaded, definition: def}}] ->
+        {:ok, def}
+
+      [{^key, %{state: :not_loaded}}] ->
+        {:loading, key}
+
       [] ->
         # Fallback to default tenant
         default_key = {name, version, nil}
+
         case :ets.lookup(:diagram_store, default_key) do
           [{^default_key, %{state: :loaded, definition: def}}] -> {:ok, def}
           [] -> {:error, :not_found}
@@ -56,20 +68,47 @@ defmodule Chronicle.Engine.Diagrams.DiagramStore do
     # Find highest version for name+tenant
     pattern = {{name, :_, tenant}, :_}
     matches = :ets.match_object(:diagram_store, pattern)
+
     case Enum.sort_by(matches, fn {{_, v, _}, _} -> v end, :desc) do
       [{_key, %{state: :loaded, definition: def}} | _] -> {:ok, def}
       _ -> get(name, nil, tenant)
     end
   end
 
+  def unregister(name, version, tenant) do
+    GenServer.call(__MODULE__, {:unregister, name, version, tenant})
+  end
+
   def get_process_names_for_message(message, tenant) do
-    :ets.lookup(:diagram_message_starts, {message, tenant})
-    |> Enum.map(fn {_, process_name} -> process_name end)
+    lookup_message_starts(message, tenant)
+    |> Enum.map(fn {_key, {process_name, _version}} -> process_name end)
+    |> Enum.uniq()
   end
 
   def get_process_names_for_signal(signal, tenant) do
     :ets.lookup(:diagram_signal_starts, {signal, tenant})
     |> Enum.map(fn {_, process_name} -> process_name end)
+  end
+
+  def get_registered_start_messages(tenant \\ nil) do
+    :ets.tab2list(:diagram_message_starts)
+    |> Enum.filter(fn {{_message, indexed_tenant}, _process} ->
+      indexed_tenant in [tenant, nil]
+    end)
+    |> Enum.map(fn {{message, _tenant}, _process} -> message end)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+  end
+
+  def get_message_start_definitions(message, tenant) do
+    lookup_message_starts(message, tenant)
+    |> Enum.flat_map(fn {_key, {name, version}} ->
+      case get(name, version, tenant) do
+        {:ok, definition} -> [definition]
+        _ -> []
+      end
+    end)
+    |> Enum.uniq_by(&{&1.name, &1.version, &1.tenant})
   end
 
   def get_definitions_with_conditional_starts(tenant) do
@@ -91,7 +130,11 @@ defmodule Chronicle.Engine.Diagrams.DiagramStore do
     case persist(name, version, tenant, raw_content) do
       :ok ->
         insert_into_ets(name, version, tenant, definition)
-        Logger.info("DiagramStore: registered #{name}@#{version || "latest"} for tenant #{tenant || "default"}")
+
+        Logger.info(
+          "DiagramStore: registered #{name}@#{version || "latest"} for tenant #{tenant || "default"}"
+        )
+
         {:reply, :ok, state}
 
       {:error, reason} ->
@@ -103,6 +146,14 @@ defmodule Chronicle.Engine.Diagrams.DiagramStore do
     end
   end
 
+  @impl true
+  def handle_call({:unregister, name, version, tenant}, _from, state) do
+    key = {name, version, tenant}
+    :ets.delete(:diagram_store, key)
+    remove_start_indexes(name, version, tenant)
+    {:reply, :ok, state}
+  end
+
   # ---- Private helpers ----
 
   defp insert_into_ets(name, version, tenant, definition) do
@@ -111,7 +162,8 @@ defmodule Chronicle.Engine.Diagrams.DiagramStore do
     :ets.insert(:diagram_store, {key, entry})
 
     for msg_start <- Definition.get_message_start_events(definition) do
-      :ets.insert(:diagram_message_starts, {{msg_start.message, tenant}, name})
+      message_name = Chronicle.Engine.MessageCorrelation.message_name(msg_start.message)
+      :ets.insert(:diagram_message_starts, {{message_name, tenant}, {name, version}})
     end
 
     for sig_start <- Definition.get_signal_start_events(definition) do
@@ -122,6 +174,21 @@ defmodule Chronicle.Engine.Diagrams.DiagramStore do
       [] -> :ok
       _ -> :ets.insert(:diagram_conditional_starts, {tenant, {name, version}})
     end
+  end
+
+  defp remove_start_indexes(name, version, tenant) do
+    :ets.match_delete(:diagram_message_starts, {{:_, tenant}, {name, version}})
+    :ets.match_delete(:diagram_signal_starts, {{:_, tenant}, name})
+    :ets.match_delete(:diagram_conditional_starts, {tenant, {name, version}})
+  end
+
+  defp lookup_message_starts(message, tenant) do
+    tenant_matches = :ets.lookup(:diagram_message_starts, {message, tenant})
+
+    default_matches =
+      if tenant, do: :ets.lookup(:diagram_message_starts, {message, nil}), else: []
+
+    Enum.uniq(tenant_matches ++ default_matches)
   end
 
   # No raw content provided — caller opted into memory-only registration

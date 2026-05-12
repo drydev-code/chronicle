@@ -7,7 +7,10 @@ defmodule Chronicle.Server.Web.Controllers.ExternalTaskController do
     payload = Map.get(params, "payload", %{})
     result = Map.get(params, "result")
 
-    reply(conn, ExternalTaskRouter.complete_task(task_id, payload, result), %{status: "completed", taskId: task_id})
+    reply(conn, ExternalTaskRouter.complete_task(task_id, payload, result), %{
+      status: "completed",
+      taskId: task_id
+    })
   end
 
   def fail(conn, %{"task_id" => task_id} = params) do
@@ -21,7 +24,10 @@ defmodule Chronicle.Server.Web.Controllers.ExternalTaskController do
     retry? = truthy?(Map.get(params, "retry", false))
     backoff_ms = positive_int(Map.get(params, "backoffMs", 0), 0)
 
-    reply(conn, ExternalTaskRouter.fail_task(task_id, error, retry?, backoff_ms), %{status: "failed", taskId: task_id})
+    reply(conn, ExternalTaskRouter.fail_task(task_id, error, retry?, backoff_ms), %{
+      status: "failed",
+      taskId: task_id
+    })
   end
 
   def cancel(conn, %{"task_id" => task_id} = params) do
@@ -39,18 +45,26 @@ defmodule Chronicle.Server.Web.Controllers.ExternalTaskController do
 
     actor = %{
       type: Map.get(params, "actorType", "Actor"),
-      id: Map.get(params, "userId") || conn.assigns[:user_id]
+      id: Map.get(params, "userId") || conn.assigns[:user_id],
+      role: Map.get(params, "actingRole")
     }
 
-    payload = Map.put(payload, "__actor", actor)
-    reply(conn, ExternalTaskRouter.complete_task(task_id, payload, nil), %{status: "executed", taskId: task_id})
+    payload = Chronicle.Engine.Actors.put_update(payload, actor)
+
+    reply(conn, ExternalTaskRouter.complete_task(task_id, payload, nil), %{
+      status: "executed",
+      taskId: task_id
+    })
   end
 
   def reject_user_task(conn, %{"task_id" => task_id} = params) do
     reason = Map.get(params, "reason", "Rejected")
     error = %{"error_message" => reason, "error_type" => "UserTaskRejected"}
 
-    reply(conn, ExternalTaskRouter.fail_task(task_id, error, false, 0), %{status: "rejected", taskId: task_id})
+    reply(conn, ExternalTaskRouter.fail_task(task_id, error, false, 0), %{
+      status: "rejected",
+      taskId: task_id
+    })
   end
 
   defp reply(conn, :ok, body), do: json(conn, body)

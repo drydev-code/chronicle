@@ -690,13 +690,14 @@ defmodule Chronicle.Engine.Instance do
   defp command_call_reply({:error, reason, state}), do: {:reply, {:error, reason}, state}
 
   defp do_message_command(state, message_name, payload) do
-    events = message_command_events(state, message_name, payload)
+    delivery = WaitRegistry.matching_message_delivery(state, message_name, payload)
+    events = message_command_events(state, message_name, payload, delivery)
 
     case persist_command_events(state, events) do
       {:ok, state} ->
         state = apply_activity_timer_cancellations(state, events)
 
-        case WaitRegistry.handle_message(state, message_name, payload) do
+        case WaitRegistry.handle_message_delivery(delivery, state, message_name, payload) do
           {:ignored, state} ->
             {:ok, state, false}
 
@@ -1049,11 +1050,12 @@ defmodule Chronicle.Engine.Instance do
     %{state | pending_effects: []}
   end
 
-  defp message_command_events(state, message_name, payload) do
+  defp message_command_events(state, message_name, payload, delivery) do
     wait_events =
-      case Map.get(state.message_waits, message_name, []) do
-        [token_id | _] ->
+      case delivery do
+        {:wait, token_id, _selected_node_id} ->
           token = Map.get(state.tokens, token_id)
+
           [%PersistentData.MessageHandled{
             token: token_id,
             family: token && token.family,
@@ -1064,11 +1066,11 @@ defmodule Chronicle.Engine.Instance do
             payload: payload
           }]
 
-        [] ->
+        _ ->
           []
       end
 
-    boundary_trigger_events(state, :message, message_name)
+    boundary_trigger_events(state, :message, message_name, delivery)
     |> Kernel.++(wait_events)
   end
 
@@ -1086,10 +1088,10 @@ defmodule Chronicle.Engine.Instance do
         }
       end)
 
-    boundary_trigger_events(state, :signal, signal_name) ++ wait_events
+    boundary_trigger_events(state, :signal, signal_name, :all) ++ wait_events
   end
 
-  defp boundary_trigger_events(state, type, name) do
+  defp boundary_trigger_events(state, type, name, delivery) do
     {interrupting, non_interrupting} =
       case type do
         :message -> {state.message_boundaries, state.ni_message_boundaries}
@@ -1099,6 +1101,7 @@ defmodule Chronicle.Engine.Instance do
     Enum.flat_map([{interrupting, true}, {non_interrupting, false}], fn {map, interrupting?} ->
       map
       |> Map.get(name, [])
+      |> matching_boundary_deliveries(delivery)
       |> Enum.flat_map(fn {token_id, boundary_node} ->
         trigger_event = BoundaryLifecycle.trigger_event(state, token_id, boundary_node.id)
 
@@ -1112,6 +1115,18 @@ defmodule Chronicle.Engine.Instance do
       end)
     end)
   end
+
+  defp matching_boundary_deliveries(boundaries, :all), do: boundaries
+
+  defp matching_boundary_deliveries(boundaries, {:boundaries, matches, _interrupting_count}) do
+    ids = MapSet.new(matches, fn {token_id, boundary} -> {token_id, boundary.id} end)
+
+    Enum.filter(boundaries, fn {token_id, boundary} ->
+      MapSet.member?(ids, {token_id, boundary.id})
+    end)
+  end
+
+  defp matching_boundary_deliveries(_boundaries, _delivery), do: []
 
   defp cleanup_interrupted_activity_timers(state) do
     active_tokens =

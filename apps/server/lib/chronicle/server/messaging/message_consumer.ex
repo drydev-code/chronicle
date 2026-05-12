@@ -47,13 +47,15 @@ defmodule Chronicle.Server.Messaging.MessageConsumer do
     service_exchange = Keyword.get(config, :service_exchange, @default_service_exchange)
 
     # Bind to realm topic exchange with routing key per message type
-    event_bindings = Enum.map(@subscribed_events, fn event ->
-      routing_key = "#{@message_assembly}+#{event}.#.#"
-      {realm_exchange, [routing_key: routing_key]}
-    end)
+    event_bindings =
+      Enum.map(@subscribed_events, fn event ->
+        routing_key = "#{@message_assembly}+#{event}.#.#"
+        {realm_exchange, [routing_key: routing_key]}
+      end)
 
     # Also bind to service fanout exchange for commands sent directly to us
     command_binding = {service_exchange, []}
+    message_start_binding = {realm_exchange, [routing_key: "#"]}
 
     # Declare exchanges before binding - captures exchange names in closure
     after_connect = fn channel ->
@@ -63,22 +65,22 @@ defmodule Chronicle.Server.Messaging.MessageConsumer do
     Broadway.start_link(__MODULE__,
       name: __MODULE__,
       producer: [
-        module: {BroadwayRabbitMQ.Producer,
-          queue: queue,
-          declare: [
-            durable: true,
-            arguments: [
-              {"x-max-priority", :long, 9},
-              {"x-queue-mode", :longstr, "lazy"},
-              {"x-dead-letter-exchange", :longstr, "Chronicle.Error"}
-            ]
-          ],
-          bindings: [command_binding | event_bindings],
-          after_connect: after_connect,
-          connection: AmqpConnection.get_amqp_config(),
-          on_failure: :reject,
-          metadata: [:type, :headers, :content_type, :routing_key, :correlation_id]
-        }
+        module:
+          {BroadwayRabbitMQ.Producer,
+           queue: queue,
+           declare: [
+             durable: true,
+             arguments: [
+               {"x-max-priority", :long, 9},
+               {"x-queue-mode", :longstr, "lazy"},
+               {"x-dead-letter-exchange", :longstr, "Chronicle.Error"}
+             ]
+           ],
+           bindings: [command_binding, message_start_binding | event_bindings],
+           after_connect: after_connect,
+           connection: AmqpConnection.get_amqp_config(),
+           on_failure: :reject,
+           metadata: [:type, :headers, :content_type, :routing_key, :correlation_id]}
       ],
       processors: [
         default: [concurrency: 10]
@@ -96,7 +98,8 @@ defmodule Chronicle.Server.Messaging.MessageConsumer do
 
     # Bind realm exchange to Chronicle.Events headers exchange
     AMQP.Exchange.bind(channel, realm_exchange, "Chronicle.Events",
-      arguments: [{"Chronicle.Realm.Any", :longstr, "True"}])
+      arguments: [{"Chronicle.Realm.Any", :longstr, "True"}]
+    )
 
     # Declare the service fanout exchange (Chronicle.Engine)
     AMQP.Exchange.declare(channel, service_exchange, :fanout, durable: true)
@@ -105,11 +108,13 @@ defmodule Chronicle.Server.Messaging.MessageConsumer do
     AMQP.Exchange.declare(channel, "Chronicle.Error", :fanout, durable: true)
 
     # Declare the workflow service destination exchange (for deployment commands)
-    workflow_dest = Keyword.get(
-      Application.get_env(:server, :rabbitmq, []),
-      :workflow_service_destination,
-      "Chronicle.Service.Workflow"
-    )
+    workflow_dest =
+      Keyword.get(
+        Application.get_env(:server, :rabbitmq, []),
+        :workflow_service_destination,
+        "Chronicle.Service.Workflow"
+      )
+
     AMQP.Exchange.declare(channel, workflow_dest, :fanout, durable: true)
 
     # Ensure delay delivery binding exists (idempotent)
@@ -117,8 +122,10 @@ defmodule Chronicle.Server.Messaging.MessageConsumer do
     # and need routing back to our service exchange
     AMQP.Exchange.declare(channel, "x-Chronicle.Delay", :topic, durable: true)
     AMQP.Exchange.declare(channel, "x-Chronicle.Delivery", :topic, durable: true)
+
     AMQP.Exchange.bind(channel, service_exchange, "x-Chronicle.Delivery",
-      routing_key: "#.#{service_exchange}")
+      routing_key: "#.#{service_exchange}"
+    )
 
     :ok
   end
@@ -135,7 +142,11 @@ defmodule Chronicle.Server.Messaging.MessageConsumer do
       e ->
         if retry_count < @max_retries do
           delay_seconds = 10 * (retry_count + 1)
-          Logger.warning("Transient error, retry #{retry_count + 1}/#{@max_retries} in #{delay_seconds}s: #{Exception.message(e)}")
+
+          Logger.warning(
+            "Transient error, retry #{retry_count + 1}/#{@max_retries} in #{delay_seconds}s: #{Exception.message(e)}"
+          )
+
           republish_to_delay(data, metadata, retry_count + 1, delay_seconds, e)
           message
         else
@@ -196,6 +207,9 @@ defmodule Chronicle.Server.Messaging.MessageConsumer do
       WireFormat.message_type_match?(decoded, "ProcessInstanceDeleteCommand") ->
         handle_process_delete(decoded.body)
 
+      registered_message_start?(decoded) ->
+        handle_registered_message_start(decoded)
+
       true ->
         :ignored
     end
@@ -209,26 +223,38 @@ defmodule Chronicle.Server.Messaging.MessageConsumer do
     result = Map.get(body, "result")
     tenant_id = Map.get(body, "tenantId", "00000000-0000-0000-0000-000000000000")
 
-    Logger.info("MessageConsumer: ServiceTaskExecutedEvent task_id=#{inspect(task_id)} body_keys=#{inspect(Map.keys(body))}")
+    Logger.info(
+      "MessageConsumer: ServiceTaskExecutedEvent task_id=#{inspect(task_id)} body_keys=#{inspect(Map.keys(body))}"
+    )
 
     # Payload may arrive as a JSON string from the executor; parse if needed
-    payload = case raw_payload do
-      str when is_binary(str) ->
-        case Jason.decode(str) do
-          {:ok, decoded} -> decoded
-          _ -> %{"_raw" => str}
-        end
-      map when is_map(map) -> map
-      list when is_list(list) -> list
-      _ -> %{}
-    end
+    payload =
+      case raw_payload do
+        str when is_binary(str) ->
+          case Jason.decode(str) do
+            {:ok, decoded} -> decoded
+            _ -> %{"_raw" => str}
+          end
+
+        map when is_map(map) ->
+          map
+
+        list when is_list(list) ->
+          list
+
+        _ ->
+          %{}
+      end
 
     # Upload large values to DataBus (keeps token parameters memory-efficient)
-    payload = if LargeVariables.enabled?() and is_map(payload) do
-      LargeVariables.upload(payload, tenant_id)
-    else
-      payload
-    end
+    payload =
+      if LargeVariables.enabled?() and is_map(payload) do
+        LargeVariables.upload(payload, tenant_id)
+      else
+        payload
+      end
+
+    payload = put_actor_update(payload, body)
 
     Logger.info("MessageConsumer: completing task_id=#{inspect(task_id)}")
 
@@ -265,12 +291,7 @@ defmodule Chronicle.Server.Messaging.MessageConsumer do
   defp handle_user_task_executed(body) do
     task_id = Map.get(body, "externalTaskId")
     payload = Map.get(body, "payload", %{})
-    actor = %{
-      type: Map.get(body, "actorType", "Actor"),
-      id: Map.get(body, "userId")
-    }
-
-    merged_payload = Map.put(payload, "__actor", actor)
+    merged_payload = put_actor_update(payload, body)
 
     case ExternalTaskRouter.complete_task(task_id, merged_payload, nil) do
       :ok -> :ok
@@ -290,7 +311,11 @@ defmodule Chronicle.Server.Messaging.MessageConsumer do
       end
     else
       task_id = Map.get(body, "externalTaskId")
-      error = %{error_message: Map.get(body, "reason", "Rejected"), error_type: "UserTaskRejected"}
+
+      error = %{
+        error_message: Map.get(body, "reason", "Rejected"),
+        error_type: "UserTaskRejected"
+      }
 
       case ExternalTaskRouter.fail_task(task_id, error, false, 0) do
         :ok -> :ok
@@ -321,8 +346,41 @@ defmodule Chronicle.Server.Messaging.MessageConsumer do
           {Instance, {definition, instance_params}}
         )
 
-      _ -> :process_not_found
+      _ ->
+        :process_not_found
     end
+  end
+
+  defp handle_registered_message_start(decoded) do
+    tenant_id = Map.get(decoded.body, "tenantId", "00000000-0000-0000-0000-000000000000")
+    message_name = registered_message_start_name(decoded)
+
+    message_name
+    |> DiagramStore.get_message_start_definitions(tenant_id)
+    |> Enum.each(fn definition ->
+      start_node = message_start_node(definition, message_name)
+
+      if message_start_matches?(start_node, decoded, message_name) do
+        instance_params = %{
+          id: UUID.uuid4(),
+          business_key: Map.get(decoded.body, "businessKey", UUID.uuid4()),
+          tenant_id: tenant_id,
+          start_node_id: start_node && start_node.id,
+          started_by_engine: true,
+          start_parameters: %{
+            "message" => decoded.body,
+            "messageType" => decoded.message_type
+          }
+        }
+
+        DynamicSupervisor.start_child(
+          Chronicle.Engine.InstanceSupervisor,
+          {Instance, {definition, instance_params}}
+        )
+      end
+    end)
+
+    :ok
   end
 
   defp handle_message_correlated(body) do
@@ -339,11 +397,15 @@ defmodule Chronicle.Server.Messaging.MessageConsumer do
     end)
 
     # Also dispatch to evicted instances via LoadCell
-    Registry.dispatch(:evicted_waits, {tenant_id, :message, message_name, business_key}, fn entries ->
-      for {_pid, cell_pid} <- entries do
-        GenServer.cast(cell_pid, {:wake, :message, message_name, payload})
+    Registry.dispatch(
+      :evicted_waits,
+      {tenant_id, :message, message_name, business_key},
+      fn entries ->
+        for {_pid, cell_pid} <- entries do
+          GenServer.cast(cell_pid, {:wake, :message, message_name, payload})
+        end
       end
-    end)
+    )
   end
 
   defp handle_process_finished(body) do
@@ -353,13 +415,16 @@ defmodule Chronicle.Server.Messaging.MessageConsumer do
     case Instance.lookup(tenant_id, instance_id) do
       {:ok, pid} ->
         Instance.terminate_instance(pid, "External completion")
+
       _ ->
         # If evicted, the LoadCell can handle termination by removing the active instance from DB
         case Chronicle.Engine.InstanceLoadCell.lookup(tenant_id, instance_id) do
           {:ok, cell_pid} ->
             GenServer.stop(cell_pid, :normal)
             Chronicle.Persistence.EventStore.delete_active(instance_id)
-          _ -> :ok
+
+          _ ->
+            :ok
         end
     end
   end
@@ -375,9 +440,10 @@ defmodule Chronicle.Server.Messaging.MessageConsumer do
     case Manager.provision(content, filename, tenant_id) do
       {:ok, results} ->
         # Build process definition ID mapping from successful registrations
-        process_ids = results
-        |> Enum.filter(&match?({:ok, name} when is_binary(name), &1))
-        |> Map.new(fn {:ok, name} -> {name, UUID.uuid4()} end)
+        process_ids =
+          results
+          |> Enum.filter(&match?({:ok, name} when is_binary(name), &1))
+          |> Map.new(fn {:ok, name} -> {name, UUID.uuid4()} end)
 
         DeploymentCommandPublisher.send_update(
           external_id: filename,
@@ -397,6 +463,7 @@ defmodule Chronicle.Server.Messaging.MessageConsumer do
 
   defp handle_process_delete(body) do
     instance_id = Map.get(body, "processInstanceId")
+
     if instance_id do
       Chronicle.Persistence.EventStore.delete_active(instance_id)
     end
@@ -406,10 +473,79 @@ defmodule Chronicle.Server.Messaging.MessageConsumer do
     :ok
   end
 
+  defp registered_message_start?(decoded) do
+    tenant_id = Map.get(decoded.body, "tenantId", "00000000-0000-0000-0000-000000000000")
+    candidates = message_type_candidates(decoded.message_type)
+    registered = DiagramStore.get_registered_start_messages(tenant_id)
+
+    Enum.any?(candidates, &(&1 in registered))
+  end
+
+  defp registered_message_start_name(decoded) do
+    tenant_id = Map.get(decoded.body, "tenantId", "00000000-0000-0000-0000-000000000000")
+    registered = DiagramStore.get_registered_start_messages(tenant_id)
+
+    decoded.message_type
+    |> message_type_candidates()
+    |> Enum.find(&(&1 in registered))
+  end
+
+  defp message_type_candidates(nil), do: []
+
+  defp message_type_candidates(message_type) do
+    short =
+      message_type
+      |> to_string()
+      |> String.split("+")
+      |> List.last()
+
+    [message_type, short]
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Enum.uniq()
+  end
+
+  defp message_start_node(definition, message_name) do
+    definition
+    |> Chronicle.Engine.Diagrams.Definition.get_message_start_events()
+    |> Enum.find(&(Chronicle.Engine.MessageCorrelation.message_name(&1.message) == message_name))
+  end
+
+  defp message_start_matches?(nil, _decoded, _message_name), do: false
+
+  defp message_start_matches?(start_node, decoded, message_name) do
+    Chronicle.Engine.MessageCorrelation.matches?(start_node, decoded.body, %{
+      "messageName" => message_name,
+      "messageType" => decoded.message_type
+    })
+  end
+
+  defp put_actor_update(payload, source) when is_map(payload) do
+    if actor_metadata?(source) do
+      Chronicle.Engine.Actors.put_update(payload, actor_from(source))
+    else
+      payload
+    end
+  end
+
+  defp put_actor_update(payload, _source), do: payload
+
+  defp actor_metadata?(source) do
+    Enum.any?(["actorType", "userId", "actingRole"], &Map.has_key?(source, &1))
+  end
+
+  defp actor_from(source) do
+    %{
+      type: Map.get(source, "actorType", "Actor"),
+      id: Map.get(source, "userId"),
+      role: Map.get(source, "actingRole")
+    }
+  end
+
   # -- Retry helpers (Util.ServiceBus delay infrastructure) --
 
   defp get_retry_count(metadata) do
     headers = Map.get(metadata, :headers, [])
+
     case List.keyfind(headers, "Chronicle.CurrentRetry", 0) do
       {"Chronicle.CurrentRetry", _, count} -> count |> to_string() |> String.to_integer()
       _ -> 0

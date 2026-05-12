@@ -346,7 +346,7 @@ defmodule Chronicle.Engine.Diagrams.Parser do
     %Nodes.StartEvents.MessageStartEvent{
       id: base.id,
       key: base.key,
-      message: Map.get(data, "message"),
+      message: parse_message(data, base.properties),
       properties: base.properties
     }
   end
@@ -531,7 +531,7 @@ defmodule Chronicle.Engine.Diagrams.Parser do
     %Nodes.Tasks.ReceiveTask{
       id: base.id,
       key: base.key,
-      message: parse_message(data),
+      message: parse_message(data, base.properties),
       boundary_events: Map.get(data, "boundaryEvents", []),
       properties: base.properties
     }
@@ -628,7 +628,7 @@ defmodule Chronicle.Engine.Diagrams.Parser do
     %Nodes.IntermediateCatch.MessageEvent{
       id: base.id,
       key: base.key,
-      message: parse_message(data),
+      message: parse_message(data, base.properties),
       properties: base.properties
     }
   end
@@ -734,7 +734,7 @@ defmodule Chronicle.Engine.Diagrams.Parser do
     %Nodes.BoundaryEvents.MessageBoundary{
       id: base.id,
       key: base.key,
-      message: parse_message(data),
+      message: parse_message(data, base.properties),
       attached_to: Map.get(data, "activity"),
       properties: base.properties
     }
@@ -811,7 +811,7 @@ defmodule Chronicle.Engine.Diagrams.Parser do
     %Nodes.BoundaryEvents.NonInterruptingMessageBoundary{
       id: base.id,
       key: base.key,
-      message: parse_message(data),
+      message: parse_message(data, base.properties),
       attached_to: Map.get(data, "activity"),
       properties: base.properties
     }
@@ -1016,7 +1016,7 @@ defmodule Chronicle.Engine.Diagrams.Parser do
 
   defp parse_iso_duration(_), do: 1000
 
-  defp parse_message(data) do
+  defp parse_message(data, properties \\ %{}) do
     msg = Map.get(data, "message", %{})
 
     case msg do
@@ -1026,7 +1026,8 @@ defmodule Chronicle.Engine.Diagrams.Parser do
           static_text: Map.get(msg, "staticText"),
           variable_name: Map.get(msg, "variableName"),
           variable_content: Map.get(msg, "variableContent"),
-          payload_variable_name: Map.get(msg, "payloadVariableName")
+          payload_variable_name: Map.get(msg, "payloadVariableName"),
+          correlation: parse_message_correlation(data, msg, properties)
         }
 
       name when is_binary(name) ->
@@ -1035,7 +1036,8 @@ defmodule Chronicle.Engine.Diagrams.Parser do
           static_text: name,
           variable_name: nil,
           variable_content: nil,
-          payload_variable_name: nil
+          payload_variable_name: nil,
+          correlation: parse_message_correlation(data, %{}, properties)
         }
 
       _ ->
@@ -1044,9 +1046,22 @@ defmodule Chronicle.Engine.Diagrams.Parser do
           static_text: nil,
           variable_name: nil,
           variable_content: nil,
-          payload_variable_name: nil
+          payload_variable_name: nil,
+          correlation: parse_message_correlation(data, %{}, properties)
         }
     end
+  end
+
+  defp parse_message_correlation(data, message, properties) do
+    Map.get(message, "correlation") ||
+      Map.get(message, "correlationScript") ||
+      Map.get(message, "correlationExpression") ||
+      Map.get(data, "correlation") ||
+      Map.get(data, "correlationScript") ||
+      Map.get(data, "correlationExpression") ||
+      Map.get(properties || %{}, "correlation") ||
+      Map.get(properties || %{}, "correlationScript") ||
+      Map.get(properties || %{}, "correlationExpression")
   end
 
   defp parse_expressions(data) do
