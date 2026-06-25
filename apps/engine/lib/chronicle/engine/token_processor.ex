@@ -626,7 +626,7 @@ defmodule Chronicle.Engine.TokenProcessor do
     state = %{state | external_tasks: Map.put(state.external_tasks, task_id, token.id)}
 
     node = Definition.get_node(state.definition, token.current_node)
-    node_properties = if node, do: Map.get(node, :properties, %{}), else: %{}
+    node_properties = (node && Map.get(node, :properties)) || %{}
     actor_type = Map.get(node_properties, "actorType") || Map.get(node_properties, :actorType)
 
     # Persist external task creation

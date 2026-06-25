@@ -651,7 +651,15 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
           {:message, name, event.payload, event.selected_node}
         )
       else
-        TokenState.set_token_active(state, token_id)
+        # Plain (non-gateway) catch consumption: mirror the LIVE resume exactly
+        # (token.ex `continue/1`) — set the token to :continue so post-replay it is
+        # dispatched to the catch node's `continue_after_wait` (which advances to the
+        # outputs), NOT to `process` (which would re-arm a fresh wait). Setting it
+        # :execute_current_node here re-ran the catch and, with the token still parked
+        # on the MessageEvent node, made `detect_implicit_waits` re-open the wait that
+        # this MessageHandled just consumed — leaving message_waits[name] == [token]
+        # for a wait that was legitimately removed by wait_id.
+        TokenState.set_token_continue(state, token_id)
       end
 
     acc = %{acc |
@@ -946,7 +954,14 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
 
     Enum.reduce(state.tokens, {state, token_wait_states, open_message_waits, open_signal_waits},
       fn {token_id, token}, {st, waits, msg_waits, sig_waits} ->
-        if Map.has_key?(waits, token_id) or Token.terminal?(token) do
+        # Skip tokens that are not genuinely parked at an un-registered catch:
+        #   * already tracked as waiting (explicit wait event), or terminal; and
+        #   * in the :continue resume state — a MessageHandled just consumed this
+        #     token's wait and it is mid-advance through `continue_after_wait`, so it
+        #     must NOT be re-armed (that would resurrect the consumed wait). The
+        #     legitimate implicit case (crash before MessageWaitCreated persisted)
+        #     leaves the token in :execute_current_node, which is still detected.
+        if Map.has_key?(waits, token_id) or Token.terminal?(token) or token.state == :continue do
           {st, waits, msg_waits, sig_waits}
         else
           node = Definition.get_node(st.definition, token.current_node)
