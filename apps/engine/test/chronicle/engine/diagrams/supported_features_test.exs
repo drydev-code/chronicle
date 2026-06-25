@@ -116,6 +116,91 @@ defmodule Chronicle.Engine.Diagrams.SupportedFeaturesTest do
     assert definition.nodes[4].message.correlation == "message.status === 'cancelled'"
   end
 
+  test "parser captures explicit correlationKey across all three locations" do
+    bpjs = %{
+      "name" => "correlation-key",
+      "version" => 1,
+      "nodes" => [
+        # location 1: on the message map
+        %{
+          "id" => 1,
+          "type" => "messageStartEvent",
+          "message" => %{
+            "name" => "OrderUpdated",
+            "correlationKey" => "data.personId"
+          }
+        },
+        # location 2: on the node data, sibling of message
+        %{
+          "id" => 2,
+          "type" => "receiveTask",
+          "message" => "OrderUpdated",
+          "correlationKey" => "data.orderId"
+        },
+        # location 3: on properties
+        %{
+          "id" => 3,
+          "type" => "intermediateCatchMessageEvent",
+          "message" => "OrderUpdated",
+          "properties" => %{"correlationKey" => "payload.ref"}
+        }
+      ]
+    }
+
+    assert {:ok, definition} = Parser.parse(Jason.encode!(bpjs))
+
+    assert definition.nodes[1].message.correlation_key == "data.personId"
+    assert definition.nodes[2].message.correlation_key == "data.orderId"
+    assert definition.nodes[3].message.correlation_key == "payload.ref"
+  end
+
+  test "parser captures explicit correlationKeyExpression" do
+    bpjs = %{
+      "name" => "correlation-key-expression",
+      "version" => 1,
+      "nodes" => [
+        %{
+          "id" => 1,
+          "type" => "messageStartEvent",
+          "message" => %{
+            "name" => "OrderUpdated",
+            "correlationKeyExpression" => "message.data.personId"
+          }
+        },
+        %{
+          "id" => 2,
+          "type" => "intermediateCatchMessageEvent",
+          "message" => "OrderUpdated",
+          "properties" => %{"correlationKeyExpression" => "payload.ref"}
+        }
+      ]
+    }
+
+    assert {:ok, definition} = Parser.parse(Jason.encode!(bpjs))
+
+    assert definition.nodes[1].message.correlation_key_expression == "message.data.personId"
+    assert definition.nodes[2].message.correlation_key_expression == "payload.ref"
+  end
+
+  test "correlationKey is nil when absent (back-compat for un-annotated catches)" do
+    bpjs = %{
+      "name" => "no-correlation-key",
+      "version" => 1,
+      "nodes" => [
+        %{
+          "id" => 1,
+          "type" => "intermediateCatchMessageEvent",
+          "message" => "OrderUpdated"
+        }
+      ]
+    }
+
+    assert {:ok, definition} = Parser.parse(Jason.encode!(bpjs))
+
+    assert definition.nodes[1].message.correlation_key == nil
+    assert definition.nodes[1].message.correlation_key_expression == nil
+  end
+
   test "conditional start requires a condition expression" do
     bpjs = %{
       "name" => "bad-conditional-start",

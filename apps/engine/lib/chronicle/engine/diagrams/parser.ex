@@ -1028,6 +1028,8 @@ defmodule Chronicle.Engine.Diagrams.Parser do
           variable_content: Map.get(msg, "variableContent"),
           payload_variable_name: Map.get(msg, "payloadVariableName"),
           correlation: parse_message_correlation(data, msg, properties),
+          correlation_key: parse_correlation_key(data, msg, properties),
+          correlation_key_expression: parse_correlation_key_expr(data, msg, properties),
           allow_keyless: parse_allow_keyless(data, msg, properties)
         }
 
@@ -1039,6 +1041,8 @@ defmodule Chronicle.Engine.Diagrams.Parser do
           variable_content: nil,
           payload_variable_name: nil,
           correlation: parse_message_correlation(data, %{}, properties),
+          correlation_key: parse_correlation_key(data, %{}, properties),
+          correlation_key_expression: parse_correlation_key_expr(data, %{}, properties),
           allow_keyless: parse_allow_keyless(data, %{}, properties)
         }
 
@@ -1050,6 +1054,8 @@ defmodule Chronicle.Engine.Diagrams.Parser do
           variable_content: nil,
           payload_variable_name: nil,
           correlation: parse_message_correlation(data, %{}, properties),
+          correlation_key: parse_correlation_key(data, %{}, properties),
+          correlation_key_expression: parse_correlation_key_expr(data, %{}, properties),
           allow_keyless: parse_allow_keyless(data, %{}, properties)
         }
     end
@@ -1078,6 +1084,25 @@ defmodule Chronicle.Engine.Diagrams.Parser do
       Map.get(properties || %{}, "correlation") ||
       Map.get(properties || %{}, "correlationScript") ||
       Map.get(properties || %{}, "correlationExpression")
+  end
+
+  # Feature-2 explicit correlation key (parity/lint only — functional extraction is
+  # gateway-side). `correlationKey` is a message field path (e.g. "data.personId") that
+  # SELECTS the instance; un-annotated catches keep the heuristic chain. Tolerate the
+  # same three locations as keyless/correlation (message / data / properties). Case is
+  # handled by normalize_keys/1, which has already camelCased the first character.
+  defp parse_correlation_key(data, message, properties) do
+    Map.get(message, "correlationKey") ||
+      Map.get(data, "correlationKey") ||
+      Map.get(properties || %{}, "correlationKey")
+  end
+
+  # Deferred sibling of `correlationKey`: a JS expression over the message/payload.
+  # Parsed for parity only (hot-path/sandbox extraction is gateway-side, phase 2).
+  defp parse_correlation_key_expr(data, message, properties) do
+    Map.get(message, "correlationKeyExpression") ||
+      Map.get(data, "correlationKeyExpression") ||
+      Map.get(properties || %{}, "correlationKeyExpression")
   end
 
   defp parse_expressions(data) do
