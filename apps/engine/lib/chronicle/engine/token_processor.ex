@@ -467,24 +467,46 @@ defmodule Chronicle.Engine.TokenProcessor do
     token = Token.set_waiting(token, :waiting_for_message)
     waits = Map.update(state.message_waits, name, [token.id], &[token.id | &1])
 
-    # Register in Registry for cross-instance routing
-    Registry.register(:waits, {state.tenant_id, :message, name, state.business_key}, token.id)
+    # Mint a durable wait-activation id ONCE here. It is persisted, threaded through
+    # the wake-hook and replay, and used as the dedup identity (never token.id, which
+    # a loop-back to the same catch would reuse).
+    wait_id = UUID.uuid4()
+    wait_ids = Map.put(state.wait_ids || %{}, {:message, name, token.id}, wait_id)
+
+    # Register in Registry for cross-instance routing. The VALUE carries the durable
+    # wait_id (B'.1): {token_id, wait_id}. The token_id stays first so unregister_match
+    # can target a single occurrence by {token_id, :_}; the wait_id is the identity the
+    # gateway/retention store reads.
+    Registry.register(:waits, {state.tenant_id, :message, name, state.business_key}, {token.id, wait_id})
+
+    # Opt-in keyless secondary index (B'.5): a catch declared keyless ALSO registers
+    # under {tenant, :message, name, :no_key} so a nil-key inbound can correlate. Keyed
+    # waits never join :no_key.
+    if message_node_keyless?(state, token) do
+      Registry.register(:waits, {state.tenant_id, :message, name, :no_key}, {token.id, wait_id})
+    end
 
     # Wait-created hook: lets the bus correlator immediately deliver a message that
     # arrived BEFORE the token reached this catch (held in the inbox). Broadcast AFTER
     # the :waits registration so the subscriber's lookup is guaranteed to find it.
     Phoenix.PubSub.broadcast(Chronicle.PubSub, "engine:message_waits",
-      {:message_wait_created, state.tenant_id, name, state.business_key, state.id})
+      {:message_wait_created, state.tenant_id, name, state.business_key, state.id, wait_id})
 
     event = %PersistentData.MessageWaitCreated{
       token: token.id,
       family: token.family,
       current_node: token.current_node,
       name: name,
-      business_key: state.business_key
+      business_key: state.business_key,
+      wait_id: wait_id
     }
 
-    state = state |> append_event(event) |> Map.put(:message_waits, waits)
+    state =
+      state
+      |> append_event(event)
+      |> Map.put(:message_waits, waits)
+      |> Map.put(:wait_ids, wait_ids)
+
     move_to_waiting(state, token)
   end
 
@@ -511,12 +533,30 @@ defmodule Chronicle.Engine.TokenProcessor do
       |> Token.set_waiting(:waiting_for_event_gateway)
       |> Token.set_context(:event_gateway_candidates, candidates)
 
+    # One durable wait_id for the whole gateway activation (it resolves to exactly
+    # one branch). Stored under {:gateway, token.id}.
+    wait_id = UUID.uuid4()
+    state = Map.put(state, :wait_ids, Map.put(state.wait_ids || %{}, {:gateway, token.id}, wait_id))
+
     {state, message_names, signal_names, timer_ids, trigger_at_by_timer_id} =
       Enum.reduce(candidates, {state, [], [], [], %{}}, fn candidate, {acc, msgs, sigs, timers, triggers} ->
         case candidate do
           %{type: :message, name: name} when not is_nil(name) ->
             waits = Map.update(acc.message_waits, name, [token.id], &[token.id | &1])
-            Registry.register(:waits, {acc.tenant_id, :message, name, acc.business_key}, token.id)
+            # VALUE carries the gateway wait_id (B'.1); all of this gateway's message
+            # candidates share the single gateway wait_id.
+            Registry.register(:waits, {acc.tenant_id, :message, name, acc.business_key}, {token.id, wait_id})
+
+            # Opt-in keyless secondary index (B'.5) for a keyless gateway message branch.
+            if candidate_keyless?(acc, candidate) do
+              Registry.register(:waits, {acc.tenant_id, :message, name, :no_key}, {token.id, wait_id})
+            end
+
+            # Wake-hook for each message candidate so an early-arrived message held in
+            # the inbox is delivered the instant the gateway opens.
+            Phoenix.PubSub.broadcast(Chronicle.PubSub, "engine:message_waits",
+              {:message_wait_created, acc.tenant_id, name, acc.business_key, acc.id, wait_id})
+
             {%{acc | message_waits: waits}, [name | msgs], sigs, timers, triggers}
 
           %{type: :signal, name: name} when not is_nil(name) ->
@@ -559,7 +599,8 @@ defmodule Chronicle.Engine.TokenProcessor do
       message_names: Enum.reverse(message_names),
       signal_names: Enum.reverse(signal_names),
       timer_ids: Enum.reverse(timer_ids),
-      trigger_at_by_timer_id: trigger_at_by_timer_id
+      trigger_at_by_timer_id: trigger_at_by_timer_id,
+      wait_id: wait_id
     }
 
     token = Token.set_context(token, :event_gateway_timer_ids, Enum.reverse(timer_ids))
@@ -803,11 +844,18 @@ defmodule Chronicle.Engine.TokenProcessor do
   end
 
   defp handle_event_gateway_resolved(state, token, trigger, selected_node, target_node) do
+    # Capture the durable gateway wait_id BEFORE remove_event_gateway_waits drops it
+    # from the in-memory index, so the resolution event can carry it.
+    gateway_wait_id = Map.get(state.wait_ids || %{}, {:gateway, token.id})
     state = remove_event_gateway_waits(state, token)
     {state, canceled_timer_ids} = cancel_timer_refs_for_token(state, token.id)
 
     {trigger_type, trigger_name, payload} =
       case trigger do
+        # WaitRegistry resumes a selected event-gateway branch with the 4-tuple
+        # {:message, name, payload, selected_node_id} (wait_registry.ex:55); keep the
+        # 3-tuple for back-compat / non-gateway resumes.
+        {:message, name, payload, _selected_node_id} -> {:message, name, payload}
         {:message, name, payload} -> {:message, name, payload}
         {:signal, name} -> {:signal, name, nil}
         :timer_elapsed -> {:timer, nil, nil}
@@ -836,10 +884,14 @@ defmodule Chronicle.Engine.TokenProcessor do
       selected_node: selected_node,
       target_node: target_node,
       payload: payload,
-      triggered_at: System.system_time(:millisecond)
+      triggered_at: System.system_time(:millisecond),
+      wait_id: gateway_wait_id
     }
 
-    state = append_event(state, event)
+    state =
+      state
+      |> append_event(event)
+      |> Map.put(:wait_ids, Map.delete(state.wait_ids || %{}, {:gateway, token.id}))
     token = Token.move_to(token, target_node)
     %{state | tokens: Map.put(state.tokens, token.id, token)}
   end
@@ -1081,12 +1133,33 @@ defmodule Chronicle.Engine.TokenProcessor do
 
         :message ->
           name = resolve_message_name(Map.get(boundary, :message), token.parameters)
-          Registry.register(:waits, {state.tenant_id, :message, name, state.business_key}, {:boundary, token.id, boundary.id})
+
+          # Durable wait_id for this boundary occurrence.
+          boundary_wait_id = UUID.uuid4()
+
+          # VALUE carries the wait_id (B'.1): {:boundary, token_id, boundary_id, wait_id}.
+          # The {:boundary, token_id, boundary_id} prefix stays so unregister_match can
+          # target this occurrence by {:boundary, token_id, boundary_id, :_}.
+          Registry.register(:waits, {state.tenant_id, :message, name, state.business_key}, {:boundary, token.id, boundary.id, boundary_wait_id})
+
+          # Opt-in keyless secondary index (B'.5) for a keyless message boundary.
+          if boundary_keyless?(boundary) do
+            Registry.register(:waits, {state.tenant_id, :message, name, :no_key}, {:boundary, token.id, boundary.id, boundary_wait_id})
+          end
+
+          state =
+            Map.put(state, :wait_ids,
+              Map.put(state.wait_ids || %{}, {:boundary, token.id, boundary.id}, boundary_wait_id))
+
+          # Wake-hook so an early-arrived message reaches the boundary the moment it opens.
+          Phoenix.PubSub.broadcast(Chronicle.PubSub, "engine:message_waits",
+            {:message_wait_created, state.tenant_id, name, state.business_key, state.id, boundary_wait_id})
+
           target = if interrupting?, do: :message_boundaries, else: :ni_message_boundaries
           state = Map.update!(state, target, fn waits ->
             Map.update(waits, name, [{token.id, boundary}], &[{token.id, boundary} | &1])
           end)
-          {state, %{type: type, boundary_node_id: boundary.id, timer_id: nil, timer_ref: nil, name: name, interrupting: interrupting?, trigger_at: nil}}
+          {state, %{type: type, boundary_node_id: boundary.id, timer_id: nil, timer_ref: nil, name: name, interrupting: interrupting?, trigger_at: nil, wait_id: boundary_wait_id}}
 
         :signal ->
           name = Map.get(boundary, :signal)
@@ -1115,7 +1188,8 @@ defmodule Chronicle.Engine.TokenProcessor do
       name: info.name,
       condition: Map.get(info, :condition),
       timer_id: info.timer_id,
-      trigger_at: info.trigger_at
+      trigger_at: info.trigger_at,
+      wait_id: Map.get(info, :wait_id)
     }
 
     {append_event(state, event), info}
@@ -1142,6 +1216,37 @@ defmodule Chronicle.Engine.TokenProcessor do
   defp resolve_message_name(name, _params) when is_binary(name), do: name
   defp resolve_message_name(_, _params), do: nil
 
+  # --- Keyless-correlation opt-in (B'.5) ---
+  # A catch is keyless ONLY when its model carries the explicit opt-in annotation
+  # (parser maps it onto message.allow_keyless). It CANNOT be inferred from an absent
+  # correlation predicate (business_key is instance-level). Only annotated waits join
+  # the {tenant, :message, name, :no_key} secondary index; keyed waits never do.
+
+  # Plain message catch: read the node at the token's current position.
+  defp message_node_keyless?(state, token) do
+    state.definition
+    |> Definition.get_node(token.current_node)
+    |> node_message_keyless?()
+  end
+
+  # Event-gateway message candidate: read the branch node it points at.
+  defp candidate_keyless?(state, %{node_id: node_id}) when not is_nil(node_id) do
+    state.definition
+    |> Definition.get_node(node_id)
+    |> node_message_keyless?()
+  end
+
+  defp candidate_keyless?(_state, _candidate), do: false
+
+  # Message boundary: the parsed message map lives on the boundary struct.
+  defp boundary_keyless?(boundary), do: message_keyless?(Map.get(boundary, :message))
+
+  defp node_message_keyless?(nil), do: false
+  defp node_message_keyless?(node), do: message_keyless?(Map.get(node, :message))
+
+  defp message_keyless?(%{allow_keyless: true}), do: true
+  defp message_keyless?(_), do: false
+
   defp compute_timer_delay(%{duration_ms: ms}) when is_integer(ms), do: ms
   defp compute_timer_delay(%{period: %{hours: h, minutes: m, seconds: s}}) do
     (h || 0) * 3_600_000 + (m || 0) * 60_000 + (s || 0) * 1000
@@ -1152,9 +1257,14 @@ defmodule Chronicle.Engine.TokenProcessor do
     candidates = token.context[:event_gateway_candidates] || []
 
     Enum.reduce(candidates, state, fn
-      %{type: :message, name: name}, acc ->
+      %{type: :message, name: name} = candidate, acc ->
+        # Value is now {token_id, wait_id}; match the occurrence by {token_id, :_}.
         key = {acc.tenant_id, :message, name, acc.business_key}
-        Registry.unregister_match(:waits, key, token.id)
+        Registry.unregister_match(:waits, key, {token.id, :_})
+
+        if candidate_keyless?(acc, candidate) do
+          Registry.unregister_match(:waits, {acc.tenant_id, :message, name, :no_key}, {token.id, :_})
+        end
 
         waits =
           acc.message_waits

@@ -30,8 +30,16 @@ defmodule Chronicle.Engine.InstanceLoadCell do
     cell_state: :resident,
     waiting_handles: [],
     mailbox: :queue.new(),
+    # pending_syncs: GenServer.from() refs awaiting a DURABLE delivery result while
+    # the instance is restoring. Each is {from, command} where command is replayed
+    # against the restored instance via a *sync* Instance call; the caller is replied
+    # to ONLY after that call returns a persisted outcome. This is the evicted-path
+    # durable-ack the retention store (and the reply ledger) settle on.
+    pending_syncs: :queue.new(),
     timer_refs: %{}
   ]
+
+  @sync_call_timeout 30_000
 
   # --- Public API ---
 
@@ -70,6 +78,35 @@ defmodule Chronicle.Engine.InstanceLoadCell do
     GenServer.call(cell_pid, {:external_task_open?, task_id})
   catch
     _, _ -> false
+  end
+
+  @doc """
+  Synchronously deliver a correlation message through the load cell, returning the
+  DURABLE outcome (`{:matched, wait_ids}` / `:ignored` / `:boundary`).
+
+  Resident: forwards straight to the Instance's `send_message_sync` (which persists
+  the message outcome before replying). Evicted/restoring: the caller is parked, a
+  restore is triggered, and the reply is sent ONLY after the restored instance has
+  durably processed the message. The retention store records consumption only on this
+  reply — never on the fire-and-forget `:wake` cast.
+  """
+  def deliver_message_sync(cell_pid, message_name, payload \\ %{}, timeout \\ @sync_call_timeout) do
+    GenServer.call(cell_pid, {:sync_command, {:message, message_name, payload}}, timeout)
+  end
+
+  @doc """
+  Generic synchronous, durable-ack load-cell command. Covers message delivery AND
+  external-task complete/error/cancel so the reply ledger settles (and the retention
+  store consumes) only on a persisted result, on both the resident and evicted paths.
+
+  `command` is one of:
+    {:message, name, payload}
+    {:external_task_complete, task_id, payload, result}
+    {:external_task_error, task_id, error, retry?, backoff_ms}
+    {:external_task_cancel, task_id, reason, continuation_node_id}
+  """
+  def command_sync(cell_pid, command, timeout \\ @sync_call_timeout) do
+    GenServer.call(cell_pid, {:sync_command, command}, timeout)
   end
 
   @doc "Get cell info for diagnostics."
@@ -124,6 +161,30 @@ defmodule Chronicle.Engine.InstanceLoadCell do
     {:reply, open?, state}
   end
 
+  def handle_call({:sync_command, command}, from, %{cell_state: :resident, instance_pid: pid} = state)
+      when pid != nil do
+    # Resident: deliver synchronously to the Instance, which persists the outcome
+    # before replying. Run in a Task so the load cell is not blocked, and so a slow
+    # instance call cannot deadlock the cell against its own monitors.
+    forward_sync_to_instance(pid, command, from)
+    {:noreply, state}
+  end
+
+  def handle_call({:sync_command, command}, from, state) do
+    # Evicted/restoring: park the caller until the restored instance durably processes
+    # the command. Trigger a restore if we are sitting in :evicted.
+    state = %{state | pending_syncs: :queue.in({from, command}, state.pending_syncs)}
+
+    state =
+      if StateMachine.should_restore?(state.cell_state) do
+        Lifecycle.trigger_restore(state)
+      else
+        state
+      end
+
+    {:noreply, state}
+  end
+
   def handle_call(:inspect_cell, _from, state) do
     info = %{
       instance_id: state.instance_id,
@@ -169,15 +230,20 @@ defmodule Chronicle.Engine.InstanceLoadCell do
     if StateMachine.restore_completable?(state.cell_state) do
       Process.monitor(new_pid)
       drain_mailbox(new_pid, state.mailbox)
+      # Drain parked sync callers AFTER the fire-and-forget mailbox so they observe a
+      # fully-applied instance, replying each only on the restored instance's durable
+      # result.
+      drain_pending_syncs(new_pid, state.pending_syncs)
       Lifecycle.cancel_evicted_timers(state)
 
-      Logger.info("InstanceLoadCell #{state.instance_id}: Restore completed, draining #{:queue.len(state.mailbox)} queued messages")
+      Logger.info("InstanceLoadCell #{state.instance_id}: Restore completed, draining #{:queue.len(state.mailbox)} queued messages and #{:queue.len(state.pending_syncs)} sync callers")
 
       {:noreply, %{state |
         cell_state: :resident,
         instance_pid: new_pid,
         waiting_handles: [],
         mailbox: :queue.new(),
+        pending_syncs: :queue.new(),
         timer_refs: %{}
       }}
     else
@@ -193,7 +259,7 @@ defmodule Chronicle.Engine.InstanceLoadCell do
     state = %{state | cell_state: :evicted}
 
     state =
-      if :queue.len(state.mailbox) > 0 do
+      if :queue.len(state.mailbox) > 0 or :queue.len(state.pending_syncs) > 0 do
         Lifecycle.trigger_restore(state)
       else
         state
@@ -252,6 +318,47 @@ defmodule Chronicle.Engine.InstanceLoadCell do
         forward_to_instance(instance_pid, msg)
         drain_mailbox(instance_pid, rest)
     end
+  end
+
+  # Replays each parked sync command against the restored instance and replies to the
+  # original caller ONLY with the instance's durable result. Run per-caller in a Task
+  # so the load cell stays responsive while the (synchronous) instance call runs.
+  defp drain_pending_syncs(instance_pid, pending) do
+    case :queue.out(pending) do
+      {:empty, _} -> :ok
+      {{:value, {from, command}}, rest} ->
+        forward_sync_to_instance(instance_pid, command, from)
+        drain_pending_syncs(instance_pid, rest)
+    end
+  end
+
+  defp forward_sync_to_instance(instance_pid, command, from) do
+    Task.start(fn ->
+      reply =
+        try do
+          do_sync_command(instance_pid, command)
+        catch
+          kind, reason -> {:error, {kind, reason}}
+        end
+
+      GenServer.reply(from, reply)
+    end)
+  end
+
+  defp do_sync_command(pid, {:message, name, payload}) do
+    Instance.send_message_sync(pid, name, payload)
+  end
+
+  defp do_sync_command(pid, {:external_task_complete, task_id, payload, result}) do
+    Instance.complete_external_task_sync(pid, task_id, payload, result)
+  end
+
+  defp do_sync_command(pid, {:external_task_error, task_id, error, retry?, backoff_ms}) do
+    Instance.error_external_task_sync(pid, task_id, error, retry?, backoff_ms)
+  end
+
+  defp do_sync_command(pid, {:external_task_cancel, task_id, reason, continuation_node_id}) do
+    Instance.cancel_external_task_sync(pid, task_id, reason, continuation_node_id)
   end
 
   defp forward_to_instance(pid, {:external_task_complete, task_id, payload, result}) do

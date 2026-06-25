@@ -127,7 +127,8 @@ defmodule Chronicle.Engine.Instance.WaitRegistryTest do
           timer_ref_ids: %{ref => "timer-1"}
         })
 
-      Registry.register(:waits, {"tenant-a", :message, "cancel", "bk-1"}, {:boundary, 1, 20})
+      # Message-boundary registry value now carries the wait_id as a 4th element.
+      Registry.register(:waits, {"tenant-a", :message, "cancel", "bk-1"}, {:boundary, 1, 20, "wait-msg-1"})
       Registry.register(:waits, {"tenant-a", :signal, "sig"}, {:boundary, 1, 21})
 
       assert {:boundary, state} = WaitRegistry.handle_message(state, "cancel", %{})

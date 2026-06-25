@@ -45,7 +45,7 @@ defmodule Chronicle.Engine.InstanceBoundaryLifecycleTest do
       :ok = Instance.error_external_task_sync(pid, task_id, %{error_message: "retry"}, true, 60_000)
       retry_timer_id = wait_for_retry_timer(pid)
 
-      :ok = Instance.send_message_sync(pid, "cancel", %{})
+      assert {:matched, _} = Instance.send_message_sync(pid, "cancel", %{})
       state = :sys.get_state(pid)
 
       assert state.timer_refs == %{}
@@ -143,7 +143,8 @@ defmodule Chronicle.Engine.InstanceBoundaryLifecycleTest do
 
       wait_until(pid, &(&1.message_waits == %{"reply" => [0]}))
 
-      :ok = Instance.send_message_sync(pid, "reply", %{"status" => "rejected"})
+      # Predicate rejects this candidate → no durable consumption, returns :ignored.
+      assert :ignored = Instance.send_message_sync(pid, "reply", %{"status" => "rejected"})
       state = :sys.get_state(pid)
 
       assert state.message_waits == %{"reply" => [0]}
@@ -153,7 +154,7 @@ defmodule Chronicle.Engine.InstanceBoundaryLifecycleTest do
                &match?(%PersistentData.MessageHandled{name: "reply"}, &1)
              )
 
-      :ok = Instance.send_message_sync(pid, "reply", %{"status" => "approved"})
+      assert {:matched, _} = Instance.send_message_sync(pid, "reply", %{"status" => "approved"})
 
       state =
         wait_until(pid, fn state ->
@@ -181,7 +182,8 @@ defmodule Chronicle.Engine.InstanceBoundaryLifecycleTest do
 
       _task_id = wait_for_external_task(pid)
 
-      :ok = Instance.send_message_sync(pid, "cancel", %{"reason" => "retry"})
+      # correlationScript requires reason == 'abort'; 'retry' is predicate-rejected.
+      assert :ignored = Instance.send_message_sync(pid, "cancel", %{"reason" => "retry"})
       state = :sys.get_state(pid)
 
       refute Enum.any?(
@@ -191,7 +193,7 @@ defmodule Chronicle.Engine.InstanceBoundaryLifecycleTest do
 
       assert state.tokens[0].state == :waiting_for_external_task
 
-      :ok = Instance.send_message_sync(pid, "cancel", %{"reason" => "abort"})
+      assert {:matched, _} = Instance.send_message_sync(pid, "cancel", %{"reason" => "abort"})
 
       state =
         wait_until(pid, fn state ->

@@ -18,7 +18,7 @@ defmodule Chronicle.Engine.WaitingHandle do
 
   defmodule Message do
     @moduledoc false
-    defstruct [:instance_id, :tenant_id, :message_name, :business_key, :token_id]
+    defstruct [:instance_id, :tenant_id, :message_name, :business_key, :token_id, :wait_id]
   end
 
   defmodule Signal do

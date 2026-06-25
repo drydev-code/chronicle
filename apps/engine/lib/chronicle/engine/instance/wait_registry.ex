@@ -369,8 +369,12 @@ defmodule Chronicle.Engine.Instance.WaitRegistry do
   # --- Private helpers ---
 
   defp unregister_message_wait(state, message_name, token_id) do
-    key = {state.tenant_id, :message, message_name, state.business_key}
-    unregister(:waits, key, token_id)
+    # The message-wait registry value is now {token_id, wait_id}; match the occurrence
+    # by {token_id, :_}. Also clear the opt-in :no_key secondary registration so a
+    # keyless wait does not leave a stale route after consumption.
+    Registry.unregister_match(:waits, {state.tenant_id, :message, message_name, state.business_key}, {token_id, :_})
+    Registry.unregister_match(:waits, {state.tenant_id, :message, message_name, :no_key}, {token_id, :_})
+    :ok
   end
 
   defp unregister_signal_waits(state, signal_name, token_ids) do
@@ -498,10 +502,19 @@ defmodule Chronicle.Engine.Instance.WaitRegistry do
          name: name,
          boundary_node_id: boundary_id
        }) do
+    # The message-boundary registry value now carries the wait_id as a 4th element
+    # ({:boundary, token_id, boundary_id, wait_id}); match the occurrence with :_ in
+    # the wait_id slot. Also drop the opt-in :no_key secondary registration.
     Registry.unregister_match(
       :waits,
       {state.tenant_id, :message, name, state.business_key},
-      {:boundary, token_id, boundary_id}
+      {:boundary, token_id, boundary_id, :_}
+    )
+
+    Registry.unregister_match(
+      :waits,
+      {state.tenant_id, :message, name, :no_key},
+      {:boundary, token_id, boundary_id, :_}
     )
 
     %{

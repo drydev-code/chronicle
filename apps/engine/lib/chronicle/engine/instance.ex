@@ -588,8 +588,12 @@ defmodule Chronicle.Engine.Instance do
   def handle_call({:message, message_name, payload}, _from, state) do
     # Report matched vs ignored so the bus correlator knows whether a token actually
     # resumed (a :waits hit is only a candidate; the correlation predicate may reject).
+    # On a match, return the durable wait_ids the delivery resolved so the retention
+    # store can write per-occurrence (instance_id, wait_id, message_id) rows. The reply
+    # is sent only AFTER the message outcome is persisted (persist_command_events).
     case do_message_command(state, message_name, payload) do
-      {:ok, state, true} -> {:reply, :matched, state, {:continue, :process_tokens}}
+      {:ok, state, true, wait_ids} -> {:reply, {:matched, wait_ids}, state, {:continue, :process_tokens}}
+      {:ok, state, true} -> {:reply, {:matched, []}, state, {:continue, :process_tokens}}
       {:ok, state, false} -> {:reply, :ignored, state}
       {:error, reason, state} -> {:reply, {:error, reason}, state}
     end
@@ -687,6 +691,7 @@ defmodule Chronicle.Engine.Instance do
     %{state | persistent_events: state.persistent_events ++ events}
   end
 
+  defp command_reply({:ok, state, true, _wait_ids}), do: {:noreply, state, {:continue, :process_tokens}}
   defp command_reply({:ok, state, true}), do: {:noreply, state, {:continue, :process_tokens}}
   defp command_reply({:ok, state, false}), do: {:noreply, state}
   defp command_reply({:error, _reason, state}), do: {:noreply, state}
@@ -699,8 +704,16 @@ defmodule Chronicle.Engine.Instance do
     delivery = WaitRegistry.matching_message_delivery(state, message_name, payload)
     events = message_command_events(state, message_name, payload, delivery)
 
+    # Durable wait_ids resolved by this physical delivery (MessageHandled +
+    # BoundaryEventTriggered). Collected BEFORE the in-memory wait maps are mutated
+    # by handle_message_delivery, but AFTER the events are durably persisted below —
+    # so the caller may reply {:matched, wait_ids} only on a durable outcome.
+    resolved_wait_ids = resolved_wait_ids_from_events(events)
+
     case persist_command_events(state, events) do
       {:ok, state} ->
+        # Drop consumed wait_ids from the in-memory index now they are durable.
+        state = forget_consumed_wait_ids(state, events)
         state = apply_activity_timer_cancellations(state, events)
 
         case WaitRegistry.handle_message_delivery(delivery, state, message_name, payload) do
@@ -709,15 +722,58 @@ defmodule Chronicle.Engine.Instance do
 
           {:boundary, state} ->
             state = cleanup_interrupted_activity_timers(state)
-            {:ok, state, true}
+            {:ok, state, true, resolved_wait_ids}
 
           {:resumed, state} ->
-            {:ok, state, true}
+            {:ok, state, true, resolved_wait_ids}
         end
 
       {:error, reason, state} ->
         {:error, reason, state}
     end
+  end
+
+  # Collect wait_ids carried by the durable delivery events.
+  defp resolved_wait_ids_from_events(events) do
+    events
+    |> Enum.flat_map(fn
+      %PersistentData.MessageHandled{wait_id: id} when not is_nil(id) -> [id]
+      %PersistentData.BoundaryEventTriggered{wait_id: id} when not is_nil(id) -> [id]
+      _ -> []
+    end)
+    |> Enum.uniq()
+  end
+
+  # Remove the in-memory wait_ids entries for the wait occurrences just consumed,
+  # so the index does not leak and a future loop-back re-mints a fresh id.
+  defp forget_consumed_wait_ids(state, events) do
+    waits =
+      Enum.reduce(events, state.wait_ids || %{}, fn
+        %PersistentData.MessageHandled{} = e, acc ->
+          if is_nil(e.selected_node) do
+            Map.delete(acc, {:message, e.name, e.token})
+          else
+            # Event-gateway selection: the gateway occurrence is not resolved until
+            # EventGatewayResolved is appended in the following :process_tokens cycle.
+            # Keep {:gateway, token} here so handle_event_gateway_resolved can capture
+            # the wait_id; it deletes the entry itself once the resolution is durable.
+            acc
+          end
+
+        %PersistentData.BoundaryEventTriggered{interrupting: interrupting} = e, acc ->
+          # A non-interrupting message boundary stays registered and can fire again,
+          # so keep its wait_id; only an interrupting trigger closes the occurrence.
+          if interrupting != false do
+            Map.delete(acc, {:boundary, e.token, e.boundary_node_id})
+          else
+            acc
+          end
+
+        _other, acc ->
+          acc
+      end)
+
+    %{state | wait_ids: waits}
   end
 
   defp do_signal_command(state, signal_name) do
@@ -1059,7 +1115,7 @@ defmodule Chronicle.Engine.Instance do
   defp message_command_events(state, message_name, payload, delivery) do
     wait_events =
       case delivery do
-        {:wait, token_id, _selected_node_id} ->
+        {:wait, token_id, selected_node_id} ->
           token = Map.get(state.tokens, token_id)
 
           [%PersistentData.MessageHandled{
@@ -1069,7 +1125,9 @@ defmodule Chronicle.Engine.Instance do
             name: message_name,
             target_node: token && token.current_node,
             retry_counter: token && token.context[:retries],
-            payload: payload
+            payload: payload,
+            wait_id: resolved_wait_id(state, message_name, token_id, selected_node_id),
+            selected_node: selected_node_id
           }]
 
         _ ->
@@ -1078,6 +1136,18 @@ defmodule Chronicle.Engine.Instance do
 
     boundary_trigger_events(state, :message, message_name, delivery)
     |> Kernel.++(wait_events)
+  end
+
+  # Looks up the durable wait_id for the wait occurrence a message delivery resolved.
+  # An event-gateway candidate carries a non-nil selected_node and is registered
+  # under {:gateway, token_id}; a plain message wait under {:message, name, token_id}.
+  defp resolved_wait_id(state, message_name, token_id, selected_node_id) do
+    waits = state.wait_ids || %{}
+
+    cond do
+      not is_nil(selected_node_id) -> Map.get(waits, {:gateway, token_id})
+      true -> Map.get(waits, {:message, message_name, token_id})
+    end
   end
 
   defp signal_command_events(state, signal_name) do

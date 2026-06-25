@@ -59,7 +59,7 @@ defmodule Chronicle.Engine.PersistentData do
   end
 
   defmodule MessageWaitCreated do
-    defstruct [:token, :family, :current_node, :name, :business_key]
+    defstruct [:token, :family, :current_node, :name, :business_key, :wait_id]
   end
 
   defmodule SignalWaitCreated do
@@ -69,14 +69,22 @@ defmodule Chronicle.Engine.PersistentData do
   defmodule EventGatewayActivated do
     defstruct [
       :token, :family, :current_node, :message_names, :signal_names,
-      :timer_ids, :trigger_at_by_timer_id
+      :timer_ids, :trigger_at_by_timer_id,
+      # wait_id: durable wait-activation id minted once for this gateway
+      # activation. The gateway's message/signal candidate waits share this id
+      # (the gateway resolves to exactly one branch).
+      :wait_id
     ]
   end
 
   defmodule EventGatewayResolved do
     defstruct [
       :token, :family, :current_node, :trigger_type, :trigger_name,
-      :selected_node, :target_node, :payload, :triggered_at
+      :selected_node, :target_node, :payload, :triggered_at,
+      # wait_id: the durable gateway wait occurrence this resolution consumed.
+      # Carried so the retention store can write a per-occurrence consumption row
+      # and replay can correlate by wait_id (NOT token_id, which a loop reuses).
+      :wait_id
     ]
   end
 
@@ -110,14 +118,18 @@ defmodule Chronicle.Engine.PersistentData do
   defmodule BoundaryEventCreated do
     defstruct [
       :token, :family, :current_node, :boundary_node_id, :boundary_type,
-      :interrupting, :name, :condition, :timer_id, :trigger_at
+      :interrupting, :name, :condition, :timer_id, :trigger_at,
+      # wait_id: durable wait-activation id for a message boundary occurrence.
+      :wait_id
     ]
   end
 
   defmodule BoundaryEventTriggered do
     defstruct [
       :token, :family, :current_node, :boundary_node_id, :boundary_type,
-      :interrupting, :name, :condition, :timer_id, :triggered_at
+      :interrupting, :name, :condition, :timer_id, :triggered_at,
+      # wait_id: the durable boundary wait occurrence this trigger consumed.
+      :wait_id
     ]
   end
 
@@ -153,7 +165,17 @@ defmodule Chronicle.Engine.PersistentData do
   end
 
   defmodule MessageHandled do
-    defstruct [:token, :family, :current_node, :name, :target_node, :retry_counter, :payload]
+    defstruct [
+      :token, :family, :current_node, :name, :target_node, :retry_counter, :payload,
+      # wait_id: the durable wait occurrence this delivery consumed. Replay removes
+      # the open wait by wait_id (NOT token_id) so a loop-back to the same catch is
+      # not mistakenly closed.
+      :wait_id,
+      # selected_node: when the consumed wait belongs to an event-based gateway, the
+      # branch node the message selected. On crash-replay of only MessageHandled,
+      # replay closes the non-selected sibling gateway waits using this.
+      :selected_node
+    ]
   end
 
   defmodule SignalThrown do

@@ -1027,7 +1027,8 @@ defmodule Chronicle.Engine.Diagrams.Parser do
           variable_name: Map.get(msg, "variableName"),
           variable_content: Map.get(msg, "variableContent"),
           payload_variable_name: Map.get(msg, "payloadVariableName"),
-          correlation: parse_message_correlation(data, msg, properties)
+          correlation: parse_message_correlation(data, msg, properties),
+          allow_keyless: parse_allow_keyless(data, msg, properties)
         }
 
       name when is_binary(name) ->
@@ -1037,7 +1038,8 @@ defmodule Chronicle.Engine.Diagrams.Parser do
           variable_name: nil,
           variable_content: nil,
           payload_variable_name: nil,
-          correlation: parse_message_correlation(data, %{}, properties)
+          correlation: parse_message_correlation(data, %{}, properties),
+          allow_keyless: parse_allow_keyless(data, %{}, properties)
         }
 
       _ ->
@@ -1047,10 +1049,24 @@ defmodule Chronicle.Engine.Diagrams.Parser do
           variable_name: nil,
           variable_content: nil,
           payload_variable_name: nil,
-          correlation: parse_message_correlation(data, %{}, properties)
+          correlation: parse_message_correlation(data, %{}, properties),
+          allow_keyless: parse_allow_keyless(data, %{}, properties)
         }
     end
   end
+
+  # B'.5 opt-in keyless-correlation annotation. ONLY a catch carrying this explicit
+  # flag joins the {tenant, :message, name, :no_key} secondary index; it is never
+  # inferred from an absent correlation predicate (business_key is instance-level).
+  defp parse_allow_keyless(data, message, properties) do
+    truthy?(Map.get(message, "allowKeylessCorrelation")) ||
+      truthy?(Map.get(data, "allowKeylessCorrelation")) ||
+      truthy?(Map.get(properties || %{}, "allowKeylessCorrelation"))
+  end
+
+  defp truthy?(true), do: true
+  defp truthy?("true"), do: true
+  defp truthy?(_), do: false
 
   defp parse_message_correlation(data, message, properties) do
     Map.get(message, "correlation") ||

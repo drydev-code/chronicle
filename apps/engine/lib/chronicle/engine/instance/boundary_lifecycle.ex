@@ -82,7 +82,8 @@ defmodule Chronicle.Engine.Instance.BoundaryLifecycle do
       name: info && Map.get(info, :name),
       condition: info && Map.get(info, :condition),
       timer_id: info && Map.get(info, :timer_id),
-      triggered_at: System.system_time(:millisecond)
+      triggered_at: System.system_time(:millisecond),
+      wait_id: Map.get(state.wait_ids || %{}, {:boundary, token_id, boundary_node_id})
     }
   end
 

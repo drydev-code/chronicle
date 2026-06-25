@@ -28,6 +28,14 @@ defmodule Chronicle.Engine.Instance.TokenState do
       joining_list: %{},
       message_waits: %{},
       signal_waits: %{},
+      # wait_ids: in-memory index from a live wait occurrence to its durable
+      # wait_id. Keyed by:
+      #   {:message, name, token_id}            -> wait_id   (plain message wait)
+      #   {:gateway, token_id}                  -> wait_id   (event-gateway activation)
+      #   {:boundary, token_id, boundary_id}    -> wait_id   (message boundary)
+      # A token holds at most one open wait per key at any instant (a loop-back
+      # creates them sequentially), so {name, token_id} is unambiguous.
+      wait_ids: %{},
       message_boundaries: %{},
       signal_boundaries: %{},
       ni_message_boundaries: %{},

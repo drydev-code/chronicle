@@ -87,6 +87,11 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
       open_ni_message_boundaries: %{},
       open_ni_signal_boundaries: %{},
       open_call_waits: %{},
+      # open_wait_ids: durable wait_id index rebuilt during replay, mirroring the
+      # live state.wait_ids. Keyed by {:message, name, token_id} | {:gateway, token_id}
+      # | {:boundary, token_id, boundary_id}. Used so a MessageHandled replay removes
+      # the open wait by wait_id (NOT token_id) and can E4-close sibling gateway waits.
+      open_wait_ids: %{},
       max_token_id: -1
     }
 
@@ -103,6 +108,7 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
       ni_message_boundaries: acc.open_ni_message_boundaries,
       ni_signal_boundaries: acc.open_ni_signal_boundaries,
       call_wait_list: acc.open_call_waits,
+      wait_ids: acc.open_wait_ids,
       next_token_id: acc.max_token_id + 1
     }
 
@@ -284,6 +290,7 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
     acc = %{acc |
       state: state,
       open_message_waits: Map.update(acc.open_message_waits, name, [token_id], &[token_id | &1]),
+      open_wait_ids: put_wait_id(acc.open_wait_ids, {:message, name, token_id}, event.wait_id),
       token_wait_states: Map.put(acc.token_wait_states, token_id, :waiting_for_message)
     }
 
@@ -330,6 +337,7 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
       state: state,
       open_message_waits: open_message_waits,
       open_signal_waits: open_signal_waits,
+      open_wait_ids: put_wait_id(acc.open_wait_ids, {:gateway, token_id}, event.wait_id),
       token_wait_states: Map.put(acc.token_wait_states, token_id, :waiting_for_event_gateway)
     }
 
@@ -353,6 +361,7 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
       state: state,
       open_message_waits: remove_token_from_all_waits(acc.open_message_waits, token_id),
       open_signal_waits: remove_token_from_all_waits(acc.open_signal_waits, token_id),
+      open_wait_ids: forget_token_wait_ids(acc.open_wait_ids, token_id),
       token_wait_states: Map.delete(acc.token_wait_states, token_id)
     }
 
@@ -456,6 +465,18 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
           acc
       end
 
+    # Record the durable wait_id for a message boundary occurrence so a
+    # BoundaryEventTriggered replay (and the live trigger_event lookup after restore)
+    # can resolve it.
+    acc =
+      if event.boundary_type == :message and not is_nil(event.wait_id) do
+        %{acc |
+          open_wait_ids:
+            put_wait_id(acc.open_wait_ids, {:boundary, event.token, event.boundary_node_id}, event.wait_id)}
+      else
+        acc
+      end
+
     acc
     |> put_boundary_index(event)
     |> track_token_id(event.token)
@@ -477,6 +498,7 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
           acc
           |> delete_boundary_wait(event)
           |> delete_token_wait_handles(event.token)
+          |> Map.put(:open_wait_ids, Map.delete(acc.open_wait_ids, {:boundary, event.token, event.boundary_node_id}))
           |> Map.put(:token_wait_states, Map.delete(acc.token_wait_states, event.token))
 
         event.boundary_type == :timer ->
@@ -569,7 +591,34 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
     token_id = event.token
     name = event.name
 
-    acc = remove_from_open_waits(acc, :open_message_waits, name, token_id)
+    # E4 durability: if this delivery selected an event-gateway branch
+    # (selected_node present, or the open wait for this token is a gateway wait),
+    # close ALL of that gateway's sibling message/signal waits — not just `name`.
+    # On crash-replay of only MessageHandled (EventGatewayResolved not yet durable),
+    # the EventGatewayActivated replay already re-opened every sibling branch wait;
+    # without this, a sibling could double-fire post-replay. Remove the consumed wait
+    # by wait_id identity (NOT token_id) so a loop-back to the same catch is unaffected.
+    gateway_wait? =
+      not is_nil(event.selected_node) or
+        not is_nil(Map.get(acc.open_wait_ids, {:gateway, token_id}))
+
+    acc =
+      if gateway_wait? do
+        %{acc |
+          open_message_waits: remove_token_from_all_waits(acc.open_message_waits, token_id),
+          open_signal_waits: remove_token_from_all_waits(acc.open_signal_waits, token_id),
+          open_wait_ids: forget_token_wait_ids(acc.open_wait_ids, token_id)
+        }
+      else
+        # Remove the consumed wait BY wait_id (B'.1 / item 2): drop only the open
+        # occurrence whose persisted wait_id matches event.wait_id, so a loop-back to
+        # the same catch (same token_id + name, DIFFERENT wait_id) is not closed by a
+        # prior occurrence's MessageHandled. Fall back to the occurrence-tuple key only
+        # when the event predates wait_id.
+        acc
+        |> remove_from_open_waits(:open_message_waits, name, token_id)
+        |> Map.put(:open_wait_ids, forget_wait_occurrence(acc.open_wait_ids, event.wait_id, {:message, name, token_id}))
+      end
 
     state = if event.target_node do
       TokenState.update_token_node(state, token_id, event.target_node)
@@ -741,6 +790,41 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
       remaining = List.delete(token_ids, token_id)
       if remaining == [], do: acc, else: Map.put(acc, name, remaining)
     end)
+  end
+
+  # Records a durable wait_id in the open index. A nil wait_id (events persisted by
+  # pre-wait_id code, if any) is ignored so the index stays clean.
+  defp put_wait_id(wait_ids, _key, nil), do: wait_ids
+  defp put_wait_id(wait_ids, key, wait_id), do: Map.put(wait_ids, key, wait_id)
+
+  # Drops the open wait_id index entry consumed by a delivery. Prefers removal BY
+  # wait_id value (so a loop-back occurrence reusing the same token_id/name but a
+  # different wait_id is preserved); falls back to the occurrence-tuple key when the
+  # event carries no wait_id (pre-wait_id events).
+  defp forget_wait_occurrence(wait_ids, nil, fallback_key), do: Map.delete(wait_ids, fallback_key)
+
+  defp forget_wait_occurrence(wait_ids, wait_id, fallback_key) do
+    removed = :maps.filter(fn _k, v -> v != wait_id end, wait_ids)
+
+    if map_size(removed) == map_size(wait_ids) do
+      # No entry carried this wait_id (e.g. mixed pre-wait_id data) — use the key.
+      Map.delete(wait_ids, fallback_key)
+    else
+      removed
+    end
+  end
+
+  # Drops every wait_id index entry owned by a token (gateway resolution / message
+  # consumption that closes all of a token's waits).
+  defp forget_token_wait_ids(wait_ids, token_id) do
+    wait_ids
+    |> Enum.reject(fn
+      {{:message, _name, tid}, _} -> tid == token_id
+      {{:gateway, tid}, _} -> tid == token_id
+      {{:boundary, tid, _bid}, _} -> tid == token_id
+      _ -> false
+    end)
+    |> Map.new()
   end
 
   defp put_boundary(acc, wait_key, name, token_id, boundary_node) do
@@ -930,9 +1014,24 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
   end
 
   defp reregister_waits_in_registry(state, open_message_waits, open_signal_waits) do
+    wait_ids = state.wait_ids || %{}
+
     Enum.each(open_message_waits, fn {name, token_ids} ->
       Enum.each(token_ids, fn token_id ->
-        Registry.register(:waits, {state.tenant_id, :message, name, state.business_key}, token_id)
+        # Re-register with the PERSISTED wait_id as the value identity (B'.1), so a
+        # restored instance carries the same wait_id the gateway/retention store keyed
+        # on before the restart — NOT a fresh id and NOT the bare token_id. A gateway
+        # candidate's wait_id is stored under {:gateway, token_id}; a plain message wait
+        # under {:message, name, token_id}.
+        wait_id =
+          Map.get(wait_ids, {:message, name, token_id}) ||
+            Map.get(wait_ids, {:gateway, token_id})
+
+        Registry.register(:waits, {state.tenant_id, :message, name, state.business_key}, {token_id, wait_id})
+
+        if message_wait_keyless?(state, name, token_id) do
+          Registry.register(:waits, {state.tenant_id, :message, name, :no_key}, {token_id, wait_id})
+        end
       end)
     end)
 
@@ -944,10 +1043,17 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
   end
 
   defp reregister_boundaries_in_registry(state) do
+    wait_ids = state.wait_ids || %{}
+
     Enum.each([state.message_boundaries, state.ni_message_boundaries], fn waits ->
       Enum.each(waits || %{}, fn {name, boundaries} ->
         Enum.each(boundaries, fn {token_id, boundary} ->
-          Registry.register(:waits, {state.tenant_id, :message, name, state.business_key}, {:boundary, token_id, boundary.id})
+          boundary_wait_id = Map.get(wait_ids, {:boundary, token_id, boundary.id})
+          Registry.register(:waits, {state.tenant_id, :message, name, state.business_key}, {:boundary, token_id, boundary.id, boundary_wait_id})
+
+          if boundary_node_keyless?(state, boundary) do
+            Registry.register(:waits, {state.tenant_id, :message, name, :no_key}, {:boundary, token_id, boundary.id, boundary_wait_id})
+          end
         end)
       end)
     end)
@@ -960,6 +1066,27 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
       end)
     end)
   end
+
+  # B'.5 keyless re-registration on restore. Mirrors token_processor: a wait whose
+  # catch node carries the explicit keyless annotation also re-registers under :no_key.
+  defp message_wait_keyless?(state, _name, token_id) do
+    case Map.get(state.tokens, token_id) do
+      nil ->
+        false
+
+      token ->
+        node = Chronicle.Engine.Diagrams.Definition.get_node(state.definition, token.current_node)
+        node_message_keyless?(node)
+    end
+  end
+
+  # The boundary value is the parsed boundary struct already carrying its message map.
+  defp boundary_node_keyless?(_state, boundary) do
+    match?(%{allow_keyless: true}, Map.get(boundary, :message) || %{})
+  end
+
+  defp node_message_keyless?(nil), do: false
+  defp node_message_keyless?(node), do: match?(%{allow_keyless: true}, Map.get(node, :message) || %{})
 
   defp finalize_restored_state(state) do
     cond do

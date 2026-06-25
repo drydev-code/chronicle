@@ -133,7 +133,10 @@ defmodule Chronicle.Engine.InstanceLoadCell.Lifecycle do
       }
     end)
 
-    # Message wait handles
+    # Message wait handles. Carry the durable wait_id (looked up from the live
+    # wait_ids index) so the evicted-path delivery can name the resolved wait
+    # occurrence on the durable ack.
+    wait_ids = Map.get(instance_state, :wait_ids, %{})
     msg_handles = Enum.flat_map(instance_state.message_waits, fn {name, token_ids} ->
       Enum.map(List.wrap(token_ids), fn token_id ->
         %WaitingHandle.Message{
@@ -141,7 +144,10 @@ defmodule Chronicle.Engine.InstanceLoadCell.Lifecycle do
           tenant_id: tenant,
           message_name: name,
           business_key: instance_state.business_key,
-          token_id: token_id
+          token_id: token_id,
+          wait_id:
+            Map.get(wait_ids, {:message, name, token_id}) ||
+              Map.get(wait_ids, {:gateway, token_id})
         }
       end)
     end)

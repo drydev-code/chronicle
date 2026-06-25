@@ -117,7 +117,7 @@ defmodule Chronicle.Engine.BpmnExampleWorkflowsTest do
         state.signal_waits == %{"customer.cancelled" => [0]}
     end)
 
-    :ok = Instance.send_message_sync(pid, "customer.reply", %{"body" => "ready"})
+    assert {:matched, _} = Instance.send_message_sync(pid, "customer.reply", %{"body" => "ready"})
 
     state = wait_for_instance_state(pid, :completed)
 
@@ -216,7 +216,7 @@ defmodule Chronicle.Engine.BpmnExampleWorkflowsTest do
     send(pid, {:timer_elapsed, token_id, timer_id})
 
     wait_until(pid, &(&1.message_waits == %{"catch.message" => [0]}))
-    :ok = Instance.send_message_sync(pid, "catch.message", %{})
+    assert {:matched, _} = Instance.send_message_sync(pid, "catch.message", %{})
 
     wait_until(pid, &(&1.signal_waits == %{"catch.signal" => [0]}))
     :ok = Instance.send_signal_sync(pid, "catch.signal")
