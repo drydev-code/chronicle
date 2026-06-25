@@ -90,8 +90,22 @@ defmodule Chronicle.Engine.Diagrams.Definition do
   """
   @spec local_catch_message_names(t()) :: MapSet.t(String.t())
   def local_catch_message_names(%__MODULE__{nodes: nodes}) do
-    nodes
-    |> Map.values()
+    values = Map.values(nodes)
+
+    # Message boundary catch-names live BOTH as top-level nodes AND attached under each
+    # host node's `boundary_events` (the parser's `attach_boundary_events/1`). Scan both:
+    # a host that only surfaces its boundaries via `boundary_events` would otherwise have
+    # its message-boundary catch-names omitted, so the gateway's family-liveness GC could
+    # orphan-drop a message a future boundary wait would catch. See HIGH-3.
+    boundary_values =
+      Enum.flat_map(values, fn node ->
+        case node do
+          %{boundary_events: bes} when is_list(bes) -> bes
+          _ -> []
+        end
+      end)
+
+    (values ++ boundary_values)
     |> Enum.flat_map(&node_catch_message_name/1)
     |> MapSet.new()
   end
