@@ -626,7 +626,34 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
       state
     end
 
-    state = TokenState.set_token_active(state, token_id)
+    # E4 CONTINUATION durability: for a gateway delivery, MessageHandled.target_node is the
+    # GATEWAY node itself (instance.ex sets target_node: token.current_node), and the durable
+    # EventGatewayResolved that actually moves the token onto the selected branch is appended
+    # in a LATER token-processing cycle. On crash-replay of ONLY MessageHandled, the token must
+    # NOT be replayed as :execute_current_node on the gateway node — that would route to
+    # Gateway.process/process_event_based and RE-OPEN every branch wait (re-arming the gateway).
+    # Instead mirror the LIVE resume: put the token into :continue with the reconstructed resume
+    # trigger {:message, name, payload, selected_node} (the same 4-tuple WaitRegistry resumes
+    # with live — wait_registry.ex:55 / gateway.ex:182). do_update_token then dispatches to
+    # Gateway.continue_after_wait → continue_event_based, which selects the SELECTED branch
+    # (gateway.ex:182) and durably re-appends EventGatewayResolved, moving the token to the
+    # branch continuation. Sibling waits were already closed above, so exactly ONE branch is
+    # active and it durably continues. Plain (non-gateway) deliveries keep the existing
+    # :execute_current_node behaviour on the post-catch target_node.
+    state =
+      if gateway_wait? and not is_nil(event.selected_node) do
+        state = TokenState.set_token_continue(state, token_id)
+
+        TokenState.update_token_context(
+          state,
+          token_id,
+          :continuation_context,
+          {:message, name, event.payload, event.selected_node}
+        )
+      else
+        TokenState.set_token_active(state, token_id)
+      end
+
     acc = %{acc |
       state: state,
       token_wait_states: Map.delete(acc.token_wait_states, token_id)
@@ -1069,15 +1096,42 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
 
   # B'.5 keyless re-registration on restore. Mirrors token_processor: a wait whose
   # catch node carries the explicit keyless annotation also re-registers under :no_key.
-  defp message_wait_keyless?(state, _name, token_id) do
+  #
+  # For an EVENT-GATEWAY message branch the token sits on the GATEWAY node (NOT the
+  # branch catch node), so reading token.current_node would miss the annotation and the
+  # keyless route would NOT be restored — the nested-catch C1 restore gap. Mirror the
+  # live registration (token_processor candidate_keyless?): when the wait belongs to a
+  # gateway, test the matching message CANDIDATE branch node for this `name`.
+  defp message_wait_keyless?(state, name, token_id) do
     case Map.get(state.tokens, token_id) do
       nil ->
         false
 
       token ->
         node = Chronicle.Engine.Diagrams.Definition.get_node(state.definition, token.current_node)
-        node_message_keyless?(node)
+
+        case node do
+          %Chronicle.Engine.Nodes.Gateway{kind: :event_based} ->
+            gateway_candidate_keyless?(state, token, name)
+
+          _ ->
+            node_message_keyless?(node)
+        end
     end
+  end
+
+  # A gateway message branch is keyless iff its candidate branch node (the catch the
+  # candidate points at) carries the explicit annotation. Matches the live site at
+  # token_processor.ex candidate_keyless?/2.
+  defp gateway_candidate_keyless?(state, token, name) do
+    (token.context[:event_gateway_candidates] || [])
+    |> List.wrap()
+    |> Enum.filter(&(&1[:type] == :message and &1[:name] == name))
+    |> Enum.any?(fn candidate ->
+      state.definition
+      |> Chronicle.Engine.Diagrams.Definition.get_node(candidate[:node_id])
+      |> node_message_keyless?()
+    end)
   end
 
   # The boundary value is the parsed boundary struct already carrying its message map.

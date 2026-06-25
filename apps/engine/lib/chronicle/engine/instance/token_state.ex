@@ -130,6 +130,21 @@ defmodule Chronicle.Engine.Instance.TokenState do
   end
 
   @doc """
+  Sets a token into the :continue (post-wait resume) state so it is dispatched to
+  the node module's `continue_after_wait/1` rather than `process/1`. Used by replay
+  to deterministically resume an event-gateway token from a persisted MessageHandled
+  without re-arming the gateway (E4 continuation durability).
+  """
+  def set_token_continue(state, token_id) do
+    case Map.get(state.tokens, token_id) do
+      nil -> state
+      token ->
+        token = %{token | state: :continue}
+        %{state | tokens: Map.put(state.tokens, token_id, token)}
+    end
+  end
+
+  @doc """
   Resumes a waiting token with continuation data, moving it from
   waiting_tokens to active_tokens and pinning the instance.
   """
