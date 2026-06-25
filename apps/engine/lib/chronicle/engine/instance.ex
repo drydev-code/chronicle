@@ -656,7 +656,20 @@ defmodule Chronicle.Engine.Instance do
           case lookup(candidate.tenant_id, candidate.parent_id) do
             {:ok, parent_pid} ->
               GenServer.cast(parent_pid, {:child_completed, candidate.id, completion_data, true})
-            _ -> :ok
+
+            _ ->
+              # Parent EVICTED/cold — route the completion to its load cell so it
+              # restores and receives it. Without this an evicted parent never learns
+              # its child finished and waits forever (the call-wait analog of the
+              # external-task wake_evicted). Parents routinely evict after their idle
+              # threshold while a child sub-process runs, so this is the common path.
+              case Chronicle.Engine.InstanceLoadCell.lookup(candidate.tenant_id, candidate.parent_id) do
+                {:ok, cell} ->
+                  GenServer.cast(cell, {:wake, :child_completed, candidate.id, completion_data, true})
+
+                _ ->
+                  :ok
+              end
           end
         end
 
