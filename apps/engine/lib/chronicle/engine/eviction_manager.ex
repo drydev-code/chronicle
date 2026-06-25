@@ -139,10 +139,29 @@ defmodule Chronicle.Engine.EvictionManager do
   defp evictable?(pid) do
     try do
       state = Instance.get_state(pid)
-      state.instance_state == :waiting and state.pin_state == :not_pinned
+
+      state.instance_state == :waiting and state.pin_state == :not_pinned and
+        not has_transient_wait?(state)
     catch
       :exit, _ -> false
     end
+  end
+
+  # Only ONE wait is unsafe to evict: :waiting_for_script. In-flight JS runs off the
+  # GenServer in a pool and has NO persisted result yet, so replay-on-restore would
+  # advance the token without its ScriptTask outputs (empty uuid -> onboard
+  # Command.DeserializationFailed). All other waits (external task, message, signal,
+  # timer, call, conditional, gateway) have durable persisted state and restore
+  # exactly. Their replies/wakes are delivered losslessly to the evicted instance via
+  # the load cell + inbox-retry-until-resident (see PssGateway.Engine.wake_evicted) —
+  # so evicting them is safe AND necessary to bound memory under the bulk-migration
+  # instance cascade. Script waits are millisecond-short, so deferring them costs
+  # almost nothing.
+  @no_evict_waits [:waiting_for_script]
+  defp has_transient_wait?(state) do
+    state.tokens
+    |> Map.values()
+    |> Enum.any?(fn t -> t.state in @no_evict_waits end)
   end
 
   defp try_evict_instance(pid) do

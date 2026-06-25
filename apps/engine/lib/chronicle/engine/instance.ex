@@ -586,7 +586,13 @@ defmodule Chronicle.Engine.Instance do
   end
 
   def handle_call({:message, message_name, payload}, _from, state) do
-    command_call_reply(do_message_command(state, message_name, payload))
+    # Report matched vs ignored so the bus correlator knows whether a token actually
+    # resumed (a :waits hit is only a candidate; the correlation predicate may reject).
+    case do_message_command(state, message_name, payload) do
+      {:ok, state, true} -> {:reply, :matched, state, {:continue, :process_tokens}}
+      {:ok, state, false} -> {:reply, :ignored, state}
+      {:error, reason, state} -> {:reply, {:error, reason}, state}
+    end
   end
 
   def handle_call({:signal, signal_name}, _from, state) do

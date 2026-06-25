@@ -1073,7 +1073,14 @@ defmodule Chronicle.Engine.Diagrams.Parser do
       # expressions maps expression names to expression strings
       Enum.into(expression_mapping, %{}, fn {node_id_str, expr_name} ->
         node_id = if is_binary(node_id_str), do: String.to_integer(node_id_str), else: node_id_str
-        expression = Map.get(expressions, expr_name, "")
+        # normalize_keys/1 has already camelCased the expression-NAME keys in
+        # `expressions` (e.g. "Valid" -> "valid"), but the mapping VALUE keeps its
+        # original case. Look up both so named gateway branches actually resolve
+        # (otherwise the expression is "" -> false -> the gateway always defaults).
+        expression =
+          Map.get(expressions, expr_name) ||
+            Map.get(expressions, to_camel_case(expr_name)) || ""
+
         {node_id, expression}
       end)
     else

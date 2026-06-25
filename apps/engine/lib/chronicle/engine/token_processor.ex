@@ -115,6 +115,12 @@ defmodule Chronicle.Engine.TokenProcessor do
         apply_loop_or_move(state, token, token.parameters, next_node_id)
 
       {:next_with_params, next_node_id, new_params} ->
+        # Persist the parameter delta as a VariablesUpdated event so an
+        # evicted-then-replayed instance restores it. Without this, ScriptTask
+        # outputs and external-task results (merged here, in-memory only) are LOST
+        # on replay — replay rebuilds from start_parameters + persisted events, and
+        # ExternalTaskCompletion replay only restores the node position, not params.
+        state = persist_param_delta(state, token, new_params)
         token = %{token | parameters: new_params}
         apply_loop_or_move(state, token, new_params, next_node_id)
 
@@ -202,6 +208,27 @@ defmodule Chronicle.Engine.TokenProcessor do
   end
 
   # --- Result Handlers ---
+
+  # Persist only the changed/added params (delta vs the token's current params) as a
+  # VariablesUpdated event. event_replayer restores params solely from
+  # VariablesUpdated, so this makes ScriptTask outputs + external-task results
+  # survive eviction/replay. Additive model (key removals are not tracked).
+  defp persist_param_delta(state, token, new_params) do
+    old = token.parameters || %{}
+    delta = for {k, v} <- new_params, Map.get(old, k) != v, into: %{}, do: {k, v}
+
+    if map_size(delta) == 0 do
+      state
+    else
+      append_event(state, %PersistentData.VariablesUpdated{
+        token: token.id,
+        family: token.family,
+        current_node: token.current_node,
+        variables: delta,
+        updated_at: System.system_time(:millisecond)
+      })
+    end
+  end
 
   defp handle_fork(state, token, paths) do
     # Mark original token as joined
@@ -442,6 +469,12 @@ defmodule Chronicle.Engine.TokenProcessor do
 
     # Register in Registry for cross-instance routing
     Registry.register(:waits, {state.tenant_id, :message, name, state.business_key}, token.id)
+
+    # Wait-created hook: lets the bus correlator immediately deliver a message that
+    # arrived BEFORE the token reached this catch (held in the inbox). Broadcast AFTER
+    # the :waits registration so the subscriber's lookup is guaranteed to find it.
+    Phoenix.PubSub.broadcast(Chronicle.PubSub, "engine:message_waits",
+      {:message_wait_created, state.tenant_id, name, state.business_key, state.id})
 
     event = %PersistentData.MessageWaitCreated{
       token: token.id,

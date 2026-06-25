@@ -59,6 +59,19 @@ defmodule Chronicle.Engine.InstanceLoadCell do
     GenServer.call(cell_pid, :evicted?)
   end
 
+  @doc """
+  Is `task_id` still an OPEN external task on this (evicted) instance? Checks the
+  waiting handles captured at eviction — lets the DeliveryReconciler safely re-drive a
+  stuck task for an evicted instance (whose reply was lost on the bus) without
+  restoring it. Returns false if not currently evicted (handles are only populated
+  while evicted; a resident instance is queried directly via the Instance).
+  """
+  def external_task_open?(cell_pid, task_id) do
+    GenServer.call(cell_pid, {:external_task_open?, task_id})
+  catch
+    _, _ -> false
+  end
+
   @doc "Get cell info for diagnostics."
   def inspect_cell(cell_pid) do
     GenServer.call(cell_pid, :inspect_cell)
@@ -99,6 +112,16 @@ defmodule Chronicle.Engine.InstanceLoadCell do
 
   def handle_call(:evicted?, _from, state) do
     {:reply, state.cell_state == :evicted, state}
+  end
+
+  def handle_call({:external_task_open?, task_id}, _from, state) do
+    open? =
+      Enum.any?(state.waiting_handles, fn
+        %Chronicle.Engine.WaitingHandle.ExternalTask{task_id: ^task_id} -> true
+        _ -> false
+      end)
+
+    {:reply, open?, state}
   end
 
   def handle_call(:inspect_cell, _from, state) do
@@ -160,6 +183,23 @@ defmodule Chronicle.Engine.InstanceLoadCell do
     else
       {:noreply, state}
     end
+  end
+
+  # Restore failed (transient: event-store read or instance start error). Reset to
+  # :evicted so a subsequent queued wake re-triggers the restore — the queued wakes
+  # (and the inbox rows behind them) are preserved, never lost. Re-trigger now if any
+  # wake is already waiting.
+  def handle_cast(:restore_failed, state) do
+    state = %{state | cell_state: :evicted}
+
+    state =
+      if :queue.len(state.mailbox) > 0 do
+        Lifecycle.trigger_restore(state)
+      else
+        state
+      end
+
+    {:noreply, state}
   end
 
   # --- Info handlers ---

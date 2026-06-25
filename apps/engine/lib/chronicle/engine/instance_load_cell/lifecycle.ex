@@ -92,12 +92,18 @@ defmodule Chronicle.Engine.InstanceLoadCell.Lifecycle do
           ) do
             {:ok, pid} ->
               GenServer.cast(cell_pid, {:restore_completed, pid})
+            {:error, {:already_started, pid}} ->
+              GenServer.cast(cell_pid, {:restore_completed, pid})
             {:error, reason} ->
               Logger.error("InstanceLoadCell #{instance_id}: Restore failed: #{inspect(reason)}")
+              # Reset to :evicted so the next queued wake re-triggers a restore —
+              # a transient start failure must not strand the cell (and its reply).
+              GenServer.cast(cell_pid, :restore_failed)
           end
 
         {:error, reason} ->
           Logger.error("InstanceLoadCell #{instance_id}: Cannot load events: #{inspect(reason)}")
+          GenServer.cast(cell_pid, :restore_failed)
       end
     end)
 
