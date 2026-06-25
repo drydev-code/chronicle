@@ -479,6 +479,22 @@ defmodule Chronicle.Engine.Instance do
   def handle_info({:boundary_timer_elapsed, token_id, boundary_node_id, timer_marker}, state) do
     {timer_ref, timer_id} = resolve_timer_ref(state, token_id, timer_marker)
 
+    # NEW-2: a boundary-timer fire is only a genuine, still-open wait if `timer_ref`
+    # is CURRENTLY registered to this token in `timer_refs`. The first fire consumes
+    # that entry (handle_boundary_timer_elapsed / cancel_* delete it); a stale or
+    # duplicate fire (sweeper racing the fast-path send_after, or a double sweep)
+    # resolves to a ref no longer in `timer_refs`. Gating HERE — before appending
+    # TimerElapsed/BoundaryEventTriggered — keeps the duplicate a true no-op and
+    # prevents persisting duplicate boundary events. Mirrors the `open_wait?` guard
+    # in WaitRegistry.handle_timer_elapsed (finding #1).
+    if Map.get(state.timer_refs, timer_ref) != token_id do
+      {:noreply, state}
+    else
+      persist_boundary_timer_elapsed(state, token_id, boundary_node_id, timer_ref, timer_id)
+    end
+  end
+
+  defp persist_boundary_timer_elapsed(state, token_id, boundary_node_id, timer_ref, timer_id) do
     trigger_event = BoundaryLifecycle.trigger_event(state, token_id, boundary_node_id)
 
     cancel_events =
@@ -657,11 +673,7 @@ defmodule Chronicle.Engine.Instance do
           {:process_instance_completed, candidate.id, candidate.business_key, candidate.tenant_id, completion_data})
 
         if candidate.parent_id do
-          case lookup(candidate.tenant_id, candidate.parent_id) do
-            {:ok, parent_pid} ->
-              GenServer.cast(parent_pid, {:child_completed, candidate.id, completion_data, true})
-            _ -> :ok
-          end
+          notify_parent_child_completed(candidate.tenant_id, candidate.parent_id, candidate.id, completion_data, true)
         end
 
         if Chronicle.Engine.LargeVariablesCleaner.enabled?() do
@@ -680,6 +692,27 @@ defmodule Chronicle.Engine.Instance do
         # Keep the instance in its pre-completion state so a supervisor
         # restart (or retry) can replay from the durable log.
         {:error, reason, state}
+    end
+  end
+
+  # Cell-aware child->parent call-return. A resident parent is notified directly
+  # (today's behaviour, identical). An EVICTED parent has no live Instance, so the
+  # notification would be lost; route it through its InstanceLoadCell, which wakes
+  # the cell ({:wake, :child_completed, ...}) — restoring the parent and delivering
+  # durably. If neither a resident instance nor a cell exists, the parent is gone.
+  defp notify_parent_child_completed(tenant_id, parent_id, child_id, completion_data, successful) do
+    case lookup(tenant_id, parent_id) do
+      {:ok, parent_pid} ->
+        GenServer.cast(parent_pid, {:child_completed, child_id, completion_data, successful})
+
+      _ ->
+        case Chronicle.Engine.InstanceLoadCell.lookup(tenant_id, parent_id) do
+          {:ok, cell_pid} ->
+            GenServer.cast(cell_pid, {:wake, :child_completed, child_id, completion_data, successful})
+
+          _ ->
+            :ok
+        end
     end
   end
 

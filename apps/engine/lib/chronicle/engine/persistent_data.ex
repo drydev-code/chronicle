@@ -218,8 +218,33 @@ defmodule Chronicle.Engine.PersistentData do
   @doc "Decode a map back to a persistent data struct."
   def decode(%{"type" => type} = map) do
     module = Module.concat([__MODULE__, type])
-    struct(module, atomize_keys(map))
+    module |> struct(atomize_keys(map)) |> restore_value_atoms()
   end
+
+  # `atomize_keys/1` atomizes map KEYS only; a few fields carry ATOM *values*
+  # (encoded to JSON strings) that consumers pattern-match as atoms. Restore them
+  # on decode so the durable form matches the in-memory form. `boundary_type`
+  # (`:timer`/`:message`/`:signal`/`:conditional`/...) is pattern-matched as an
+  # atom by the resident `EventReplayer` (event_replayer.ex ~496/~949), by
+  # `boundary_lifecycle`, and by `EvictedWaitRestorer` — without this, a boundary
+  # streamed back from storage carried `boundary_type: "message"` and silently
+  # failed every `== :message` / `boundary_type: :message` match, so boundary
+  # message/signal waits were NOT reconstructed on restore.
+  defp restore_value_atoms(%mod{boundary_type: bt} = event)
+       when mod in [BoundaryEventCreated, BoundaryEventTriggered, BoundaryEventCancelled] and
+              is_binary(bt) do
+    %{event | boundary_type: safe_to_atom(bt)}
+  end
+
+  defp restore_value_atoms(event), do: event
+
+  defp safe_to_atom(value) when is_binary(value) do
+    String.to_existing_atom(value)
+  rescue
+    ArgumentError -> value
+  end
+
+  defp safe_to_atom(value), do: value
 
   defp atomize_keys(map) do
     Map.new(map, fn

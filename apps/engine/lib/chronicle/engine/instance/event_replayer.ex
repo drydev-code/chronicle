@@ -72,9 +72,116 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
     end
   end
 
+  @doc """
+  Side-effect-free classifier: replay `events` against a freshly built base
+  state and report whether the instance has any ACTIVE (in-flight, non-waiting,
+  non-terminal) token.
+
+  Used by the evicted-only boot-restore path
+  (`Chronicle.Engine.EvictedWaitRestorer`) to decide whether an instance must be
+  brought back RESIDENT-and-processed immediately (active token mid-processing,
+  e.g. a WAKE event was recorded but the next wait/completion was never written)
+  rather than parked as a passive evicted cell. Unlike `restore_from_events/2`
+  this performs NO registry registration and arms NO timers — it only reuses the
+  pure replay + token classification, so it is safe to call from any process.
+
+  Returns `true` when at least one token classifies as active, `false` when the
+  instance is purely waiting/completed, and `{:error, reason}` when the
+  definition cannot be loaded (caller then falls back to the conservative
+  evicted-cell path).
+  """
+  def has_active_tokens?(events, base_state) do
+    case replay_open_state(events, base_state) do
+      {:ok, {state, _open_timers}} ->
+        {:ok, MapSet.size(state.active_tokens) > 0}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @doc """
+  Side-effect-free FULL replay: rebuild the complete token/wait state — including
+  the IMPLICIT message/signal waits `detect_implicit_waits/4` reconstructs for a
+  token that durably reached a catch but crashed before its `MessageWaitCreated`
+  was persisted — and return it together with the open-timer map.
+
+  This is the authoritative source the evicted-boot restore
+  (`Chronicle.Engine.EvictedWaitRestorer`) enumerates its open
+  `WaitingHandle`s from, so the evicted path can NEVER diverge from the resident
+  reconstruction: it reads the SAME `state.message_waits` / `signal_waits` /
+  `external_tasks` / `call_wait_list` / boundary maps and the SAME open-timer map
+  that `restore_from_events/2` builds, minus only the registry/timer side effects.
+
+  Like `has_active_tokens?/2` this performs NO registry registration and arms NO
+  timers, so it is safe to call from any process. Returns
+  `{:ok, {state, open_timers}}` or `{:error, reason}` when the definition cannot
+  be loaded (caller then falls back to its conservative path).
+  """
+  def replay_open_state(events, base_state) do
+    start_event =
+      Enum.find(events, fn
+        %PersistentData.ProcessInstanceStart{} -> true
+        _ -> false
+      end)
+
+    if start_event == nil do
+      {:error, :no_start_event}
+    else
+      tenant_id = start_event.tenant || base_state.tenant_id
+
+      case DiagramStore.get(start_event.process_name, start_event.process_version, tenant_id) do
+        {:ok, definition} ->
+          state = %{base_state |
+            business_key: start_event.business_key,
+            tenant_id: tenant_id,
+            definition: definition,
+            start_node_id: start_event.start_node_id
+          }
+
+          {state, open_timers, _msg_waits, _sig_waits} = replay_events_pure(events, state)
+          {:ok, {state, open_timers}}
+
+        _ ->
+          {:error, :definition_unavailable}
+      end
+    end
+  end
+
+  @doc """
+  Public wrapper over the resident `:no_key` opt-in test, so the evicted-boot
+  restore decides a message wait's keyless flag with EXACTLY the resident
+  semantics (`reregister_waits_in_registry` / `message_wait_keyless?/3`) instead
+  of re-deriving it. Reads the catch node off `state.tokens[token_id]` — for an
+  event-gateway branch the token sits on the gateway node, so the gateway
+  candidate is consulted, mirroring the live registration.
+  """
+  def wait_keyless?(state, name, token_id) do
+    message_wait_keyless?(state, name, token_id)
+  end
+
   # Replays all events against the given state, returning the fully
   # reconstructed state with tokens, waits, and timers restored.
   defp replay_events(events, state) do
+    {state, open_timers, open_message_waits, open_signal_waits} = replay_events_pure(events, state)
+
+    # Re-register timers for tokens still waiting
+    state = reregister_timers(state, open_timers)
+
+    # Re-register message/signal waits in the Registry for cross-instance routing
+    reregister_waits_in_registry(state, open_message_waits, open_signal_waits)
+    reregister_boundaries_in_registry(state)
+
+    state
+  end
+
+  # Pure core of the replay: rebuild token positions, waits and classify tokens
+  # WITHOUT any side effect (no `Process.send_after`, no `Registry.register`).
+  # `replay_events/2` layers the registry/timer re-registration on top; the
+  # evicted-boot classifier (`has_active_tokens?/2`) uses this alone. Returns the
+  # classified state plus the open-timer/message/signal maps the resident path
+  # needs for re-registration.
+  defp replay_events_pure(events, state) do
     acc = %{
       state: state,
       token_wait_states: %{},
@@ -122,14 +229,7 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
     # Classify tokens into active/waiting/completed sets
     state = TokenState.classify_tokens(state, token_wait_states)
 
-    # Re-register timers for tokens still waiting
-    state = reregister_timers(state, acc.open_timers)
-
-    # Re-register message/signal waits in the Registry for cross-instance routing
-    reregister_waits_in_registry(state, open_message_waits, open_signal_waits)
-    reregister_boundaries_in_registry(state)
-
-    state
+    {state, acc.open_timers, open_message_waits, open_signal_waits}
   end
 
   # --- Event replay clauses ---
@@ -250,18 +350,32 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
 
     acc = %{acc | open_timers: Map.delete(acc.open_timers, timer_id)}
 
-    state = if event.target_node do
-      TokenState.update_token_node(state, token_id, event.target_node)
+    # E4 twin (TIMER winner): a timer that WON an event-based gateway resolves
+    # the gateway exactly like a message/signal winner. The live resume sets the
+    # token :continue with the trigger `:timer_elapsed` (wait_registry.ex:235) and
+    # closes every sibling branch wait. On crash-replay of ONLY TimerElapsed
+    # (EventGatewayResolved not yet durable), the EventGatewayActivated replay
+    # already re-opened every sibling message/signal wait — without this the token
+    # would replay as :execute_current_node on the gateway node (re-arming every
+    # branch) and stale sibling waits would remain. Detect the gateway-winner case
+    # by the still-open gateway wait_id for this token (TimerElapsed carries no
+    # selected_node), then mirror the MessageHandled gateway path EXACTLY.
+    if event_gateway_winner?(acc, token_id) do
+      resume_event_gateway_winner(acc, token_id, :timer_elapsed)
     else
-      state
-    end
+      state = if event.target_node do
+        TokenState.update_token_node(state, token_id, event.target_node)
+      else
+        state
+      end
 
-    state = TokenState.set_token_active(state, token_id)
-    acc = %{acc |
-      state: state,
-      token_wait_states: Map.delete(acc.token_wait_states, token_id)
-    }
-    track_token_id(acc, token_id)
+      state = TokenState.set_token_active(state, token_id)
+      acc = %{acc |
+        state: state,
+        token_wait_states: Map.delete(acc.token_wait_states, token_id)
+      }
+      track_token_id(acc, token_id)
+    end
   end
 
   defp replay_single_event(%PersistentData.TimerCanceled{} = event, acc) do
@@ -681,20 +795,34 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
     token_id = event.token
     name = event.signal_name
 
-    acc = remove_from_open_waits(acc, :open_signal_waits, name, token_id)
-
-    state = if event.target_node do
-      TokenState.update_token_node(state, token_id, event.target_node)
+    # E4 twin (SIGNAL winner): a signal that WON an event-based gateway resolves
+    # the gateway exactly like a message winner. The live resume sets the token
+    # :continue with the trigger `{:signal, name}` (wait_registry.ex:94) and closes
+    # every sibling branch wait. On crash-replay of ONLY SignalHandled
+    # (EventGatewayResolved not yet durable), the EventGatewayActivated replay
+    # already re-opened every sibling message/signal wait — without this the token
+    # would replay as :execute_current_node on the gateway node (re-arming every
+    # branch) and stale sibling waits would remain. Detect the gateway-winner case
+    # by the still-open gateway wait_id for this token (SignalHandled carries no
+    # selected_node), then mirror the MessageHandled gateway path EXACTLY.
+    if event_gateway_winner?(acc, token_id) do
+      resume_event_gateway_winner(acc, token_id, {:signal, name})
     else
-      state
-    end
+      acc = remove_from_open_waits(acc, :open_signal_waits, name, token_id)
 
-    state = TokenState.set_token_active(state, token_id)
-    acc = %{acc |
-      state: state,
-      token_wait_states: Map.delete(acc.token_wait_states, token_id)
-    }
-    track_token_id(acc, token_id)
+      state = if event.target_node do
+        TokenState.update_token_node(state, token_id, event.target_node)
+      else
+        state
+      end
+
+      state = TokenState.set_token_active(state, token_id)
+      acc = %{acc |
+        state: state,
+        token_wait_states: Map.delete(acc.token_wait_states, token_id)
+      }
+      track_token_id(acc, token_id)
+    end
   end
 
   defp replay_single_event(%PersistentData.CallStarted{} = event, acc) do
@@ -804,6 +932,48 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
 
   defp track_token_id(acc, token_id) do
     %{acc | max_token_id: max(acc.max_token_id, token_id)}
+  end
+
+  # E4 twin: true iff the token is parked on an event-based gateway whose durable
+  # wait occurrence is still OPEN (the gateway has NOT been resolved yet). This is
+  # the gateway-winner signal/timer counterpart of the MessageHandled gateway test
+  # — but SignalHandled/TimerElapsed carry no `selected_node`, so the ONLY signal is
+  # the still-open `{:gateway, token_id}` wait_id minted by EventGatewayActivated
+  # replay and removed by EventGatewayResolved replay. When EventGatewayResolved IS
+  # present (no-crash path), it ran first and cleared this entry, so this is false
+  # and the plain (re-arm-free) signal/timer handling applies unchanged.
+  defp event_gateway_winner?(acc, token_id) do
+    not is_nil(Map.get(acc.open_wait_ids, {:gateway, token_id}))
+  end
+
+  # E4 twin: resolve an event-based gateway won by a SIGNAL or TIMER on crash-replay
+  # of only SignalHandled / TimerElapsed (EventGatewayResolved not yet durable).
+  # Mirrors the MessageHandled gateway clause EXACTLY (event_replayer.ex MessageHandled):
+  #   * close ALL of this gateway's sibling message/signal candidate waits (re-opened
+  #     by EventGatewayActivated replay) and forget the gateway's wait_id index entry,
+  #     so exactly ONE branch survives and no sibling can double-fire;
+  #   * leave the token on the GATEWAY node and set it :continue with the reconstructed
+  #     resume trigger (`{:signal, name}` / `:timer_elapsed`, the SAME tuple the live
+  #     WaitRegistry resumes with — wait_registry.ex:94 / :235), so re-processing
+  #     dispatches to Gateway.continue_after_wait → continue_event_based, which selects
+  #     the SELECTED branch and durably re-appends EventGatewayResolved.
+  # Holds for both resident restore and the evicted path (both derive waits from this
+  # same replay state).
+  defp resume_event_gateway_winner(acc, token_id, continuation_trigger) do
+    acc = %{acc |
+      open_message_waits: remove_token_from_all_waits(acc.open_message_waits, token_id),
+      open_signal_waits: remove_token_from_all_waits(acc.open_signal_waits, token_id),
+      open_wait_ids: forget_token_wait_ids(acc.open_wait_ids, token_id)
+    }
+
+    state = TokenState.set_token_continue(acc.state, token_id)
+    state = TokenState.update_token_context(state, token_id, :continuation_context, continuation_trigger)
+
+    acc = %{acc |
+      state: state,
+      token_wait_states: Map.delete(acc.token_wait_states, token_id)
+    }
+    track_token_id(acc, token_id)
   end
 
   defp remove_from_open_waits(acc, wait_key, name, token_id) do

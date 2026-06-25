@@ -109,6 +109,53 @@ defmodule Chronicle.Engine.InstanceBoundaryLifecycleTest do
       assert Enum.any?(events, &match?(%PersistentData.BoundaryEventTriggered{boundary_node_id: 22}, &1))
       assert Enum.any?(events, &match?(%PersistentData.TimerCanceled{timer_id: ^retry_timer_id}, &1))
     end
+
+    test "NEW-2: a double boundary-timer fire persists exactly one BoundaryEventTriggered" do
+      # Crash-window / double-sweep guard: a sweeper racing the fast-path
+      # send_after (or a double sweep) can deliver the SAME boundary_timer_elapsed
+      # twice. The second fire must be a no-op — not append duplicate
+      # TimerElapsed/BoundaryEventTriggered events.
+      {:ok, pid, _instance_id} = start_retry_boundary_instance("retry-timer-boundary-double", [
+        %{
+          "id" => 22,
+          "type" => "timerBoundaryEvent",
+          "activity" => 2,
+          "timer" => %{"durationMs" => 60_000}
+        }
+      ])
+
+      task_id = wait_for_external_task(pid)
+      :ok = Instance.error_external_task_sync(pid, task_id, %{error_message: "retry"}, true, 60_000)
+      retry_timer_id = wait_for_retry_timer(pid)
+      {boundary_ref, boundary_timer_id} = wait_for_boundary_timer(pid, 22)
+
+      # First fire resolves the boundary durably.
+      send(pid, {:boundary_timer_elapsed, 0, 22, boundary_ref})
+
+      state =
+        wait_until(pid, fn state ->
+          Enum.any?(state.persistent_events, &match?(%PersistentData.TimerCanceled{timer_id: ^retry_timer_id}, &1))
+        end)
+
+      assert state.timer_refs == %{}
+
+      # Second (stale/duplicate) fire of the SAME ref must be a no-op.
+      send(pid, {:boundary_timer_elapsed, 0, 22, boundary_ref})
+
+      # Let the (no-op) message drain before asserting.
+      _ = :sys.get_state(pid)
+      Process.sleep(40)
+      state = :sys.get_state(pid)
+
+      triggered =
+        Enum.count(state.persistent_events, &match?(%PersistentData.BoundaryEventTriggered{boundary_node_id: 22}, &1))
+
+      elapsed =
+        Enum.count(state.persistent_events, &match?(%PersistentData.TimerElapsed{timer_id: ^boundary_timer_id}, &1))
+
+      assert triggered == 1
+      assert elapsed == 1
+    end
   end
 
   describe "message correlation" do

@@ -207,7 +207,12 @@ defmodule Chronicle.Engine.Instance.WaitRegistry do
   State always has the timer_ref cleaned up.
   """
   def handle_timer_elapsed(state, token_id, timer_ref) do
-    alias Chronicle.Engine.Token
+    # A timer is a genuine, still-open wait for this token only if `timer_ref` is
+    # CURRENTLY registered to it in `timer_refs`. The first fire consumes that
+    # entry; any stale/duplicate fire (the evicted boot path's fast-path
+    # `send_after` racing the restored Instance's re-armed timer) resolves to a
+    # ref that is no longer in `timer_refs`, so it cannot pass this check.
+    open_wait? = Map.get(state.timer_refs, timer_ref) == token_id
 
     state = %{
       state
@@ -217,7 +222,16 @@ defmodule Chronicle.Engine.Instance.WaitRegistry do
 
     token = Map.get(state.tokens, token_id)
 
-    if token && Token.waiting?(token) do
+    # Resume only when the fired timer is a current open wait AND the token is
+    # still parked on a timer-eligible catch. A plain intermediate timer leaves
+    # the token `:waiting_for_timer`; an event-based gateway arms its timer
+    # candidate while the token is `:waiting_for_event_gateway`
+    # (token_processor.handle_wait_for_event_gateway), so a timer WINNING that
+    # gateway must also resume. Gating on `open_wait?` (not state alone) keeps the
+    # evicted double-fire a no-op: the second fire has already lost its
+    # `timer_refs` entry, so it is ignored even while the token still waits.
+    if open_wait? && token &&
+         token.state in [:waiting_for_timer, :waiting_for_event_gateway] do
       state = TokenState.resume_token(state, token_id, :timer_elapsed)
       {:resumed, state}
     else

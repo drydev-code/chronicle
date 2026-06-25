@@ -55,27 +55,60 @@ defmodule Chronicle.Supervisor do
        strategy: :one_for_one,
        max_restarts: 1000,
        max_seconds: 5},
-      Chronicle.Engine.EvictionManager
+      Chronicle.Engine.EvictionManager,
+      # Crash-durable safety net for evicted-instance timers. Dormant on the
+      # default :resident path (it only scans :evicted_waits timer rows, of
+      # which there are none there); independent of EvictionManager.enabled.
+      Chronicle.Engine.TimerSweeper,
+      # Crash-durable safety net for call returns to an evicted parent: the
+      # child->parent wake cast is volatile, so a crash between the child
+      # persisting its completion and the parent recording its CallCompleted
+      # loses the wake. Dormant on the default :resident path (no evicted :call
+      # rows exist there); independent of EvictionManager.enabled. See
+      # Chronicle.Engine.CallReturnSweeper (CODEX FINDING #5).
+      Chronicle.Engine.CallReturnSweeper,
+      # Bounds concurrent on-demand restores so an :evicted boot does not
+      # stampede InstanceSupervisor when many woken cells restore at once.
+      # Unbounded by default (config :engine, restore_max_concurrency: N to
+      # bound) — a no-op on the :resident path, so the existing suite is
+      # unaffected. See Chronicle.Engine.RestoreLimiter.
+      Chronicle.Engine.RestoreLimiter
     ]
+
+    restore_mode = Application.get_env(:engine, :restore_mode, :resident)
 
     restore_child =
       if restore? do
-        [
-          {Task,
-           fn ->
-             # `restore_active_instances/0` brings active instances back resident
-             # which re-registers their waits via the normal `InstanceLoadCell`
-             # path. `EvictedWaitRestorer.restore_all/0` is intentionally NOT
-             # called here — it would double-register waits and its current
-             # implementation has known correctness issues (see module doc).
-             restore_active_instances()
-           end}
-        ]
+        [restore_task(restore_mode)]
       else
         []
       end
 
     Enum.reject(base ++ restore_child, &is_nil/1)
+  end
+
+  # Boot-restore routing. Default :resident is the UNCHANGED existing path:
+  # `restore_active_instances/0` brings instances back resident, re-registering
+  # their waits via the normal `InstanceLoadCell` path. Opt-in :evicted instead
+  # starts a lightweight evicted cell per active instance via
+  # `EvictedWaitRestorer.restore_all/0`; those cells restore on-demand (bounded
+  # by `RestoreLimiter`) when a trigger arrives.
+  #
+  # NOTE: in :evicted mode `EvictionManager` MUST be enabled (it defaults to
+  # enabled: false, eviction_manager.ex) — otherwise instances restored
+  # on-demand are never re-evicted and the engine drifts back to fully resident.
+  defp restore_task(:evicted) do
+    {Task, fn -> Chronicle.Engine.EvictedWaitRestorer.restore_all() end}
+  end
+
+  defp restore_task(_resident) do
+    {Task,
+     fn ->
+       # `EvictedWaitRestorer.restore_all/0` is intentionally NOT called on this
+       # default path — it would double-register waits against the resident
+       # instances started here.
+       restore_active_instances()
+     end}
   end
 
   defp restore_active_instances do

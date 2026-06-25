@@ -232,6 +232,79 @@ defmodule Chronicle.Engine.Instance.WaitRegistryTest do
     end
   end
 
+  describe "handle_timer_elapsed/3" do
+    test "a timer winning an event-based gateway resumes the token, and a stale second fire is a no-op" do
+      ref = make_ref()
+
+      token =
+        Token.new(1, 0, 10, %{})
+        |> Token.set_waiting(:waiting_for_event_gateway)
+        |> Token.set_context(:event_gateway_candidates, [
+          %{type: :message, name: "reply", node_id: 11},
+          %{type: :timer, node_id: 12}
+        ])
+
+      state =
+        Map.merge(TokenState.base_state(), %{
+          id: "inst-1",
+          tenant_id: "tenant-a",
+          business_key: "bk-1",
+          definition: %Chronicle.Engine.Diagrams.Definition{
+            nodes: %{
+              10 => %Nodes.Gateway{id: 10, kind: :event_based},
+              11 => %Nodes.IntermediateCatch.MessageEvent{
+                id: 11,
+                message: %{name: "reply"},
+                outputs: [20]
+              },
+              12 => %Nodes.IntermediateCatch.TimerEvent{id: 12, outputs: [21]}
+            }
+          },
+          tokens: %{1 => token},
+          waiting_tokens: MapSet.new([1]),
+          message_waits: %{"reply" => [1]},
+          timer_refs: %{ref => 1},
+          timer_ref_ids: %{ref => "timer-1"}
+        })
+
+      # The fired timer is a current open wait for the token (ref ∈ timer_refs):
+      # the timer branch must be taken even though the token is parked on the
+      # gateway, not :waiting_for_timer.
+      assert {:resumed, state} = WaitRegistry.handle_timer_elapsed(state, 1, ref)
+      assert state.tokens[1].context.continuation_context == :timer_elapsed
+      assert state.timer_refs == %{}
+
+      # A stale/duplicate fire of the SAME ref (already consumed) is ignored even
+      # though the token is now active — this is the evicted double-fire guard.
+      assert {:ignored, ^state} = WaitRegistry.handle_timer_elapsed(state, 1, ref)
+    end
+
+    test "a plain intermediate timer still resumes the :waiting_for_timer token" do
+      ref = make_ref()
+
+      token =
+        Token.new(1, 0, 10, %{})
+        |> Token.set_waiting(:waiting_for_timer)
+
+      state =
+        Map.merge(TokenState.base_state(), %{
+          id: "inst-1",
+          tenant_id: "tenant-a",
+          business_key: "bk-1",
+          tokens: %{1 => token},
+          waiting_tokens: MapSet.new([1]),
+          timer_refs: %{ref => 1},
+          timer_ref_ids: %{ref => "timer-1"}
+        })
+
+      assert {:resumed, state} = WaitRegistry.handle_timer_elapsed(state, 1, ref)
+      assert state.tokens[1].context.continuation_context == :timer_elapsed
+
+      # Stale re-fire after consumption is a no-op.
+      assert {:ignored, ^state} = WaitRegistry.handle_timer_elapsed(state, 1, ref)
+    end
+  end
+
   defp boundary_state(overrides) do
     token =
       Token.new(1, 0, 10)

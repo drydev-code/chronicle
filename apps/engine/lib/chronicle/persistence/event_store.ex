@@ -119,6 +119,29 @@ defmodule Chronicle.Persistence.EventStore do
     end
   end
 
+  @doc """
+  Durable terminal status of an instance, derived purely from which table holds
+  its row. Used by the `CallReturnSweeper` to decide — WITHOUT restoring the
+  child — whether an evicted parent's outstanding call return is owed:
+
+    * `:completed`  — child finished normally (CompletedProcessInstances row).
+    * `:terminated` — child was terminated (TerminatedProcessInstances row).
+    * `:active`     — child is still running (ActiveProcessInstances row), so no
+      return is owed yet.
+    * `:unknown`    — no row in any table (already reaped, or never existed).
+
+  The active-row check is first and cheapest; only when it is absent do we probe
+  the terminal tables.
+  """
+  def terminal_status(instance_id) do
+    cond do
+      Repo.get(ActiveInstance, instance_id) != nil -> :active
+      Repo.get(CompletedInstance, instance_id) != nil -> :completed
+      Repo.get(TerminatedInstance, instance_id) != nil -> :terminated
+      true -> :unknown
+    end
+  end
+
   def delete_active(instance_id) do
     Repo.delete_all(from a in ActiveInstance, where: a.process_instance_id == ^instance_id)
   end
