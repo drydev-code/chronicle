@@ -96,6 +96,21 @@ defmodule Chronicle.Engine.EvictedWaitRestorer do
         {tenant_id, business_key} = identity(events)
 
         cond do
+          contains_unknown_event?(events) ->
+            # FAIL-CLOSED (mirrors Supervisor.restore_instance): the log carries an
+            # event type this engine version does not understand. Both branches
+            # below (resident restore via `restore_resident`, and the evicted cell
+            # whose waits are derived from a replay that SKIPS the unknown event)
+            # would drive/register the instance from a TRUNCATED state. Refuse and
+            # leave the active row untouched for a newer, compatible owner.
+            Logger.warning(
+              "EvictedWaitRestorer: instance #{instance_id} contains unrecognized future " <>
+                "event type(s) — refusing to restore on this engine version; leaving for a " <>
+                "compatible owner"
+            )
+
+            {:error, :unknown_event_type}
+
           resident_instance_exists?(tenant_id, instance_id) ->
             :already_started
 
@@ -522,6 +537,12 @@ defmodule Chronicle.Engine.EvictedWaitRestorer do
     Enum.find(events, &match?(%PersistentData.ProcessInstanceStart{}, &1))
   end
 
+  # Cheap single pass: does the decoded log contain ANY event whose type this
+  # release does not recognise (`PersistentData.decode/1` yields `%Unknown{}`)?
+  defp contains_unknown_event?(events) do
+    Enum.any?(events, &match?(%PersistentData.Unknown{}, &1))
+  end
+
   defp fold(%PersistentData.ExternalTaskCreation{} = e, acc) do
     put_in(acc.ext[e.external_task], %{token_id: e.token})
   end
@@ -722,6 +743,13 @@ defmodule Chronicle.Engine.EvictedWaitRestorer do
   # most one wait construct at a time, so removing it from every name is safe.
   defp fold(%PersistentData.EventGatewayResolved{} = e, acc) do
     resolve_gateway_if_parked(acc, e.token)
+  end
+
+  # Rolling-deploy forward compatibility: an `%Unknown{}` is a newer pod's event
+  # whose `"type"` this release lacks. Log and SKIP without touching wait state.
+  defp fold(%PersistentData.Unknown{type: type}, acc) do
+    Logger.warning("EvictedWaitRestorer: skipping unknown future event type #{inspect(type)}")
+    acc
   end
 
   # Explicit wait-creation events (from per-transition persistence, agent 1).

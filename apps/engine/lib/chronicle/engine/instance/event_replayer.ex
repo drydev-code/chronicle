@@ -922,6 +922,18 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
     acc
   end
 
+  # Rolling-deploy forward compatibility: an `%Unknown{}` is an event whose `"type"`
+  # this (older) release does not have — emitted by a newer pod. Log and SKIP it
+  # without mutating token state. (Safe only for a pod that does not OWN/drive the
+  # instance — see docs/rolling-deploy-plan.md ownership fence.)
+  defp replay_single_event(%PersistentData.Unknown{type: type}, acc) do
+    Logger.warning(
+      "Instance #{acc.state.id}: Skipping unknown future event type during restoration: #{inspect(type)}"
+    )
+
+    acc
+  end
+
   defp replay_single_event(unknown_event, acc) do
     Logger.warning("Instance #{acc.state.id}: Unknown event type during restoration: #{inspect(unknown_event.__struct__)}")
     acc

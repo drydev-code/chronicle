@@ -2,11 +2,41 @@ defmodule Chronicle.Engine.PersistentData do
   @moduledoc """
   All 17 PersistentData types for event sourcing.
   Each struct carries the data needed for restoration/replay.
+
+  ## ADDITIVE-ONLY field discipline (rolling-deploy / schema-evolution invariant)
+
+  Event struct fields may ONLY be ADDED. They must NEVER be removed, renamed, or
+  retyped, and a newly added field must NEVER become *required* for replay — every
+  field must remain optional (decode to `nil` when absent) and replay must tolerate
+  a `nil` value for it. This discipline, together with the tolerant codec below,
+  keeps schema evolution forward- AND backward-safe across a mixed-version fleet:
+
+    * NEW reads OLD — a struct missing a freshly added field decodes with that field
+      `nil` (`struct/2` defaults missing keys), and replay handles the `nil`.
+    * OLD reads NEW — `decode/1` is tolerant of UNKNOWN map KEYS (dropped via
+      `atomize_keys/1` instead of raising, equivalent to "old code ignores fields it
+      does not know") and of UNKNOWN event TYPES (an `%Unknown{}` sentinel instead of
+      `UndefinedFunctionError`), so an old release never crashes on a newer release's
+      events. Replay/fold log-and-skip an `%Unknown{}` event without mutating state.
+
+  A genuinely NON-additive change would require an explicit per-event version tag
+  (insertion point noted in `encode/1`) and a migration — it is NOT covered by the
+  tolerant codec.
   """
 
   defmodule Base do
     @moduledoc "Common fields for persistent data."
     defstruct [:token, :family, :current_node, :timestamp]
+  end
+
+  defmodule Unknown do
+    @moduledoc """
+    Sentinel for an event whose `"type"` this release does not know (e.g. a newer
+    version's struct). `decode/1` returns `%Unknown{}` instead of raising
+    `UndefinedFunctionError`, and replay/fold log-and-skip it without mutating state.
+    Carries the original `raw` map so it can be re-encoded losslessly if needed.
+    """
+    defstruct [:type, :raw]
   end
 
   defmodule ProcessInstanceStart do
@@ -209,17 +239,58 @@ defmodule Chronicle.Engine.PersistentData do
   @doc "Encode persistent data to a JSON-compatible map."
   def encode(%{__struct__: module} = data) do
     type = module |> Module.split() |> List.last()
+    # (deferred) NON-additive schema-version insertion point: a future
+    # non-additive change would stamp `|> Map.put(:v, <n>)` here and branch on it
+    # in `decode/1`. Not added now — the codec is additive-only (see @moduledoc).
     data
     |> Map.from_struct()
     |> normalize_for_json()
     |> Map.put(:type, type)
   end
 
-  @doc "Decode a map back to a persistent data struct."
+  @doc """
+  Decode a map back to a persistent data struct.
+
+  Tolerant of forward schema evolution: an UNKNOWN event `"type"` (a struct this
+  release does not have) yields `%Unknown{}` rather than raising, and UNKNOWN map
+  KEYS are dropped by `atomize_keys/1` rather than raising (see @moduledoc).
+  """
   def decode(%{"type" => type} = map) do
-    module = Module.concat([__MODULE__, type])
-    module |> struct(atomize_keys(map)) |> restore_value_atoms()
+    case safe_concat(type) do
+      {:ok, module} ->
+        module |> struct(atomize_keys(map)) |> restore_value_atoms()
+
+      :error ->
+        %Unknown{type: type, raw: map}
+    end
   end
+
+  # Resolve `type` to a compiled PersistentData submodule WITHOUT raising AND
+  # WITHOUT interning a new atom from the untrusted persisted `"type"` string. An
+  # unknown type (a newer release's event struct) returns `:error` so `decode/1`
+  # falls back to `%Unknown{}` instead of `UndefinedFunctionError`.
+  #
+  # SECURITY (atom-table-exhaustion DoS): the prior `Module.concat/1` CREATED the
+  # `Chronicle.Engine.PersistentData.<type>` atom before checking whether it was a
+  # real module, so a corrupt/hostile event blob carrying many distinct unknown
+  # `"type"` strings could exhaust the (non-GC'd) atom table. `Module.safe_concat/1`
+  # builds the joined atom ONLY if it already exists, else raises `ArgumentError`,
+  # which we rescue to `:error` — so an unknown/never-loaded type never mints a new
+  # atom. `Code.ensure_loaded?` + `function_exported?` then confirm the resolved
+  # atom is a real, compiled PersistentData struct. Known types still resolve.
+  defp safe_concat(type) when is_binary(type) do
+    module = Module.safe_concat([__MODULE__, type])
+
+    if Code.ensure_loaded?(module) and function_exported?(module, :__struct__, 0) do
+      {:ok, module}
+    else
+      :error
+    end
+  rescue
+    ArgumentError -> :error
+  end
+
+  defp safe_concat(_), do: :error
 
   # `atomize_keys/1` atomizes map KEYS only; a few fields carry ATOM *values*
   # (encoded to JSON strings) that consumers pattern-match as atoms. Restore them
@@ -246,13 +317,33 @@ defmodule Chronicle.Engine.PersistentData do
 
   defp safe_to_atom(value), do: value
 
+  # Atomize map KEYS for `struct/2`. UNKNOWN keys (a binary the running release
+  # never compiled as an atom — e.g. a newer version's field) are DROPPED, not
+  # raised: `struct/2` already ignores keys that aren't struct fields, so dropping
+  # is exactly equivalent to "old code ignores fields it doesn't know about" and is
+  # behaviour-preserving for every KNOWN key. We keep `to_existing_atom` (via
+  # `safe_existing_atom/1`) and never fall back to `String.to_atom` — that would be
+  # an atom-table-exhaustion DoS on attacker- or future-controlled keys.
   defp atomize_keys(map) do
-    Map.new(map, fn
-      {"type", _} -> {:__skip__, nil}
-      {k, v} when is_binary(k) -> {String.to_existing_atom(k), v}
-      {k, v} -> {k, v}
+    Enum.reduce(map, %{}, fn
+      {"type", _}, acc ->
+        acc
+
+      {k, v}, acc when is_binary(k) ->
+        case safe_existing_atom(k) do
+          {:ok, atom} -> Map.put(acc, atom, v)
+          :error -> acc
+        end
+
+      {k, v}, acc ->
+        Map.put(acc, k, v)
     end)
-    |> Map.delete(:__skip__)
+  end
+
+  defp safe_existing_atom(string) when is_binary(string) do
+    {:ok, String.to_existing_atom(string)}
+  rescue
+    ArgumentError -> :error
   end
 
   defp normalize_for_json(%{__struct__: module} = data) do

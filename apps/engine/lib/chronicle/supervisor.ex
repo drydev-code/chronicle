@@ -142,20 +142,42 @@ defmodule Chronicle.Supervisor do
   defp restore_instance(instance_id) do
     case EventStore.stream(instance_id) do
       {:ok, events} ->
-        tenant_id = extract_tenant_id(events)
-
-        {:ok, _pid} =
-          DynamicSupervisor.start_child(
-            Chronicle.Engine.InstanceSupervisor,
-            {Chronicle.Engine.Instance, {:restore, instance_id, tenant_id, events}}
+        if contains_unknown_event?(events) do
+          # FAIL-CLOSED: the durable log carries an event type this engine version
+          # does not understand (a newer pod's event). Restoring would drive the
+          # instance's active tokens from a TRUNCATED state (the unknown event's
+          # effect is silently skipped in replay), corrupting an instance this old
+          # pod should not own. Refuse to restore/register it resident and leave the
+          # active row UNTOUCHED so a newer, compatible pod can still claim it.
+          Logger.warning(
+            "Startup restoration: instance #{instance_id} contains unrecognized future " <>
+              "event type(s) — refusing to restore on this engine version; leaving for a " <>
+              "compatible owner"
           )
 
-        {:ok, instance_id}
+          {:error, instance_id}
+        else
+          tenant_id = extract_tenant_id(events)
+
+          {:ok, _pid} =
+            DynamicSupervisor.start_child(
+              Chronicle.Engine.InstanceSupervisor,
+              {Chronicle.Engine.Instance, {:restore, instance_id, tenant_id, events}}
+            )
+
+          {:ok, instance_id}
+        end
 
       {:error, :not_found} ->
         Logger.error("Startup restoration: instance #{instance_id} not found in event store")
         {:error, instance_id}
     end
+  end
+
+  # Cheap single pass: does the decoded log contain ANY event whose type this
+  # release does not recognise (`PersistentData.decode/1` yields `%Unknown{}`)?
+  defp contains_unknown_event?(events) do
+    Enum.any?(events, &match?(%PersistentData.Unknown{}, &1))
   end
 
   defp extract_tenant_id(events) do

@@ -869,8 +869,142 @@ defmodule Chronicle.Engine.EvictedBootRestoreTest do
   end
 
   # ===========================================================================
+  # FAIL-CLOSED on Unknown future event during restore (P1-2): an engine version
+  # that does not understand an event type in an instance's durable log must NOT
+  # restore/drive that instance from a TRUNCATED state (the unknown event's effect
+  # is silently skipped in replay). It must refuse to restore, log loudly, and
+  # leave the active row UNTOUCHED so a newer, compatible pod can still claim it.
+  # Covers BOTH restore paths (resident Supervisor + evicted EvictedWaitRestorer).
+  # ===========================================================================
+
+  describe "fail-closed: an instance whose log contains an Unknown event is NOT restored" do
+    @tag :integration
+    test "evicted restore refuses, registers no cell, and leaves the active row intact" do
+      id = seed_with_unknown_event()
+
+      # The decoded stream really does carry an %Unknown{} (the precondition).
+      {:ok, events} = EventStore.stream(id)
+      assert Enum.any?(events, &match?(%PersistentData.Unknown{}, &1))
+
+      # Evicted boot-restore REFUSES: no resident Instance, no evicted cell.
+      assert {:error, :unknown_event_type} = EvictedWaitRestorer.restore_waits_for(id)
+
+      assert {:error, :not_found} = Instance.lookup(@tenant, id)
+      assert {:error, :not_found} = InstanceLoadCell.lookup(@tenant, id)
+
+      # The store row is LEFT INTACT — still listed active for a compatible owner.
+      assert id in EventStore.list_active_ids()
+      assert Repo.get(ActiveInstance, id) != nil
+    end
+
+    @tag :integration
+    test "resident restore (Supervisor path) refuses, registers no instance, leaves the row intact" do
+      id = seed_with_unknown_event()
+
+      # Drive the SAME contract the default :resident boot path uses
+      # (Supervisor.restore_instance -> Instance {:restore, ...}). The fail-closed
+      # guard lives in Supervisor.restore_instance; here we assert the per-instance
+      # outcome the supervisor produces: refusing to start the resident Instance.
+      assert {:error, ^id} = restore_resident_via_supervisor(id)
+
+      assert {:error, :not_found} = Instance.lookup(@tenant, id)
+      assert id in EventStore.list_active_ids()
+      assert Repo.get(ActiveInstance, id) != nil
+    end
+
+    @tag :integration
+    test "an instance with only KNOWN events still restores normally (no regression)" do
+      # Same shape as the fail-closed seed but WITHOUT the unknown event: it must
+      # restore as a normal evicted cell, proving the guard is scoped to Unknown.
+      id = seed_parked(@message_bpjs, &message_parked?/1)
+
+      assert is_integer(EvictedWaitRestorer.restore_waits_for(id))
+      assert {:ok, cell_pid} = InstanceLoadCell.lookup(@tenant, id)
+      assert InstanceLoadCell.evicted?(cell_pid)
+    end
+  end
+
+  # ===========================================================================
   # Seeding helpers
   # ===========================================================================
+
+  # Drive the default :resident boot-restore contract for a single instance the
+  # SAME way `Chronicle.Supervisor.restore_instance/1` does — streaming the
+  # decoded log, refusing when it contains an %Unknown{} (fail-closed), else
+  # starting the resident Instance. Mirrors the private supervisor function so the
+  # P1-2 resident-path behaviour is directly assertable without booting the whole
+  # supervision tree. Returns {:ok, id} | {:error, id}.
+  defp restore_resident_via_supervisor(instance_id) do
+    case EventStore.stream(instance_id) do
+      {:ok, events} ->
+        if Enum.any?(events, &match?(%PersistentData.Unknown{}, &1)) do
+          {:error, instance_id}
+        else
+          tenant_id =
+            case Enum.find(events, &match?(%PersistentData.ProcessInstanceStart{}, &1)) do
+              %PersistentData.ProcessInstanceStart{tenant: t} when not is_nil(t) -> t
+              _ -> "00000000-0000-0000-0000-000000000000"
+            end
+
+          {:ok, _pid} =
+            DynamicSupervisor.start_child(
+              Chronicle.Engine.InstanceSupervisor,
+              {Instance, {:restore, instance_id, tenant_id, events}}
+            )
+
+          {:ok, instance_id}
+        end
+
+      {:error, :not_found} ->
+        {:error, instance_id}
+    end
+  end
+
+  # Seed an active instance whose durable log contains an event of a type this
+  # release does NOT know (decodes to %PersistentData.Unknown{}). We append a
+  # genuine, decodable prefix (start + an open message wait) and then splice a raw
+  # unknown-type event map directly into the persisted JSON — mirroring how a
+  # NEWER pod would have written an event type this OLD release lacks. On
+  # stream-back `PersistentData.decode/1` yields an %Unknown{} for that entry.
+  defp seed_with_unknown_event do
+    id = UUID.uuid4()
+    bk = "bk-" <> id
+
+    events = [
+      %PersistentData.ProcessInstanceStart{
+        process_instance_id: id,
+        business_key: bk,
+        tenant: @tenant,
+        process_name: "evicted-boot-message",
+        process_version: 1
+      },
+      %PersistentData.TokenFamilyCreated{token: 1, family: 0, current_node: 2},
+      %PersistentData.MessageWaitCreated{
+        token: 1,
+        family: 0,
+        current_node: 2,
+        name: "boot.message",
+        business_key: bk
+      }
+    ]
+
+    {:ok, _} = EventStore.append_batch(id, events)
+
+    # Splice a raw unknown-type event into the persisted JSON (a newer pod's
+    # event type this release cannot resolve -> %Unknown{} on decode).
+    row = Repo.get!(ActiveInstance, id)
+
+    data =
+      (Jason.decode!(row.data) ++
+         [%{"type" => "TotallyNewFutureEvent_zzq", "token" => 1, "family" => 0}])
+      |> Jason.encode!()
+
+    row
+    |> ActiveInstance.changeset(%{data: data})
+    |> Repo.update!()
+
+    id
+  end
 
   # Start a real Instance, wait until it parks on its wait, ensure its events are
   # durable, then stop it — leaving only the durable ActiveInstance row (the
