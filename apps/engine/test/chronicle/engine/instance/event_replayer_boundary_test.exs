@@ -382,10 +382,23 @@ defmodule Chronicle.Engine.Instance.EventReplayerBoundaryTest do
 
     assert {:ok, state} = EventReplayer.restore_from_events(events, restore_state("inst-6"))
 
+    # Both waits are CLOSED — neither the external task nor the call child remains
+    # open after their cancellations replayed.
     assert state.external_tasks == %{}
     assert state.call_wait_list == %{}
-    assert state.tokens[1].current_node == 12
+
+    # CallCanceled is the LAST event: the crash-replay durable contract is that the
+    # token resumes EXACTLY like the live cancel (wait_registry.ex:201
+    # `resume_token(token_id, {:canceled, next_node})`), NOT that replay itself
+    # jumps the token to node 12. The token stays on the CallActivity node (11) and
+    # is set :continue with the reconstructed {:canceled, 12} trigger, so
+    # re-processing dispatches CallActivity.continue_after_wait → next(12).
+    token = state.tokens[1]
+    assert token.current_node == 11
+    assert token.state == :continue
+    assert token.context[:continuation_context] == {:canceled, 12}
     assert MapSet.member?(state.active_tokens, 1)
+    refute MapSet.member?(state.waiting_tokens, 1)
   end
 
   defp restore_state(instance_id) do

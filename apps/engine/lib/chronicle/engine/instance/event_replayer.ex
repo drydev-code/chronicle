@@ -286,13 +286,29 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
 
     acc = %{acc | open_external_tasks: Map.delete(acc.open_external_tasks, task_id)}
 
-    state = if event.next_node do
-      TokenState.update_token_node(state, token_id, event.next_node)
-    else
-      state
-    end
+    # External-task resolution: mirror the LIVE resume EXACTLY. The durable event
+    # records "the task resolved" with current_node = the ExternalTask node
+    # (instance.ex:842/883) and NO next_node (the post-wait move is produced by
+    # continue_after_wait, not by this event). The token therefore stays on the
+    # ExternalTask node and is set :continue so re-processing dispatches to
+    # ExternalTask.continue_after_wait — NOT :execute_current_node, which would
+    # re-run ExternalTask.process and RE-ARM a fresh external task (new UUID).
+    #   * successful → {:complete, payload, result}  (wait_registry.ex:120)
+    #   * failed     → {:error, error, retry?, backoff_ms} (wait_registry.ex:135)
+    #     retry?/backoff are runtime-only (not persisted); reconstruct with
+    #     retry? = false so continue_after_wait takes the deterministic
+    #     fail/ignore branch (a :retry continuation cannot be re-derived from the
+    #     durable log and was never advanced past the task before the crash).
+    continuation =
+      if event.successful do
+        {:complete, event.payload, event.result}
+      else
+        {:error, event.error, false, nil}
+      end
 
-    state = TokenState.set_token_active(state, token_id)
+    state = TokenState.set_token_continue(state, token_id)
+    state = TokenState.update_token_context(state, token_id, :continuation_context, continuation)
+
     acc = %{acc |
       state: state,
       token_wait_states: Map.delete(acc.token_wait_states, token_id)
@@ -307,12 +323,23 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
 
     acc = %{acc | open_external_tasks: Map.delete(acc.open_external_tasks, task_id)}
 
-    state = if event.continuation_node_id do
-      state = TokenState.update_token_node(state, token_id, event.continuation_node_id)
-      TokenState.set_token_active(state, token_id)
-    else
-      TokenState.set_token_active(state, token_id)
-    end
+    # External-task cancellation: mirror the LIVE resume EXACTLY
+    # (wait_registry.ex:151 `resume_token(token_id, {:cancel, reason, continuation_node_id})`).
+    # The token stays on the ExternalTask node and is set :continue so re-processing
+    # dispatches to ExternalTask.continue_after_wait, whose {:cancel, _, node} arm
+    # returns NodeResult.next(continuation_node_id) — deterministically advancing to
+    # the SAME node the live cancel routed to. Setting :execute_current_node on the
+    # continuation node would instead re-run THAT node's process (and, worse, an
+    # in-flight cancel raced detect_implicit_waits if the node were a catch).
+    state = TokenState.set_token_continue(state, token_id)
+
+    state =
+      TokenState.update_token_context(
+        state,
+        token_id,
+        :continuation_context,
+        {:cancel, event.cancellation_reason, event.continuation_node_id}
+      )
 
     acc = %{acc |
       state: state,
@@ -363,13 +390,20 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
     if event_gateway_winner?(acc, token_id) do
       resume_event_gateway_winner(acc, token_id, :timer_elapsed)
     else
-      state = if event.target_node do
-        TokenState.update_token_node(state, token_id, event.target_node)
-      else
-        state
-      end
+      # Plain (non-gateway) intermediate timer resolution: mirror the LIVE resume
+      # EXACTLY (wait_registry.ex:235 `resume_token(token_id, :timer_elapsed)`).
+      # TimerElapsed.target_node is the TimerEvent catch node itself
+      # (instance.ex:553 sets target_node: token.current_node), so the durable
+      # event records "the timer fired", NOT a move onto the post-wait output.
+      # The token therefore stays on the catch node and is set :continue so
+      # re-processing dispatches to TimerEvent.continue_after_wait (advances to
+      # the first output) — NOT :execute_current_node, which would re-run
+      # TimerEvent.process and RE-ARM a fresh timer (a duplicate Process.send_after
+      # via reregister_timers / a brand-new TimerCreated on the next cycle).
+      # This is the timer twin of the MessageHandled plain clause.
+      state = TokenState.set_token_continue(state, token_id)
+      state = TokenState.update_token_context(state, token_id, :continuation_context, :timer_elapsed)
 
-      state = TokenState.set_token_active(state, token_id)
       acc = %{acc |
         state: state,
         token_wait_states: Map.delete(acc.token_wait_states, token_id)
@@ -808,15 +842,23 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
     if event_gateway_winner?(acc, token_id) do
       resume_event_gateway_winner(acc, token_id, {:signal, name})
     else
+      # Plain (non-gateway) signal catch resolution: mirror the LIVE resume
+      # EXACTLY (wait_registry.ex:94 `resume_token(token_id, {:signal, name})`).
+      # SignalHandled.target_node is the SignalEvent catch node itself
+      # (instance.ex:1195 sets target_node: token.current_node), so the durable
+      # event records "the signal was consumed", NOT a move onto the post-wait
+      # output. The token therefore stays on the catch node and is set :continue
+      # so re-processing dispatches to SignalEvent.continue_after_wait (advances
+      # to the first output) — NOT :execute_current_node, which would re-run
+      # SignalEvent.process and re-arm a fresh wait_for_signal. Leaving it
+      # :execute_current_node also let detect_implicit_waits resurrect the very
+      # signal wait this event consumed (token parked on a SignalEvent node, not
+      # in :continue). This is the signal twin of the MessageHandled plain clause.
       acc = remove_from_open_waits(acc, :open_signal_waits, name, token_id)
 
-      state = if event.target_node do
-        TokenState.update_token_node(state, token_id, event.target_node)
-      else
-        state
-      end
+      state = TokenState.set_token_continue(state, token_id)
+      state = TokenState.update_token_context(state, token_id, :continuation_context, {:signal, name})
 
-      state = TokenState.set_token_active(state, token_id)
       acc = %{acc |
         state: state,
         token_wait_states: Map.delete(acc.token_wait_states, token_id)
@@ -842,11 +884,11 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
   end
 
   defp replay_single_event(%PersistentData.CallCompleted{} = event, acc) do
-    replay_call_resolution(event, acc)
+    replay_call_resolution(event, acc, {:completed, event.completion_context, event.successful})
   end
 
   defp replay_single_event(%PersistentData.CallCanceled{} = event, acc) do
-    replay_call_resolution(event, acc)
+    replay_call_resolution(event, acc, {:canceled, event.next_node})
   end
 
   defp replay_single_event(%PersistentData.EscalationThrown{} = event, acc) do
@@ -901,7 +943,7 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
     |> Map.new()
   end
 
-  defp replay_call_resolution(event, acc) do
+  defp replay_call_resolution(event, acc, continuation) do
     state = acc.state
     token_id = event.token
 
@@ -916,13 +958,20 @@ defmodule Chronicle.Engine.Instance.EventReplayer do
       acc
     end
 
-    state = if event.next_node do
-      TokenState.update_token_node(state, token_id, event.next_node)
-    else
-      state
-    end
+    # Call-activity resolution (completion or cancellation): mirror the LIVE resume
+    # EXACTLY. CallCompleted is persisted with current_node = the CallActivity node
+    # and NO next_node (instance.ex:395 — the post-wait move is produced by
+    # continue_after_wait, not by this event). The token therefore stays on the
+    # CallActivity node and is set :continue so re-processing dispatches to
+    # CallActivity.continue_after_wait — NOT :execute_current_node, which would
+    # re-run CallActivity.process and START A SECOND CHILD process instance.
+    #   * CallCompleted → {:completed, completion_context, successful} (wait_registry.ex:184)
+    #     continue_after_wait advances to the first output (or steps a sequential loop).
+    #   * CallCanceled  → {:canceled, next_node} (wait_registry.ex:201)
+    #     continue_after_wait returns NodeResult.next(next_node).
+    state = TokenState.set_token_continue(state, token_id)
+    state = TokenState.update_token_context(state, token_id, :continuation_context, continuation)
 
-    state = TokenState.set_token_active(state, token_id)
     acc = %{acc |
       state: state,
       token_wait_states: Map.delete(acc.token_wait_states, token_id)
