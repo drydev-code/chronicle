@@ -81,19 +81,22 @@ function handleScript(request) {
 
   const context = vm.createContext(sandbox);
 
-  // Wrap in function to allow top-level 'return' statements (Jint compatibility)
+  // Wrap in function to allow top-level 'return' statements (Jint compatibility).
   let scriptSource = request.script;
   const wrappedSource = `(function() { ${scriptSource} })()`;
 
-  let result;
+  // Compile the wrapped form; fall back to the raw source ONLY if wrapping itself
+  // breaks compilation (a SyntaxError). Critically, do NOT fall back when the script
+  // RUNS and throws a runtime error — the old code did, which re-parsed the unwrapped
+  // source and reported a bogus "Illegal return statement", masking the real error and
+  // crashing the token. Runtime errors must surface as-is so the task fails cleanly.
+  let script;
   try {
-    const script = new vm.Script(wrappedSource);
-    result = script.runInContext(context, { timeout: TIMEOUT_MS });
-  } catch (wrapErr) {
-    // Fallback: try without wrapping (for scripts that don't use return)
-    const script = new vm.Script(scriptSource);
-    result = script.runInContext(context, { timeout: TIMEOUT_MS });
+    script = new vm.Script(wrappedSource);
+  } catch (compileErr) {
+    script = new vm.Script(scriptSource);
   }
+  const result = script.runInContext(context, { timeout: TIMEOUT_MS });
 
   // If the script returned a value (from 'return {...}'), merge it into outputs
   if (result && typeof result === 'object' && !Array.isArray(result)) {
