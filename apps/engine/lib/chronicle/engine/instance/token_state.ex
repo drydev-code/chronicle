@@ -59,7 +59,12 @@ defmodule Chronicle.Engine.Instance.TokenState do
       persistent_events: [],
       last_persisted_index: 0,
       start_parameters: %{},
-      start_node_id: nil
+      start_node_id: nil,
+      # Ownership-lease fencing epoch (feature 3b). `:no_fence` means this
+      # instance was started without a lease (single-pod / tests): the write
+      # boundary skips the fence check entirely → identical behaviour. A
+      # lease-acquiring start (P2) threads the acquired epoch here.
+      fence_epoch: :no_fence
     }
   end
 

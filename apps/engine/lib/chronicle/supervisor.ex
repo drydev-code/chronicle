@@ -9,7 +9,8 @@ defmodule Chronicle.Supervisor do
   require Logger
 
   alias Chronicle.Persistence.EventStore
-  alias Chronicle.Engine.PersistentData
+  alias Chronicle.Persistence.InstanceLease
+  alias Chronicle.Engine.{LeaseConfig, NodeIdentity, PersistentData}
 
   def start_link(opts \\ []) do
     Supervisor.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
@@ -55,7 +56,18 @@ defmodule Chronicle.Supervisor do
        strategy: :one_for_one,
        max_restarts: 1000,
        max_seconds: 5},
+      # Mint this pod's stable lease identity eagerly at boot (feature 3b).
+      # Returns :ignore, so it occupies no supervision slot; it simply caches
+      # NodeIdentity.node_id/0 in :persistent_term before anything acquires a
+      # lease. No-op overhead at N=1.
+      Chronicle.Engine.NodeIdentity,
       Chronicle.Engine.EvictionManager,
+      # Ownership-lease maintenance: periodic boot scan + orphan/expired
+      # adoption + dead-owner steal (feature 3b, phase 2). Dormant when
+      # `:lease, enabled: false` (default / tests) and at N=1 a no-op (the one
+      # pod already owns everything it restored), so the existing suite is
+      # unaffected. Sibling of EvictionManager.
+      Chronicle.Engine.LeaseManager,
       # Crash-durable safety net for evicted-instance timers. Dormant on the
       # default :resident path (it only scans :evicted_waits timer rows, of
       # which there are none there); independent of EvictionManager.enabled.
@@ -122,7 +134,7 @@ defmodule Chronicle.Supervisor do
       results =
         Enum.map(active_ids, fn instance_id ->
           try do
-            restore_instance(instance_id)
+            acquire_and_restore(instance_id)
           rescue
             e ->
               Logger.error(
@@ -134,12 +146,48 @@ defmodule Chronicle.Supervisor do
         end)
 
       restored = Enum.count(results, &match?({:ok, _}, &1))
+      skipped = Enum.count(results, &match?(:contended, &1))
       failed = Enum.count(results, &match?({:error, _}, &1))
-      Logger.info("Startup restoration complete: #{restored} restored, #{failed} failed")
+
+      Logger.info(
+        "Startup restoration complete: #{restored} restored, #{skipped} skipped (owned elsewhere), #{failed} failed"
+      )
     end
   end
 
-  defp restore_instance(instance_id) do
+  # Lease-gated restore. When the lease is DISABLED (default / tests / N=1 path)
+  # this is the exact prior behaviour: restore unconditionally with `:no_fence`.
+  # When ENABLED, acquire the lease first and ONLY restore the ones we WIN —
+  # threading the won epoch so every write fences with it and the instance
+  # renews it. A row a live peer owns is `:contended` and left for that peer.
+  # At N=1 every row is unowned, so the one pod wins them all -> identical.
+  defp acquire_and_restore(instance_id) do
+    if LeaseConfig.enabled?() do
+      node = NodeIdentity.node_id()
+
+      case InstanceLease.acquire(instance_id, node, LeaseConfig.ttl_ms()) do
+        {:ok, epoch} ->
+          # Thread the real `{owner_node, epoch}` fence so every write boundary
+          # verifies BOTH this pod's identity and its epoch (S2-7).
+          restore_instance(instance_id, InstanceLease.fence(node, epoch))
+
+        :contended ->
+          Logger.info(
+            "Startup restoration: instance #{instance_id} owned by a live peer — skipping"
+          )
+
+          :contended
+
+        {:error, :not_found} ->
+          Logger.error("Startup restoration: instance #{instance_id} has no active row")
+          {:error, instance_id}
+      end
+    else
+      restore_instance(instance_id, :no_fence)
+    end
+  end
+
+  defp restore_instance(instance_id, fence) do
     case EventStore.stream(instance_id) do
       {:ok, events} ->
         if contains_unknown_event?(events) do
@@ -162,7 +210,7 @@ defmodule Chronicle.Supervisor do
           {:ok, _pid} =
             DynamicSupervisor.start_child(
               Chronicle.Engine.InstanceSupervisor,
-              {Chronicle.Engine.Instance, {:restore, instance_id, tenant_id, events}}
+              {Chronicle.Engine.Instance, {:restore, instance_id, tenant_id, events, fence}}
             )
 
           {:ok, instance_id}

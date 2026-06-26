@@ -54,7 +54,18 @@ defmodule Chronicle.Engine.Instance do
   end
 
   def start_link({:restore, instance_id, tenant_id, events}) do
-    GenServer.start_link(__MODULE__, {:restore, instance_id, tenant_id, events},
+    GenServer.start_link(__MODULE__, {:restore, instance_id, tenant_id, events, :no_fence},
+      name: via(tenant_id, instance_id)
+    )
+  end
+
+  # Lease-aware restore (feature 3b, phase 2): the caller has already WON the
+  # ownership lease for this instance and threads the acquired fence — a real
+  # `{owner_node, epoch}` token (InstanceLease.fence/2) — so every write boundary
+  # fences with it and the instance renews it. `:no_fence` (the 4-tuple above)
+  # preserves the exact pre-lease single-pod behaviour.
+  def start_link({:restore, instance_id, tenant_id, events, fence}) do
+    GenServer.start_link(__MODULE__, {:restore, instance_id, tenant_id, events, fence},
       name: via(tenant_id, instance_id)
     )
   end
@@ -138,6 +149,26 @@ defmodule Chronicle.Engine.Instance do
     GenServer.call(pid, {:migrate, new_definition, node_mappings}, 30_000)
   end
 
+  @doc """
+  Graceful-drain a resident instance for a clean pod shutdown (feature 3b,
+  phase 4).
+
+  A synchronous call, so it naturally waits behind any in-flight command cycle
+  already queued in this instance's mailbox — the instance is single-threaded,
+  so by the time this handler runs the previous cycle has fully finished and
+  flushed. It then flushes any still-pending events one last time and RELEASES
+  the ownership lease (clearing `owner_node`) so a freshly-started pod can adopt
+  the instance immediately instead of waiting out the TTL.
+
+  Idempotent and safe at N=1 / lease-disabled: a `:no_fence` instance holds no
+  lease, so the release is skipped and this is a pure flush. Returns `:ok`.
+  """
+  def drain(pid, timeout \\ 30_000) do
+    GenServer.call(pid, :drain, timeout)
+  catch
+    :exit, _ -> :ok
+  end
+
   # --- Registry ---
 
   defp via(tenant_id, instance_id) do
@@ -196,9 +227,22 @@ defmodule Chronicle.Engine.Instance do
     # Persist the initial ProcessInstanceStart event synchronously so that
     # the active row is created before we begin processing. A crash between
     # here and the first waiting transition must still be recoverable.
-    case Chronicle.Persistence.EventStore.create(id, start_data) do
-      {:ok, _} ->
-        state = %{state | last_persisted_index: length(state.persistent_events)}
+    # S0-3 (atomic create-with-lease): a freshly-CREATED instance must OWN its own
+    # row from the SAME insert when the lease layer is enabled — no separate
+    # create-then-acquire window in which a peer LeaseManager could steal the new
+    # row and the creator fall back to `:no_fence` and drive unfenced (split-brain).
+    # `create_with_lease/2` returns the real `{owner_node, 1}` fence on the owned
+    # path; at N=1 / lease-disabled it inserts an unowned row and returns `:no_fence`
+    # — byte-identical create. A FAILURE to own a brand-new id (shouldn't happen)
+    # is FAIL-CLOSED below: we stop rather than drive `:no_fence`.
+    case create_with_lease(id, start_data) do
+      {:ok, fence} ->
+        schedule_lease_renew(fence)
+
+        state = %{state |
+          last_persisted_index: length(state.persistent_events),
+          fence_epoch: fence
+        }
 
         # Broadcast start event
         Phoenix.PubSub.broadcast(Chronicle.PubSub, "engine:events",
@@ -207,21 +251,70 @@ defmodule Chronicle.Engine.Instance do
         {:ok, state, {:continue, :start_initial_token}}
 
       {:error, reason} ->
-        Logger.error("Instance #{id}: Failed to persist start event: #{inspect(reason)}")
+        Logger.error("Instance #{id}: Failed to create owned start row: #{inspect(reason)}")
         {:stop, {:persist_start_failed, reason}}
     end
   end
 
   def init({:restore, instance_id, tenant_id, events}) do
+    init({:restore, instance_id, tenant_id, events, :no_fence})
+  end
+
+  def init({:restore, instance_id, tenant_id, events, fence}) do
     state = Map.merge(TokenState.base_state(), %{
       id: instance_id,
       tenant_id: tenant_id,
       instance_state: :simulating,
       persistent_events: events,
-      last_persisted_index: length(events)
+      last_persisted_index: length(events),
+      # Fence with the `{owner_node, epoch}` the caller WON on acquire (feature
+      # 3b, phase 2). `:no_fence` keeps the pre-lease behaviour: the write
+      # boundary skips the fence check and no renew timer is armed.
+      fence_epoch: fence
     })
 
+    # Arm the per-instance lease renew loop ONLY when we restored under a real
+    # lease. At N=1 / disabled the fence is `:no_fence`, so this is skipped and
+    # the instance behaves exactly as before.
+    schedule_lease_renew(fence)
+
     {:ok, state, {:continue, {:restore, events}}}
+  end
+
+  # S0-3 (atomic create-with-lease) helper. Persist the initial start event AND
+  # take ownership of the new row in ONE insert when the lease layer is enabled,
+  # so there is no unowned window between create and acquire that a peer could
+  # steal in. Returns:
+  #
+  #   * `{:ok, {owner_node, 1}}` — owned create (lease enabled): drive FENCED with
+  #     epoch 1 immediately, no peer can have stolen the row (it never existed
+  #     unowned).
+  #   * `{:ok, :no_fence}`       — unowned create (lease disabled / N=1 / tests):
+  #     byte-identical to the pre-lease path.
+  #   * `{:error, reason}`       — FAIL-CLOSED: an owned create could not own a
+  #     brand-new id (should never happen) or the insert failed. We do NOT fall
+  #     back to driving `:no_fence` over a row a peer might own — the caller stops.
+  defp create_with_lease(instance_id, start_data) do
+    if Chronicle.Engine.LeaseConfig.enabled?() do
+      node = Chronicle.Engine.NodeIdentity.node_id()
+
+      case Chronicle.Persistence.EventStore.create(
+             instance_id,
+             start_data,
+             {node, Chronicle.Engine.LeaseConfig.ttl_ms()}
+           ) do
+        {:ok, %{fence_epoch: epoch}} ->
+          {:ok, Chronicle.Persistence.InstanceLease.fence(node, epoch)}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      case Chronicle.Persistence.EventStore.create(instance_id, start_data, :no_owner) do
+        {:ok, _} -> {:ok, :no_fence}
+        {:error, reason} -> {:error, reason}
+      end
+    end
   end
 
   @impl true
@@ -289,6 +382,11 @@ defmodule Chronicle.Engine.Instance do
               {:ok, state} ->
                 {:noreply, state}
 
+              {:error, {:fenced, _}, state} ->
+                # Fenced out by a newer owner: stop without restart-replay
+                # semantics. Do NOT publish or notify the parent.
+                {:stop, :fenced_out, state}
+
               {:error, reason, state} ->
                 # Completion persistence failed — stop so the supervisor can
                 # restart and replay from the durable log. Hibernating would
@@ -301,6 +399,12 @@ defmodule Chronicle.Engine.Instance do
             state = %{state | instance_state: :waiting, pin_state: :not_pinned, pin_reason: :none}
             {:noreply, state, :hibernate}
         end
+
+      {:error, {:fenced, _}, state} ->
+        # A newer owner has fenced this instance out at the write boundary.
+        # Stop driving immediately: do NOT publish downstream events and do NOT
+        # hibernate (which would leave a fenced-out instance resident).
+        {:stop, :fenced_out, state}
 
       {:error, _reason, state} ->
         # In-cycle persistence failed. Do not continue token processing and
@@ -349,6 +453,11 @@ defmodule Chronicle.Engine.Instance do
           {:process_instance_terminated, candidate.id, candidate.business_key, candidate.tenant_id, reason})
 
         {:noreply, candidate}
+
+      {:error, {:fenced, _}} ->
+        # Fenced out by a newer owner before the termination was durable.
+        # Stop without publishing; the owner drives the instance.
+        {:stop, :fenced_out, state}
 
       {:error, err} ->
         Logger.error("Instance #{state.id}: Termination persistence failed: #{inspect(err)}")
@@ -409,6 +518,9 @@ defmodule Chronicle.Engine.Instance do
               {:ok, state} -> {:noreply, state, {:continue, :process_tokens}}
             end
 
+          {:error, {:fenced, _}, state} ->
+            {:stop, :fenced_out, state}
+
           {:error, _reason, state} ->
             {:noreply, state}
         end
@@ -444,6 +556,9 @@ defmodule Chronicle.Engine.Instance do
               {:ok, state} -> {:noreply, state, {:continue, :process_tokens}}
             end
 
+          {:error, {:fenced, _}, state} ->
+            {:stop, :fenced_out, state}
+
           {:error, _reason, state} ->
             {:noreply, state}
         end
@@ -465,6 +580,9 @@ defmodule Chronicle.Engine.Instance do
           {:ok, state} ->
             {:noreply, state, {:continue, :process_tokens}}
 
+          {:error, {:fenced, _}, state} ->
+            {:stop, :fenced_out, state}
+
           {:error, _reason, state} ->
             # Hibernate without publishing; timer will re-fire or instance
             # will be restored from the event log after a crash.
@@ -475,6 +593,35 @@ defmodule Chronicle.Engine.Instance do
         {:noreply, state}
     end
   end
+
+  # Per-instance lease renew (feature 3b, phase 2). Only ever armed when the
+  # instance restored under a real lease (`fence_epoch` is an integer). Renews at
+  # the configured cadence; on `:lost` the lease was stolen by a newer owner, so
+  # this pod must STOP driving immediately — exactly the `:fenced_out` semantics a
+  # rejected write produces, but reached proactively before the next append. At
+  # N=1 the single owner always renews successfully and this loops forever.
+  def handle_info(:lease_renew, %{fence_epoch: {owner_node, epoch} = fence} = state) do
+    case Chronicle.Persistence.InstanceLease.renew(
+           state.id,
+           owner_node,
+           Chronicle.Engine.LeaseConfig.ttl_ms(),
+           epoch
+         ) do
+      {:ok, ^epoch} ->
+        schedule_lease_renew(fence)
+        {:noreply, state}
+
+      :lost ->
+        Logger.warning(
+          "Instance #{state.id}: lease lost on renew (epoch #{epoch}) — stopping, a newer owner has taken over"
+        )
+
+        {:stop, :fenced_out, state}
+    end
+  end
+
+  # No lease (`:no_fence`) or a stray renew tick after a handoff: ignore.
+  def handle_info(:lease_renew, state), do: {:noreply, state}
 
   def handle_info({:boundary_timer_elapsed, token_id, boundary_node_id, timer_marker}, state) do
     {timer_ref, timer_id} = resolve_timer_ref(state, token_id, timer_marker)
@@ -510,6 +657,9 @@ defmodule Chronicle.Engine.Instance do
     case persist_command_events(state, [timer_event, trigger_event | cancel_events]) do
       {:ok, state} ->
         handle_persisted_boundary_timer_elapsed(state, token_id, boundary_node_id, timer_ref)
+
+      {:error, {:fenced, _}, state} ->
+        {:stop, :fenced_out, state}
 
       {:error, _reason, state} ->
         {:noreply, state, :hibernate}
@@ -601,6 +751,41 @@ defmodule Chronicle.Engine.Instance do
     {:reply, state, state}
   end
 
+  # Graceful drain (feature 3b, phase 4). Flush any still-pending events, then
+  # release the ownership lease so a new pod can adopt immediately. Reached only
+  # AFTER any prior in-flight cycle finished (single mailbox), so the instance is
+  # at a clean boundary. We keep the instance resident and simply hand off the
+  # lease; the pod is shutting down, so the process dies with the BEAM moments
+  # later. `:no_fence` (N=1 / disabled) holds no lease -> pure flush, no release.
+  def handle_call(:drain, _from, state) do
+    case sync_persist(state) do
+      {:ok, state} ->
+        release_lease(state)
+        # S1-6 (a): once the lease is RELEASED the actor must STOP driving so it
+        # can never append after release (the owner_node is now NULL, which the
+        # {owner_node, epoch} fence would reject anyway, but stopping is the
+        # belt-and-braces guarantee). A `:no_fence` instance holds no lease, so
+        # nothing was released and there is nothing to fence — keep it resident
+        # and reply (the N=1 / lease-disabled flush-only no-op, byte-identical).
+        if Chronicle.Persistence.InstanceLease.real_fence?(state.fence_epoch) do
+          {:stop, :normal, :ok, state}
+        else
+          {:reply, :ok, state}
+        end
+
+      {:error, {:fenced, _}, state} ->
+        # A newer owner already fenced us out; the lease is theirs, nothing to
+        # release. Stop driving.
+        {:stop, :fenced_out, :ok, state}
+
+      {:error, _reason, state} ->
+        # Final flush failed (DB unreachable mid-shutdown). Do NOT release the
+        # lease: a crash-style handoff (TTL expiry + orphan-steal, fenced) is
+        # safer than releasing with un-flushed events a new owner cannot see.
+        {:reply, :ok, state}
+    end
+  end
+
   def handle_call({:message, message_name, payload}, _from, state) do
     # Report matched vs ignored so the bus correlator knows whether a token actually
     # resumed (a :waits hit is only a candidate; the correlation predicate may reject).
@@ -611,6 +796,7 @@ defmodule Chronicle.Engine.Instance do
       {:ok, state, true, wait_ids} -> {:reply, {:matched, wait_ids}, state, {:continue, :process_tokens}}
       {:ok, state, true} -> {:reply, {:matched, []}, state, {:continue, :process_tokens}}
       {:ok, state, false} -> {:reply, :ignored, state}
+      {:error, {:fenced, _}, state} -> {:stop, :fenced_out, {:error, :fenced_out}, state}
       {:error, reason, state} -> {:reply, {:error, reason}, state}
     end
   end
@@ -645,6 +831,9 @@ defmodule Chronicle.Engine.Instance do
     case sync_persist(state) do
       {:ok, state} ->
         {:reply, :ok, state}
+
+      {:error, {:fenced, _}, state} ->
+        {:stop, :fenced_out, {:error, :fenced_out}, state}
 
       {:error, reason, state} ->
         {:reply, {:error, {:persist_failed, reason}}, state}
@@ -727,10 +916,12 @@ defmodule Chronicle.Engine.Instance do
   defp command_reply({:ok, state, true, _wait_ids}), do: {:noreply, state, {:continue, :process_tokens}}
   defp command_reply({:ok, state, true}), do: {:noreply, state, {:continue, :process_tokens}}
   defp command_reply({:ok, state, false}), do: {:noreply, state}
+  defp command_reply({:error, {:fenced, _}, state}), do: {:stop, :fenced_out, state}
   defp command_reply({:error, _reason, state}), do: {:noreply, state}
 
   defp command_call_reply({:ok, state, true}), do: {:reply, :ok, state, {:continue, :process_tokens}}
   defp command_call_reply({:ok, state, false}), do: {:reply, :ok, state}
+  defp command_call_reply({:error, {:fenced, _}, state}), do: {:stop, :fenced_out, {:error, :fenced_out}, state}
   defp command_call_reply({:error, reason, state}), do: {:reply, {:error, reason}, state}
 
   defp do_message_command(state, message_name, payload) do
@@ -1305,6 +1496,27 @@ defmodule Chronicle.Engine.Instance do
     end
   end
 
+  # Arm the next lease renew tick. Only schedules for a real `{owner_node, epoch}`
+  # fence; a `:no_fence` instance (single-pod / lease disabled) never renews.
+  defp schedule_lease_renew({_owner_node, _epoch}) do
+    Process.send_after(self(), :lease_renew, Chronicle.Engine.LeaseConfig.renew_interval_ms())
+  end
+
+  defp schedule_lease_renew(_no_fence), do: :ok
+
+  # Release this instance's ownership lease on graceful drain (feature 3b,
+  # phase 4). Only a real `{owner_node, epoch}` fence holds a lease; `:no_fence`
+  # (N=1 / disabled) is a no-op. `InstanceLease.release/3` is idempotent — a
+  # lease already stolen returns `:ok` from the caller's point of view. The
+  # release clears `owner_node`, so the {owner_node, epoch} fence rejects any
+  # later append this (now-released) actor attempts (S1-6).
+  defp release_lease(%{fence_epoch: {owner_node, epoch}, id: id}) do
+    Chronicle.Persistence.InstanceLease.release(id, owner_node, epoch)
+    :ok
+  end
+
+  defp release_lease(_state), do: :ok
+
   # --- Persistence helpers ---
 
   @doc false
@@ -1328,9 +1540,14 @@ defmodule Chronicle.Engine.Instance do
       true ->
         pending = Enum.drop(state.persistent_events, state.last_persisted_index)
 
-        case safe_append_batch(state.id, pending) do
+        case safe_append_batch(state.id, pending, state.fence_epoch) do
           :ok ->
             {:ok, %{state | last_persisted_index: total}}
+
+          {:error, {:fenced, _} = reason} ->
+            # A newer owner has fenced this instance out: do NOT log as an error
+            # and surface the fence verbatim so the caller stops driving.
+            {:error, reason, state}
 
           {:error, reason} ->
             Logger.error("Instance #{state.id}: Failed to persist #{delta} events: #{inspect(reason)}")
@@ -1339,11 +1556,12 @@ defmodule Chronicle.Engine.Instance do
     end
   end
 
-  defp safe_append_batch(instance_id, events) do
+  defp safe_append_batch(instance_id, events, fence_epoch) do
     try do
-      case Chronicle.Persistence.EventStore.append_batch(instance_id, events) do
+      case Chronicle.Persistence.EventStore.append_batch(instance_id, events, fence_epoch) do
         {:ok, _} -> :ok
         :ok -> :ok
+        {:error, {:fenced, _} = fenced} -> {:error, fenced}
         other -> {:error, other}
       end
     rescue
@@ -1359,8 +1577,9 @@ defmodule Chronicle.Engine.Instance do
   # timeout raises on DB stalls just the same).
   # Returns :ok on success, {:error, reason} on failure.
   defp persist_completion(state) do
-    case Chronicle.Persistence.EventStore.complete(state.id, state.persistent_events) do
+    case Chronicle.Persistence.EventStore.complete(state.id, state.persistent_events, state.fence_epoch) do
       {:ok, _} -> :ok
+      {:error, {:fenced, _} = fenced} -> {:error, fenced}
       other -> {:error, other}
     end
   rescue
@@ -1370,8 +1589,9 @@ defmodule Chronicle.Engine.Instance do
   end
 
   defp persist_termination(state, reason) do
-    case Chronicle.Persistence.EventStore.terminate(state.id, state.persistent_events, reason) do
+    case Chronicle.Persistence.EventStore.terminate(state.id, state.persistent_events, reason, state.fence_epoch) do
       {:ok, _} -> :ok
+      {:error, {:fenced, _} = fenced} -> {:error, fenced}
       other -> {:error, other}
     end
   rescue

@@ -35,8 +35,13 @@ defmodule Chronicle.Engine.InstanceLoadCell.Lifecycle do
 
         # Persist current events to DB (ensure nothing is lost). If this
         # fails we must NOT stop the instance — unflushed events would be
-        # lost and the durable replay would be incomplete.
-        case persist_events_sync(instance_state) do
+        # lost and the durable replay would be incomplete. S1-5: the flush is
+        # FENCED with the resident Instance's real `{owner_node, epoch}` fence so
+        # a stale, already-stolen owner cannot flush an evicting instance over a
+        # newer owner's log. `:no_fence` (N=1 / disabled) flushes unfenced.
+        fence = Map.get(instance_state, :fence_epoch, :no_fence)
+
+        case persist_events_sync(instance_state, fence) do
           :ok ->
             # Stop the Instance GenServer
             GenServer.stop(instance_pid, :normal)
@@ -47,11 +52,21 @@ defmodule Chronicle.Engine.InstanceLoadCell.Lifecycle do
             # Re-register message/signal handles in :waits registry for this LoadCell
             register_evicted_waits(handles, self())
 
+            # Eviction KEEPS the ownership lease (feature 3b, phase 2): the
+            # `{owner_node, epoch}` fence the resident Instance held (captured
+            # above as `fence`) lets the cell renew the lease on its behalf and
+            # thread it back into the restore. At N=1 / lease disabled this is
+            # `:no_fence` and no renew is armed.
+            if Chronicle.Persistence.InstanceLease.real_fence?(fence) do
+              Chronicle.Engine.InstanceLoadCell.schedule_lease_renew()
+            end
+
             new_state = %{state |
               cell_state: :evicted,
               instance_pid: nil,
               waiting_handles: handles,
-              timer_refs: timer_refs
+              timer_refs: timer_refs,
+              fence_epoch: fence
             }
 
             Logger.info("InstanceLoadCell #{state.instance_id}: Evicted with #{length(handles)} waiting handles")
@@ -82,6 +97,10 @@ defmodule Chronicle.Engine.InstanceLoadCell.Lifecycle do
     instance_id = state.instance_id
     tenant_id = state.tenant_id
     handles = state.waiting_handles
+    # Thread the `{owner_node, epoch}` fence the cell held while evicted (feature
+    # 3b, phase 2) so the restored Instance resumes fencing + renewing with it.
+    # `:no_fence` keeps the pre-lease behaviour (no fence check, no renew).
+    fence = Map.get(state, :fence_epoch, :no_fence)
 
     Task.start(fn ->
       # Bound concurrent on-demand restores so a broadcast wake on an :evicted
@@ -110,7 +129,7 @@ defmodule Chronicle.Engine.InstanceLoadCell.Lifecycle do
           {:ok, events} ->
             case DynamicSupervisor.start_child(
               Chronicle.Engine.InstanceSupervisor,
-              {Instance, {:restore, instance_id, tenant_id, events}}
+              {Instance, {:restore, instance_id, tenant_id, events, fence}}
             ) do
               {:ok, pid} ->
                 GenServer.cast(cell_pid, {:restore_completed, pid})
@@ -268,7 +287,10 @@ defmodule Chronicle.Engine.InstanceLoadCell.Lifecycle do
   # Returns `:ok` if everything was already persisted or the append succeeded,
   # `{:error, reason}` otherwise. Callers MUST NOT proceed to stop the
   # instance when this returns an error — the unflushed events would be lost.
-  defp persist_events_sync(instance_state) do
+  # `fence` is the resident Instance's real `{owner_node, epoch}` fence (S1-5)
+  # so the eviction flush is rejected if a newer owner already stole the lease;
+  # `:no_fence` (N=1 / disabled) flushes unfenced exactly as before.
+  defp persist_events_sync(instance_state, fence) do
     total = length(instance_state.persistent_events)
     # Prefer the in-memory index the Instance maintains. Fall back to the
     # EventStore's persisted count in case an older (pre-index) state is
@@ -292,7 +314,7 @@ defmodule Chronicle.Engine.InstanceLoadCell.Lifecycle do
         :ok
 
       events ->
-        case EventStore.append_batch(instance_state.id, events) do
+        case EventStore.append_batch(instance_state.id, events, fence) do
           {:ok, _} -> :ok
           :ok -> :ok
           {:error, reason} -> {:error, reason}

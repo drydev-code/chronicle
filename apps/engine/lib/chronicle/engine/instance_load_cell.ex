@@ -18,6 +18,7 @@ defmodule Chronicle.Engine.InstanceLoadCell do
   require Logger
 
   alias Chronicle.Engine.Instance
+  alias Chronicle.Persistence.InstanceLease
   alias __MODULE__.{Lifecycle, StateMachine}
 
   @type cell_state :: :resident | :evicting | :evicted | :restore_requested | :restoring
@@ -36,7 +37,15 @@ defmodule Chronicle.Engine.InstanceLoadCell do
     # to ONLY after that call returns a persisted outcome. This is the evicted-path
     # durable-ack the retention store (and the reply ledger) settle on.
     pending_syncs: :queue.new(),
-    timer_refs: %{}
+    timer_refs: %{},
+    # Ownership-lease fence epoch (feature 3b, phase 2). Captured from the
+    # evicted Instance's state at eviction time. When it is an integer the cell
+    # KEEPS the lease alive on the evicted instance's behalf (the resident
+    # Instance is gone, so it can no longer renew) by renewing on a timer, and
+    # threads the epoch back into the restore so the woken Instance resumes
+    # fencing + renewing. `:no_fence` (single-pod / lease disabled) means no
+    # lease was ever held: the cell does not renew, exactly as before.
+    fence_epoch: :no_fence
   ]
 
   @sync_call_timeout 30_000
@@ -60,6 +69,20 @@ defmodule Chronicle.Engine.InstanceLoadCell do
     GenServer.start_link(
       __MODULE__,
       {:evicted, instance_id, tenant_id, business_key, handles},
+      name: via(tenant_id, instance_id)
+    )
+  end
+
+  # Start an evicted-from-inception cell that already HOLDS a lease fence (feature
+  # 3b). Used by the lease-aware boot-restore path (`EvictedWaitRestorer` under an
+  # enabled lease): the restorer ACQUIRED the lease for this instance and threads
+  # the won `{owner_node, epoch}` fence in so the cell renews it on the evicted
+  # instance's behalf and hands it back into any on-demand restore. `:no_fence`
+  # behaves exactly like the 5-arg form (no renew armed).
+  def start_link({:evicted, instance_id, tenant_id, business_key, handles, fence}) do
+    GenServer.start_link(
+      __MODULE__,
+      {:evicted, instance_id, tenant_id, business_key, handles, fence},
       name: via(tenant_id, instance_id)
     )
   end
@@ -184,6 +207,26 @@ defmodule Chronicle.Engine.InstanceLoadCell do
     GenServer.call(cell_pid, :inspect_cell)
   end
 
+  @doc """
+  Graceful-drain an EVICTED load cell on a clean pod shutdown (feature 3b,
+  phase 4).
+
+  An evicted cell renews the lease on behalf of its (non-resident) instance, so
+  on drain it must RELEASE that lease — clearing `owner_node` — so a new pod can
+  adopt the evicted instance immediately instead of waiting out the TTL. The
+  durable `:evicted_waits` rows + per-occurrence inbox already make the handoff
+  lossless; this just hands ownership over cleanly (the alternative, a crash, is
+  also safe via TTL expiry + fenced orphan-steal). A `:resident` cell's lease is
+  held by its live Instance and released by that Instance's own drain, so this
+  is a no-op there; likewise `:no_fence` (N=1 / disabled) holds no lease.
+  Idempotent. Returns `:ok`.
+  """
+  def drain(cell_pid, timeout \\ 30_000) do
+    GenServer.call(cell_pid, :drain, timeout)
+  catch
+    :exit, _ -> :ok
+  end
+
   defp via(tenant_id, instance_id) do
     {:via, Registry, {:load_cells, {tenant_id, instance_id}}}
   end
@@ -209,8 +252,20 @@ defmodule Chronicle.Engine.InstanceLoadCell do
   # :evicted with the reconstructed handles, registering waits + timers so
   # wake-up events route through this cell (and trigger an on-demand restore).
   def init({:evicted, instance_id, tenant_id, business_key, handles}) do
+    init({:evicted, instance_id, tenant_id, business_key, handles, :no_fence})
+  end
+
+  # Fence-carrying variant (feature 3b boot-restore under an enabled lease): the
+  # cell holds the won `{owner_node, epoch}` fence and ARMS the renew loop so the
+  # lease it was started with stays live until restore/drain. `:no_fence` arms no
+  # renew — identical to the pre-lease evicted boot.
+  def init({:evicted, instance_id, tenant_id, business_key, handles, fence}) do
     timer_refs = Lifecycle.register_evicted_timers(handles, instance_id)
     Lifecycle.register_evicted_waits(handles, self())
+
+    if InstanceLease.real_fence?(fence) do
+      schedule_lease_renew()
+    end
 
     state = %__MODULE__{
       instance_id: instance_id,
@@ -219,7 +274,8 @@ defmodule Chronicle.Engine.InstanceLoadCell do
       instance_pid: nil,
       cell_state: :evicted,
       waiting_handles: handles,
-      timer_refs: timer_refs
+      timer_refs: timer_refs,
+      fence_epoch: fence
     }
 
     {:ok, state}
@@ -274,6 +330,36 @@ defmodule Chronicle.Engine.InstanceLoadCell do
 
     {:noreply, state}
   end
+
+  # Graceful drain (feature 3b, phase 4). Release the lease this evicted cell is
+  # renewing so a new pod adopts the evicted instance immediately. Only an evicted
+  # cell holding a real epoch has a lease to release; resident / :no_fence cells
+  # are a no-op (handled by the catch-all clause below).
+  def handle_call(:drain, from, %{cell_state: :evicted, fence_epoch: {owner_node, epoch}} = state) do
+    # S1-6: release the lease this evicted cell renews on the instance's behalf,
+    # using the OWNER NODE captured at eviction (not this pod's current node — in
+    # multi-pod they are the same, but threading the captured node keeps release
+    # correct under the {owner_node, epoch} fence). Clearing owner_node fences any
+    # later append the woken instance would attempt with the stale token.
+    InstanceLease.release(state.instance_id, owner_node, epoch)
+
+    # S1-6 (the hole): after releasing, this instance is NO LONGER OURS — a new
+    # pod may adopt it at any moment. Merely clearing `fence_epoch` to `:no_fence`
+    # (the old behaviour) left the cell ALIVE with its `:evicted_waits` rows and
+    # timers registered, so a wake/timer arriving before shutdown completed would
+    # trigger a restore and resurrect a `:no_fence` (unfenced) instance over a row
+    # the new owner is driving — split-brain. Mirror the lost-lease path
+    # (handle_info :lease_renew :lost): UNREGISTER the durable waits, CANCEL the
+    # timers, and STOP the cell, so no wake can restore it. Reply :ok before
+    # stopping so `drain/1`'s caller is not blocked on the terminating process.
+    GenServer.reply(from, :ok)
+
+    Lifecycle.unregister_evicted_waits(state.waiting_handles)
+    Lifecycle.cancel_evicted_timers(state)
+    {:stop, :normal, %{state | fence_epoch: :no_fence}}
+  end
+
+  def handle_call(:drain, _from, state), do: {:reply, :ok, state}
 
   def handle_call(:inspect_cell, _from, state) do
     info = %{
@@ -371,7 +457,10 @@ defmodule Chronicle.Engine.InstanceLoadCell do
         waiting_handles: [],
         mailbox: :queue.new(),
         pending_syncs: :queue.new(),
-        timer_refs: %{}
+        timer_refs: %{},
+        # The restored Instance resumes the lease renew loop (it got the epoch
+        # threaded into its restore tuple), so the cell drops its own.
+        fence_epoch: :no_fence
       }}
     else
       {:noreply, state}
@@ -425,6 +514,45 @@ defmodule Chronicle.Engine.InstanceLoadCell do
   def handle_info({:evicted_timer_elapsed, token_id, timer_ref}, state) do
     handle_wake_event(timer_wake(token_id, timer_ref, nil), state)
   end
+
+  # Keep the lease alive for an EVICTED instance (feature 3b, phase 2). The
+  # resident Instance is gone, so the cell renews on its behalf — eviction KEEPS
+  # the lease so a peer cannot steal the instance just because it idled out of
+  # memory. Only armed when the cell captured a real `{owner_node, epoch}` fence
+  # at eviction.
+  #
+  # S0-4 / S1-5: on :lost the lease was STOLEN by a newer owner — this instance
+  # is no longer ours. We MUST drop the cell entirely: unregister its durable
+  # `:evicted_waits` rows (so wakes route to the NEW owner, not back to us) and
+  # STOP the cell. Keeping it for a `:no_fence` restore would resurrect a
+  # no-fence (unfenced) instance for a row a peer owns — exactly the multi-pod
+  # double-drive this layer exists to prevent. At N=1 the renew always succeeds,
+  # so this :lost branch is unreachable for the single pod.
+  def handle_info(:lease_renew, %{cell_state: :evicted, fence_epoch: {owner_node, epoch}} = state) do
+    case Chronicle.Persistence.InstanceLease.renew(
+           state.instance_id,
+           owner_node,
+           Chronicle.Engine.LeaseConfig.ttl_ms(),
+           epoch
+         ) do
+      {:ok, ^epoch} ->
+        schedule_lease_renew()
+        {:noreply, state}
+
+      :lost ->
+        Logger.warning(
+          "InstanceLoadCell #{state.instance_id}: evicted lease lost on renew (epoch #{epoch}) — a newer owner has taken over; unregistering + stopping cell"
+        )
+
+        Lifecycle.unregister_evicted_waits(state.waiting_handles)
+        Lifecycle.cancel_evicted_timers(state)
+        {:stop, :normal, %{state | fence_epoch: :no_fence}}
+    end
+  end
+
+  # Stray renew tick (no lease, or the cell already restored / is restoring):
+  # ignore. Once restored, the resident Instance owns the renew loop again.
+  def handle_info(:lease_renew, state), do: {:noreply, state}
 
   def handle_info({:DOWN, _ref, :process, pid, reason}, %{instance_pid: pid} = state) do
     case state.cell_state do
@@ -551,6 +679,13 @@ defmodule Chronicle.Engine.InstanceLoadCell do
   # it as a plain `:timer_elapsed` would wake the wrong continuation or be ignored.
   defp forward_to_instance(pid, {:boundary_timer_elapsed, token_id, boundary_node_id, timer_ref}) do
     send(pid, {:boundary_timer_elapsed, token_id, boundary_node_id, timer_ref})
+  end
+
+  @doc false
+  # Arm the next lease-renew tick for an evicted cell. Public to the module so
+  # Lifecycle can arm it right after a successful evict captures a real epoch.
+  def schedule_lease_renew do
+    Process.send_after(self(), :lease_renew, Chronicle.Engine.LeaseConfig.renew_interval_ms())
   end
 
   # Build the wake tuple that flows through the mailbox queue and `forward_to_instance`:

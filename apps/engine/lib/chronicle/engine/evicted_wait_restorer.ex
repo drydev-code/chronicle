@@ -22,10 +22,10 @@ defmodule Chronicle.Engine.EvictedWaitRestorer do
 
   require Logger
 
-  alias Chronicle.Engine.{InstanceLoadCell, PersistentData, WaitingHandle}
+  alias Chronicle.Engine.{InstanceLoadCell, LeaseConfig, NodeIdentity, PersistentData, WaitingHandle}
   alias Chronicle.Engine.Diagrams.{Definition, DiagramStore}
   alias Chronicle.Engine.Instance.{EventReplayer, TokenState}
-  alias Chronicle.Persistence.EventStore
+  alias Chronicle.Persistence.{EventStore, InstanceLease}
 
   @type wait ::
           WaitingHandle.ExternalTask.t()
@@ -115,31 +115,31 @@ defmodule Chronicle.Engine.EvictedWaitRestorer do
             :already_started
 
           true ->
-            # Single authoritative replay (side-effect-free): the SAME resident
-            # reconstruction the on-demand restore uses, including implicit waits.
-            # Routing on its classified tokens AND deriving the evicted handles
-            # from its open-wait maps means the evicted cell can never again
-            # diverge from resident semantics.
-            case replay_state(events, tenant_id) do
-              {:ok, {state, open_timers}} ->
-                if MapSet.size(state.active_tokens) > 0 do
-                  restore_resident(instance_id, tenant_id, events)
-                else
-                  waits = waits_from_state(state, open_timers, instance_id)
-                  start_evicted_cell(instance_id, tenant_id, business_key, waits)
-                end
+            # Feature 3b: the evicted-only boot-restore must COMPOSE with the
+            # lease layer. When the lease is ENABLED, ACQUIRE a lease for this
+            # instance and ONLY restore the ones we WIN — threading the won
+            # `{owner_node, epoch}` fence into the started resident Instance OR
+            # evicted cell (mirrors `Chronicle.Supervisor.acquire_and_restore`).
+            # A row a live peer owns is `:contended` and left for that peer. When
+            # the lease is DISABLED / N=1 this returns `{:ok, :no_fence}` and wins
+            # all — byte-identical to the pre-lease boot-restore.
+            case acquire_fence(instance_id) do
+              {:ok, fence} ->
+                restore_won(instance_id, tenant_id, business_key, events, fence)
 
-              {:error, reason} ->
-                # The replay could not classify (e.g. the diagram is not loaded
-                # yet). Fall back to the pure event fold so a transient lookup
-                # failure never blocks restore — an instance kept reachable on a
-                # conservative wait list still recovers; one lost is not.
-                Logger.debug(
-                  "EvictedWaitRestorer: state replay fell back to collect_open_waits for #{instance_id}: #{inspect(reason)}"
+              :contended ->
+                Logger.info(
+                  "EvictedWaitRestorer: instance #{instance_id} owned by a live peer — skipping"
                 )
 
-                waits = collect_open_waits(events, resolve_definition(events))
-                start_evicted_cell(instance_id, tenant_id, business_key, waits)
+                :contended
+
+              {:error, reason} ->
+                Logger.error(
+                  "EvictedWaitRestorer: could not acquire lease for #{instance_id}: #{inspect(reason)}"
+                )
+
+                {:error, reason}
             end
         end
 
@@ -149,6 +149,54 @@ defmodule Chronicle.Engine.EvictedWaitRestorer do
         )
 
         {:error, reason}
+    end
+  end
+
+  # Lease-gated acquire for the boot-restore path. Mirrors
+  # `Chronicle.Supervisor.acquire_and_restore`: enabled -> acquire and return the
+  # real `{owner_node, epoch}` fence on a win; disabled / N=1 -> `{:ok, :no_fence}`
+  # (win all, no fence). `:contended` is propagated so the caller leaves the row
+  # for the live peer; `{:error, :not_found}` becomes `{:error, ...}`.
+  defp acquire_fence(instance_id) do
+    if LeaseConfig.enabled?() do
+      node = NodeIdentity.node_id()
+
+      case InstanceLease.acquire(instance_id, node, LeaseConfig.ttl_ms()) do
+        {:ok, epoch} -> {:ok, InstanceLease.fence(node, epoch)}
+        :contended -> :contended
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      {:ok, :no_fence}
+    end
+  end
+
+  # Restore an instance we WON the lease for, threading `fence` into whichever
+  # path we take. Routes the same way the lease-less path did: an instance with an
+  # active token comes back RESIDENT (and processes it immediately); a purely
+  # waiting instance becomes a passive evicted cell. The fence (real or
+  # `:no_fence`) is carried into both.
+  defp restore_won(instance_id, tenant_id, business_key, events, fence) do
+    case replay_state(events, tenant_id) do
+      {:ok, {state, open_timers}} ->
+        if MapSet.size(state.active_tokens) > 0 do
+          restore_resident(instance_id, tenant_id, events, fence)
+        else
+          waits = waits_from_state(state, open_timers, instance_id)
+          start_evicted_cell(instance_id, tenant_id, business_key, waits, fence)
+        end
+
+      {:error, reason} ->
+        # The replay could not classify (e.g. the diagram is not loaded yet). Fall
+        # back to the pure event fold so a transient lookup failure never blocks
+        # restore — an instance kept reachable on a conservative wait list still
+        # recovers; one lost is not.
+        Logger.debug(
+          "EvictedWaitRestorer: state replay fell back to collect_open_waits for #{instance_id}: #{inspect(reason)}"
+        )
+
+        waits = collect_open_waits(events, resolve_definition(events))
+        start_evicted_cell(instance_id, tenant_id, business_key, waits, fence)
     end
   end
 
@@ -310,12 +358,13 @@ defmodule Chronicle.Engine.EvictedWaitRestorer do
   end
 
   # Bring the instance back RESIDENT via the same contract the default
-  # :resident boot path uses (`{:restore, ...}` Instance), so its active token is
-  # processed immediately. The instance re-evicts later via EvictionManager.
-  defp restore_resident(instance_id, tenant_id, events) do
+  # :resident boot path uses (`{:restore, ..., fence}` Instance), so its active
+  # token is processed immediately under the WON fence. The instance re-evicts
+  # later via EvictionManager. `:no_fence` keeps the pre-lease behaviour.
+  defp restore_resident(instance_id, tenant_id, events, fence) do
     case DynamicSupervisor.start_child(
            Chronicle.Engine.InstanceSupervisor,
-           {Chronicle.Engine.Instance, {:restore, instance_id, tenant_id, events}}
+           {Chronicle.Engine.Instance, {:restore, instance_id, tenant_id, events, fence}}
          ) do
       {:ok, _pid} ->
         :restored_resident
@@ -332,10 +381,13 @@ defmodule Chronicle.Engine.EvictedWaitRestorer do
     end
   end
 
-  defp start_evicted_cell(instance_id, tenant_id, business_key, waits) do
+  # Start a passive evicted cell carrying the WON fence so it renews the lease on
+  # the evicted instance's behalf (and threads it into any on-demand restore).
+  # `:no_fence` arms no renew — the pre-lease evicted boot.
+  defp start_evicted_cell(instance_id, tenant_id, business_key, waits, fence) do
     case DynamicSupervisor.start_child(
            Chronicle.Engine.LoadCellSupervisor,
-           {InstanceLoadCell, {:evicted, instance_id, tenant_id, business_key, waits}}
+           {InstanceLoadCell, {:evicted, instance_id, tenant_id, business_key, waits, fence}}
          ) do
       {:ok, _cell_pid} ->
         length(waits)
