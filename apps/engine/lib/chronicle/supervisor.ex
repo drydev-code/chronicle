@@ -38,6 +38,7 @@ defmodule Chronicle.Supervisor do
       active_repo,
       active_databus_repo,
       {Phoenix.PubSub, name: Chronicle.PubSub},
+      Chronicle.Engine.RestoreGovernor,
       {Registry, keys: :unique, name: :instances},
       {Registry, keys: :duplicate, name: :waits},
       {Registry, keys: :unique, name: :load_cells},

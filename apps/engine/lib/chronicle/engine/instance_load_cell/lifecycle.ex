@@ -75,39 +75,51 @@ defmodule Chronicle.Engine.InstanceLoadCell.Lifecycle do
   and spawns a Task to load events and start a new Instance.
   """
   def trigger_restore(state) do
-    state = %{state | cell_state: :restore_requested}
-    cell_pid = self()
-    instance_id = state.instance_id
-    tenant_id = state.tenant_id
+    # Bound concurrent restores. Under a mass-eviction burst, unbounded restore Tasks
+    # saturate CPU + the event-store DB and livelock the engine. If no slot is free, stay
+    # :evicted — the queued wake + the inbox's at-least-once retry re-trigger us once a slot
+    # frees, so nothing is lost, just deferred.
+    if not Chronicle.Engine.RestoreGovernor.try_acquire() do
+      %{state | cell_state: :evicted}
+    else
+      state = %{state | cell_state: :restore_requested}
+      cell_pid = self()
+      instance_id = state.instance_id
+      tenant_id = state.tenant_id
 
-    # Unregister evicted waits before restore (Instance will re-register its own)
-    unregister_evicted_waits(state.waiting_handles)
+      # Unregister evicted waits before restore (Instance will re-register its own)
+      unregister_evicted_waits(state.waiting_handles)
 
-    Task.start(fn ->
-      case EventStore.stream(instance_id) do
-        {:ok, events} ->
-          case DynamicSupervisor.start_child(
-            Chronicle.Engine.InstanceSupervisor,
-            {Instance, {:restore, instance_id, tenant_id, events}}
-          ) do
-            {:ok, pid} ->
-              GenServer.cast(cell_pid, {:restore_completed, pid})
-            {:error, {:already_started, pid}} ->
-              GenServer.cast(cell_pid, {:restore_completed, pid})
+      Task.start(fn ->
+        try do
+          case EventStore.stream(instance_id) do
+            {:ok, events} ->
+              case DynamicSupervisor.start_child(
+                Chronicle.Engine.InstanceSupervisor,
+                {Instance, {:restore, instance_id, tenant_id, events}}
+              ) do
+                {:ok, pid} ->
+                  GenServer.cast(cell_pid, {:restore_completed, pid})
+                {:error, {:already_started, pid}} ->
+                  GenServer.cast(cell_pid, {:restore_completed, pid})
+                {:error, reason} ->
+                  Logger.error("InstanceLoadCell #{instance_id}: Restore failed: #{inspect(reason)}")
+                  # Reset to :evicted so the next queued wake re-triggers a restore —
+                  # a transient start failure must not strand the cell (and its reply).
+                  GenServer.cast(cell_pid, :restore_failed)
+              end
+
             {:error, reason} ->
-              Logger.error("InstanceLoadCell #{instance_id}: Restore failed: #{inspect(reason)}")
-              # Reset to :evicted so the next queued wake re-triggers a restore —
-              # a transient start failure must not strand the cell (and its reply).
+              Logger.error("InstanceLoadCell #{instance_id}: Cannot load events: #{inspect(reason)}")
               GenServer.cast(cell_pid, :restore_failed)
           end
+        after
+          Chronicle.Engine.RestoreGovernor.release()
+        end
+      end)
 
-        {:error, reason} ->
-          Logger.error("InstanceLoadCell #{instance_id}: Cannot load events: #{inspect(reason)}")
-          GenServer.cast(cell_pid, :restore_failed)
-      end
-    end)
-
-    %{state | cell_state: :restoring}
+      %{state | cell_state: :restoring}
+    end
   end
 
   @doc "Cancel all evicted timer references."
