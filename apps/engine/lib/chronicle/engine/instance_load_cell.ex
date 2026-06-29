@@ -14,7 +14,9 @@ defmodule Chronicle.Engine.InstanceLoadCell do
   State transition logic lives in `InstanceLoadCell.StateMachine`.
   Eviction/restore operations live in `InstanceLoadCell.Lifecycle`.
   """
-  use GenServer
+  # :transient — a cell is removed (not respawned) when it stops :normal (its instance finished
+  # and was cleaned up); a crash still restarts it so the restore path can recover the instance.
+  use GenServer, restart: :transient
   require Logger
 
   alias Chronicle.Engine.Instance
@@ -213,6 +215,11 @@ defmodule Chronicle.Engine.InstanceLoadCell do
     case state.cell_state do
       :evicting ->
         {:noreply, state}
+
+      # Instance finished and stopped itself cleanly -> tear the cell down too (no restart, no
+      # restore). This is what frees a completed instance's footprint; without it cells leak.
+      :resident when reason in [:normal, :shutdown] ->
+        {:stop, :normal, state}
 
       :resident ->
         Logger.error("InstanceLoadCell #{state.instance_id}: Instance process crashed: #{inspect(reason)}")

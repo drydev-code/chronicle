@@ -453,6 +453,11 @@ defmodule Chronicle.Engine.Instance do
   # --- Timer handling ---
 
   @impl true
+  # The instance finished and was durably persisted; release the process so it stops leaking.
+  def handle_info(:shutdown_completed, state) do
+    {:stop, :normal, state}
+  end
+
   def handle_info({:timer_elapsed, token_id, timer_marker}, state) do
     {timer_ref, timer_id} = resolve_timer_ref(state, token_id, timer_marker)
 
@@ -680,6 +685,14 @@ defmodule Chronicle.Engine.Instance do
             Enum.each(all_params, &Chronicle.Engine.LargeVariablesCleaner.cleanup(&1, cleanup_state.tenant_id))
           end)
         end
+
+        # Release the GenServer once the instance is durably completed. Without this a finished
+        # instance stays resident forever — under a bulk migration that leaks thousands of
+        # zombie processes (started≈finished but engine holds them all), bogging the scheduler
+        # and stalling throughput. Stop asynchronously so the current callback (and its
+        # process_tokens continuation) finishes first; the load cell sees the :normal DOWN and
+        # cleans itself up. Instance is restart: :temporary, so it is not respawned.
+        send(self(), :shutdown_completed)
 
         {:ok, candidate}
 
