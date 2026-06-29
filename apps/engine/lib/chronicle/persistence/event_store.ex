@@ -31,9 +31,9 @@ defmodule Chronicle.Persistence.EventStore do
   duplicate submissions — a re-submit of an already-run instance must not spawn a second one.
   """
   def exists?(instance_id) do
-    Repo.exists?(from a in ActiveInstance, where: a.process_instance_id == ^instance_id) or
-      Repo.exists?(from c in CompletedInstance, where: c.process_instance_id == ^instance_id) or
-      Repo.exists?(from t in TerminatedInstance, where: t.process_instance_id == ^instance_id)
+    Enum.any?([ActiveInstance, CompletedInstance, TerminatedInstance], fn schema ->
+      Repo.all(from x in schema, where: x.process_instance_id == ^instance_id, select: 1, limit: 1) != []
+    end)
   end
 
   def stream(instance_id) do
