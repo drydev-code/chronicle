@@ -25,6 +25,17 @@ defmodule Chronicle.Persistence.EventStore do
     end
   end
 
+  @doc """
+  True if this instance id has ever been persisted (active, completed, or terminated). Used to
+  make starts idempotent against a deterministic instance id under at-least-once delivery /
+  duplicate submissions — a re-submit of an already-run instance must not spawn a second one.
+  """
+  def exists?(instance_id) do
+    Repo.exists?(from a in ActiveInstance, where: a.process_instance_id == ^instance_id) or
+      Repo.exists?(from c in CompletedInstance, where: c.process_instance_id == ^instance_id) or
+      Repo.exists?(from t in TerminatedInstance, where: t.process_instance_id == ^instance_id)
+  end
+
   def stream(instance_id) do
     case Repo.get(ActiveInstance, instance_id) do
       nil -> {:error, :not_found}
