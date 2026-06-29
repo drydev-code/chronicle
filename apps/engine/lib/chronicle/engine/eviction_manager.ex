@@ -17,7 +17,10 @@ defmodule Chronicle.Engine.EvictionManager do
   use GenServer
   require Logger
 
-  alias Chronicle.Engine.{Instance, InstanceLoadCell}
+  alias Chronicle.Engine.{Instance, InstanceLoadCell, PersistentData}
+  alias Chronicle.Persistence.EventStore
+
+  @zero_tenant "00000000-0000-0000-0000-000000000000"
 
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -124,6 +127,19 @@ defmodule Chronicle.Engine.EvictionManager do
         end
       end)
 
+    # Safety-net pass: recover any stranded cell (evicted with no waiting handles -> unwakeable).
+    # The do_evict guard prevents creating these, but this self-heals any that form via any path
+    # so the system never needs a manual restore/wake. Cheap: a cast per cell, no-op unless stranded.
+    recover_stranded_cells()
+
+    # Safety-net pass: recover ORPHANED active instances — persisted active in the event store but
+    # with NO live process (neither resident nor a load cell). These form when an instance's process
+    # is lost without a cell (e.g. dispatched an external task then its process vanished); the reply
+    # can't route to a non-existent process and nothing restores it until reboot. Startup restoration
+    # only runs at boot, so this is its mid-run equivalent: restore them resident so the router +
+    # DeliveryReconciler can drive them to completion.
+    recover_orphaned_actives()
+
     now = System.system_time(:millisecond)
 
     if evicted > 0 do
@@ -134,6 +150,71 @@ defmodule Chronicle.Engine.EvictionManager do
       evicted_count: state.evicted_count + evicted,
       last_scan_at: now
     }
+  end
+
+  defp recover_stranded_cells do
+    for {_, pid, _, _} <- DynamicSupervisor.which_children(Chronicle.Engine.LoadCellSupervisor),
+        is_pid(pid) do
+      InstanceLoadCell.recover_if_stranded(pid)
+    end
+  catch
+    _, _ -> :ok
+  end
+
+  # Restore active instances that have no live process. Pre-filtered cheaply on the (common)
+  # zero tenant — a resident/celled instance there is skipped without a DB read; only candidates
+  # are streamed, and the real tenant from the stream gates the actual restore so we never
+  # double-start. {:already_started} from a concurrent start is harmless.
+  defp recover_orphaned_actives do
+    for id <- safe_list_active_ids(),
+        Registry.lookup(:instances, {@zero_tenant, id}) == [],
+        Registry.lookup(:load_cells, {@zero_tenant, id}) == [] do
+      restore_orphan(id)
+    end
+  catch
+    _, _ -> :ok
+  end
+
+  defp safe_list_active_ids do
+    EventStore.list_active_ids()
+  rescue
+    _ -> []
+  catch
+    _, _ -> []
+  end
+
+  defp restore_orphan(id) do
+    # First stream resolves the tenant for the authoritative registry recheck. After confirming
+    # the instance has no live process, RE-STREAM fresh immediately before start_child: if it
+    # completed/terminated in the meantime its active row is gone, the fresh stream returns
+    # :not_found and we skip — never restoring a finished instance from stale events (codex review).
+    with {:ok, events0} <- EventStore.stream(id),
+         tenant <- extract_tenant_id(events0),
+         [] <- Registry.lookup(:instances, {tenant, id}),
+         [] <- Registry.lookup(:load_cells, {tenant, id}),
+         {:ok, events} <- EventStore.stream(id) do
+      case DynamicSupervisor.start_child(
+             Chronicle.Engine.InstanceSupervisor,
+             {Instance, {:restore, id, tenant, events}}
+           ) do
+        {:ok, _} ->
+          Logger.warning("EvictionManager: restored orphaned active instance #{id} (no live process)")
+
+        _ ->
+          :ok
+      end
+    else
+      _ -> :ok
+    end
+  catch
+    _, _ -> :ok
+  end
+
+  defp extract_tenant_id(events) do
+    case Enum.find(events, &match?(%PersistentData.ProcessInstanceStart{}, &1)) do
+      %PersistentData.ProcessInstanceStart{tenant: tenant} when not is_nil(tenant) -> tenant
+      _ -> @zero_tenant
+    end
   end
 
   defp evictable?(pid) do

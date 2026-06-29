@@ -26,15 +26,25 @@ defmodule Chronicle.Engine.InstanceLoadCell.Lifecycle do
       if instance_state.instance_state != :waiting or instance_state.pin_state != :not_pinned do
         {:error, :not_evictable}
       else
-        state = %{state | cell_state: :evicting}
-
         # Extract waiting handles from instance state
         handles = extract_waiting_handles(instance_state)
 
-        # Persist current events to DB (ensure nothing is lost). If this
-        # fails we must NOT stop the instance — unflushed events would be
-        # lost and the durable replay would be incomplete.
-        case persist_events_sync(instance_state) do
+        # A :waiting instance with NO capturable wait is mid-transition: a wait (e.g. the last
+        # external-task reply) has just resolved but the token hasn't advanced yet. Evicting here
+        # would snapshot an empty wait-set, so the cell could never be woken (nothing routes to it)
+        # and the in-flight progression would be lost — the bulk-migration tail-orphan bug, where
+        # ~50 instances per run parked unwakeable and only a manual restore/wake finished them.
+        # Refuse: keep it resident; it advances on its next step and evicts later once genuinely
+        # parked with real waits.
+        if handles == [] do
+          {:error, :no_waits}
+        else
+          state = %{state | cell_state: :evicting}
+
+          # Persist current events to DB (ensure nothing is lost). If this
+          # fails we must NOT stop the instance — unflushed events would be
+          # lost and the durable replay would be incomplete.
+          case persist_events_sync(instance_state) do
           :ok ->
             # Stop the Instance GenServer
             GenServer.stop(instance_pid, :normal)
@@ -61,6 +71,7 @@ defmodule Chronicle.Engine.InstanceLoadCell.Lifecycle do
             )
 
             {:error, {:persist_failed, reason}}
+          end
         end
       end
     catch
@@ -74,21 +85,26 @@ defmodule Chronicle.Engine.InstanceLoadCell.Lifecycle do
   Updates cell_state from :evicted -> :restore_requested -> :restoring
   and spawns a Task to load events and start a new Instance.
   """
-  def trigger_restore(state) do
+  def trigger_restore(state, ref) do
     # Bound concurrent restores. Under a mass-eviction burst, unbounded restore Tasks
-    # saturate CPU + the event-store DB and livelock the engine. If no slot is free, stay
-    # :evicted — the queued wake + the inbox's at-least-once retry re-trigger us once a slot
-    # frees, so nothing is lost, just deferred.
+    # saturate CPU + the event-store DB and livelock the engine. If no slot is free, return
+    # :no_slot — the CELL schedules a backoff retry (keeping exactly one pending restore_ref +
+    # timer), so nothing is lost and a denied retry can never strand the cell (codex review).
     if not Chronicle.Engine.RestoreGovernor.try_acquire() do
-      %{state | cell_state: :evicted}
+      {:no_slot, state}
     else
-      state = %{state | cell_state: :restore_requested}
+      # `ref` tags this restore attempt. Every completion/failure cast carries it; the cell ignores
+      # casts whose ref != its current restore_ref, so a stale crash/timeout from a superseded
+      # attempt can't reset a cell that has already restored (codex review).
+      state = %{state | cell_state: :restore_requested, restore_ref: ref}
       cell_pid = self()
       instance_id = state.instance_id
       tenant_id = state.tenant_id
 
-      # Unregister evicted waits before restore (Instance will re-register its own)
-      unregister_evicted_waits(state.waiting_handles)
+      # NOTE: evicted waits are deliberately NOT unregistered here. If this restore fails we go back
+      # to :evicted and must keep routing message/signal wakes to the cell during the backoff; they
+      # are unregistered only on restore SUCCESS (cell's :restore_completed handler), just before
+      # the now-resident Instance's own :waits take over.
 
       Task.start(fn ->
         try do
@@ -99,26 +115,36 @@ defmodule Chronicle.Engine.InstanceLoadCell.Lifecycle do
                 {Instance, {:restore, instance_id, tenant_id, events}}
               ) do
                 {:ok, pid} ->
-                  GenServer.cast(cell_pid, {:restore_completed, pid})
+                  GenServer.cast(cell_pid, {:restore_completed, ref, pid})
                 {:error, {:already_started, pid}} ->
-                  GenServer.cast(cell_pid, {:restore_completed, pid})
+                  GenServer.cast(cell_pid, {:restore_completed, ref, pid})
                 {:error, reason} ->
                   Logger.error("InstanceLoadCell #{instance_id}: Restore failed: #{inspect(reason)}")
-                  # Reset to :evicted so the next queued wake re-triggers a restore —
-                  # a transient start failure must not strand the cell (and its reply).
-                  GenServer.cast(cell_pid, :restore_failed)
+                  GenServer.cast(cell_pid, {:restore_failed, ref, reason})
               end
 
             {:error, reason} ->
               Logger.error("InstanceLoadCell #{instance_id}: Cannot load events: #{inspect(reason)}")
-              GenServer.cast(cell_pid, :restore_failed)
+              GenServer.cast(cell_pid, {:restore_failed, ref, reason})
           end
+        rescue
+          e ->
+            # A RAISED stream/start_child (DB error/timeout under load) would otherwise kill this
+            # Task before any cast, stranding the cell in :restoring forever (the production tail
+            # wedge: replies cycle, restore_inflight stays 0 because `after` still releases).
+            # Convert any exception into a keyed failure so the cell resets + retries — self-healing.
+            Logger.error("InstanceLoadCell #{instance_id}: Restore crashed: #{Exception.message(e)}")
+            GenServer.cast(cell_pid, {:restore_failed, ref, {:crashed, e.__struct__}})
+        catch
+          kind, reason ->
+            Logger.error("InstanceLoadCell #{instance_id}: Restore #{kind}: #{inspect(reason)}")
+            GenServer.cast(cell_pid, {:restore_failed, ref, {kind, reason}})
         after
           Chronicle.Engine.RestoreGovernor.release()
         end
       end)
 
-      %{state | cell_state: :restoring}
+      {:ok, %{state | cell_state: :restoring}}
     end
   end
 
@@ -268,7 +294,8 @@ defmodule Chronicle.Engine.InstanceLoadCell.Lifecycle do
     end)
   end
 
-  defp unregister_evicted_waits(handles) do
+  @doc "Unregister this cell's evicted message/signal waits. Called on restore SUCCESS."
+  def unregister_evicted_waits(handles) do
     Enum.each(handles, fn
       %WaitingHandle.Message{} = h ->
         Registry.unregister(:evicted_waits, {h.tenant_id, :message, h.message_name, h.business_key})

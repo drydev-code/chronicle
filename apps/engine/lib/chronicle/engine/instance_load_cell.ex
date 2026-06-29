@@ -32,7 +32,13 @@ defmodule Chronicle.Engine.InstanceLoadCell do
     cell_state: :resident,
     waiting_handles: [],
     mailbox: :queue.new(),
-    timer_refs: %{}
+    timer_refs: %{},
+    # Restore self-healing: restore_ref tags the in-flight (or backoff-scheduled) restore so a
+    # stale crash/timeout cast can't reset a cell that already restored; non-nil also means "a
+    # restore is active or scheduled" so cycling wakes don't bypass the backoff. restore_attempts
+    # drives exponential jittered backoff and resets on success.
+    restore_ref: nil,
+    restore_attempts: 0
   ]
 
   # --- Public API ---
@@ -78,6 +84,14 @@ defmodule Chronicle.Engine.InstanceLoadCell do
   def inspect_cell(cell_pid) do
     GenServer.call(cell_pid, :inspect_cell)
   end
+
+  @doc """
+  Safety net for stranded cells. A cell that is `:evicted` with NO waiting handles can never be
+  woken (nothing routes a wake to it). The `do_evict` guard prevents creating such cells, but if
+  one ever forms via any path this triggers a restore so the (mid-transition) instance can advance
+  or finish. No-op unless genuinely stranded.
+  """
+  def recover_if_stranded(cell_pid), do: GenServer.cast(cell_pid, :recover_if_stranded)
 
   defp via(tenant_id, instance_id) do
     {:via, Registry, {:load_cells, {tenant_id, instance_id}}}
@@ -167,9 +181,12 @@ defmodule Chronicle.Engine.InstanceLoadCell do
 
   # --- Restore completion ---
 
-  def handle_cast({:restore_completed, new_pid}, state) do
-    if StateMachine.restore_completable?(state.cell_state) do
+  def handle_cast({:restore_completed, ref, new_pid}, state) do
+    if ref == state.restore_ref and StateMachine.restore_completable?(state.cell_state) do
       Process.monitor(new_pid)
+      # Evicted message/signal waits routed to this cell while evicted; the now-resident Instance
+      # re-registered its own :waits during restore, so retire the cell's :evicted_waits here.
+      Lifecycle.unregister_evicted_waits(state.waiting_handles)
       drain_mailbox(new_pid, state.mailbox)
       Lifecycle.cancel_evicted_timers(state)
 
@@ -180,28 +197,39 @@ defmodule Chronicle.Engine.InstanceLoadCell do
         instance_pid: new_pid,
         waiting_handles: [],
         mailbox: :queue.new(),
-        timer_refs: %{}
+        timer_refs: %{},
+        restore_ref: nil,
+        restore_attempts: 0
       }}
+    else
+      # Stale completion from a superseded attempt (or cell already resident/evicted) — ignore.
+      {:noreply, state}
+    end
+  end
+
+  # Restore failed (transient event-store read / instance start error, or a RAISED restore Task).
+  # Reset to :evicted and schedule a jittered exponential-backoff retry. We keep restore_ref set
+  # (non-nil = "restore pending") so cycling wakes during the backoff only QUEUE (handle_wake_event
+  # won't re-trigger) — the scheduled :retry_restore is the single re-trigger, bounding the retry
+  # rate. The queued wakes + the inbox's at-least-once rows are preserved, never lost.
+  def handle_cast({:restore_failed, ref, _reason}, state) do
+    if ref == state.restore_ref do
+      {:noreply, schedule_retry(state, ref)}
     else
       {:noreply, state}
     end
   end
 
-  # Restore failed (transient: event-store read or instance start error). Reset to
-  # :evicted so a subsequent queued wake re-triggers the restore — the queued wakes
-  # (and the inbox rows behind them) are preserved, never lost. Re-trigger now if any
-  # wake is already waiting.
-  def handle_cast(:restore_failed, state) do
-    state = %{state | cell_state: :evicted}
-
-    state =
-      if :queue.len(state.mailbox) > 0 do
-        Lifecycle.trigger_restore(state)
-      else
-        state
-      end
-
-    {:noreply, state}
+  # Safety net (driven by EvictionManager's scan): an :evicted cell with no waiting handles is
+  # unwakeable. Trigger a restore so the instance re-evaluates and advances/finishes. Guarded so
+  # normal evicted cells (with handles) and in-flight restores are untouched.
+  def handle_cast(:recover_if_stranded, state) do
+    if state.cell_state == :evicted and state.waiting_handles == [] and state.restore_ref == nil do
+      Logger.warning("InstanceLoadCell #{state.instance_id}: stranded (evicted, no waits) — restoring")
+      {:noreply, start_or_schedule_restore(state)}
+    else
+      {:noreply, state}
+    end
   end
 
   # --- Info handlers ---
@@ -230,7 +258,52 @@ defmodule Chronicle.Engine.InstanceLoadCell do
     end
   end
 
+  # Backoff-scheduled restore retry after a failure. Only act if still the current attempt and
+  # still evicted; if a wake already re-residented us, or a newer attempt superseded this ref, the
+  # send_after is stale and ignored. Retry only when there is queued work; otherwise clear
+  # restore_ref so the next wake re-triggers fresh.
+  def handle_info({:retry_restore, ref}, state) do
+    cond do
+      ref != state.restore_ref or state.cell_state != :evicted ->
+        {:noreply, state}
+
+      :queue.len(state.mailbox) > 0 ->
+        {:noreply, start_or_schedule_restore(%{state | restore_ref: nil})}
+
+      true ->
+        # No pending work — settle. Reset attempts so a later restore starts fresh backoff.
+        {:noreply, %{state | restore_ref: nil, restore_attempts: 0}}
+    end
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
+
+  # Acquire a restore slot and start the restore, or — if the governor is saturated — schedule a
+  # backoff retry. Either way the invariant holds: restore_ref != nil ⟹ exactly one restore is
+  # in flight OR one {:retry_restore, restore_ref} timer is pending. So a governor denial (even one
+  # hit from a retry) can never strand the cell — there is always a pending re-trigger (codex review).
+  defp start_or_schedule_restore(state) do
+    ref = make_ref()
+
+    case Lifecycle.trigger_restore(state, ref) do
+      {:ok, new_state} -> new_state
+      {:no_slot, new_state} -> schedule_retry(new_state, ref)
+    end
+  end
+
+  # Reset to :evicted and arm exactly one backoff retry tagged with `ref`, kept as restore_ref.
+  defp schedule_retry(state, ref) do
+    attempts = state.restore_attempts + 1
+    Process.send_after(self(), {:retry_restore, ref}, restore_backoff_ms(attempts))
+    %{state | cell_state: :evicted, restore_ref: ref, restore_attempts: attempts}
+  end
+
+  # Exponential backoff with jitter, capped. Paces per-cell restore retries so a deterministic
+  # replay failure or DB outage can't become a tight restore loop (codex review).
+  defp restore_backoff_ms(attempts) do
+    base = 100 * trunc(:math.pow(2, min(attempts, 6)))
+    base + :rand.uniform(base)
+  end
 
   # --- Internal ---
 
@@ -243,8 +316,11 @@ defmodule Chronicle.Engine.InstanceLoadCell do
     new_mailbox = :queue.in(msg, state.mailbox)
     state = %{state | mailbox: new_mailbox}
 
-    state = if StateMachine.should_restore?(state.cell_state) do
-      Lifecycle.trigger_restore(state)
+    # Trigger a restore only when evicted AND no restore is already in-flight or backoff-scheduled
+    # (restore_ref == nil). During a post-failure backoff restore_ref stays set, so cycling wakes
+    # just queue here and the scheduled :retry_restore is the single re-trigger — no tight loop.
+    state = if StateMachine.should_restore?(state.cell_state) and state.restore_ref == nil do
+      start_or_schedule_restore(state)
     else
       state
     end
